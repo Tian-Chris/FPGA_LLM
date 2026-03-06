@@ -130,12 +130,16 @@ module vitis_control #(
     // -------------------------------------------------------------------------
     // Write Channel State Machine
     // -------------------------------------------------------------------------
+    // AW and W can arrive in any order. Track both independently and only
+    // proceed when both have been captured.
     reg [1:0] wr_state;
     localparam WR_IDLE = 2'd0;
-    localparam WR_DATA = 2'd1;
+    localparam WR_EXEC = 2'd1;
     localparam WR_RESP = 2'd2;
     reg [6:0]  wr_addr_latch;
     reg [31:0] wr_data_latch;
+    reg        aw_done;  // AW handshake captured
+    reg        w_done;   // W  handshake captured
 
     // Write-channel: capture address + data, produce response
     always @(posedge clk or negedge rst_n) begin
@@ -146,22 +150,37 @@ module vitis_control #(
             s_axi_bvalid  <= 1'b0;
             wr_addr_latch <= 7'd0;
             wr_data_latch <= 32'd0;
+            aw_done       <= 1'b0;
+            w_done        <= 1'b0;
         end else begin
             case (wr_state)
                 WR_IDLE: begin
-                    s_axi_awready <= 1'b1;
-                    s_axi_wready  <= 1'b1;
+                    // Accept both channels simultaneously
+                    if (!aw_done) s_axi_awready <= 1'b1;
+                    if (!w_done)  s_axi_wready  <= 1'b1;
+
                     if (s_axi_awvalid && s_axi_awready) begin
                         wr_addr_latch <= s_axi_awaddr[6:0];
                         s_axi_awready <= 1'b0;
+                        aw_done       <= 1'b1;
                     end
                     if (s_axi_wvalid && s_axi_wready) begin
                         wr_data_latch <= s_axi_wdata;
                         s_axi_wready  <= 1'b0;
-                        wr_state      <= WR_DATA;
+                        w_done        <= 1'b1;
+                    end
+
+                    // Both captured? (check combinationally for same-cycle)
+                    if ((aw_done || (s_axi_awvalid && s_axi_awready)) &&
+                        (w_done  || (s_axi_wvalid  && s_axi_wready))) begin
+                        wr_state      <= WR_EXEC;
+                        s_axi_awready <= 1'b0;
+                        s_axi_wready  <= 1'b0;
                     end
                 end
-                WR_DATA: begin
+                WR_EXEC: begin
+                    aw_done  <= 1'b0;
+                    w_done   <= 1'b0;
                     wr_state <= WR_RESP;
                 end
                 WR_RESP: begin
@@ -176,8 +195,8 @@ module vitis_control #(
         end
     end
 
-    // Write strobe: pulses for one cycle when write data is ready
-    wire wr_fire = (wr_state == WR_DATA);
+    // Write strobe: pulses for one cycle when both addr+data are ready
+    wire wr_fire = (wr_state == WR_EXEC);
 
     // -------------------------------------------------------------------------
     // Read Channel State Machine

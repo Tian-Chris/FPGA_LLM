@@ -1,0 +1,13 @@
+============================================================
+SIM_SMALL INTEGRATION TEST — RTL vs GOLDEN COMPARISON
+============================================================
+
+--- Final Output: Residual 2 (flush HBM) ---
+  residual2: 2048/2048 match
+
+--- URAM Contents (should be residual2) ---
+  uram_residual2: 2048/2048 match
+
+============================================================
+SUMMARY: 4096/4096 elements match
+ALL CHECKS PASSED

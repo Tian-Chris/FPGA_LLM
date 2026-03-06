@@ -1,0 +1,8 @@
+*.vcd
+scripts/.last_target
+obj_dir/
+verify/test_data/
+verify/__pycache__
+.claude/
+tasks/
+CLAUDE.md

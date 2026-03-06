@@ -1,0 +1,25 @@
+============================================================
+DECODE MODE TEST - RTL vs GOLDEN COMPARISON
+============================================================
+
+--- Prefill K cache (flush HBM) ---
+  prefill_K_cache: 8192/8192 match
+
+--- Prefill V cache (flush HBM) ---
+  prefill_V_cache: 8192/8192 match
+
+--- Decode K_new at row 8 (flush HBM) ---
+  decode_K_new: 1024/1024 match
+
+--- Decode V_new at row 8 (flush HBM) ---
+  decode_V_new: 1024/1024 match
+
+--- Decode Residual 2 (flush HBM at ACT_EMBED) ---
+  decode_res2_flush: 1024/1024 match
+
+--- Decode Residual 2 (URAM row 0) ---
+  decode_res2_uram: 1024/1024 match
+
+============================================================
+SUMMARY: 20480/20480 elements match
+ALL CHECKS PASSED

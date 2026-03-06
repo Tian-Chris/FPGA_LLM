@@ -1,0 +1,166 @@
+FPGA Transformer Accelerator — GPT-2 on Alveo U280
+====================================================
+
+Fixed-point transformer inference engine targeting Xilinx Alveo U280.
+INT16 datapath, INT32 accumulation, HBM2 memory hierarchy.
+
+Architecture
+------------
+Compute:
+  - 2x parallel 32x32 tiled matmul engines (1024 mac_units each, DSP48E2 mapped)
+  - Tiling engine dispatches (M,N) tile pairs round-robin to idle engines
+  - Per-engine tile loaders issue AXI4 read bursts from HBM (weight + activation)
+  - URAM accumulation buffer (1024x4096 x INT16) with write arbiter backpressure
+
+Memory hierarchy:
+  - HBM2 (8 GB, 32 channels): weight storage, activation storage, output
+  - URAM: on-chip accumulation buffer + non-matmul staging area
+  - Per-engine tile loaders (64-word local buffer, blocking load-then-compute)
+  - URAM flush controller (URAM -> HBM via AXI4 write bursts)
+
+Non-matmul path:
+  - Scalar NM adapter (16-bit <-> 256-bit URAM bridge, read cache + write buffer)
+  - act_dma (scalar <-> HBM bridge for LN params, residual skip connections)
+  - Softmax (3-pass, exp/recip LUTs, causal masking, attention scaling)
+  - LayerNorm (3-pass, BRAM input buffer, 2-stage normalize pipeline)
+  - ReLU activation, saturating residual add
+
+Control:
+  - FSM controller (step-table architecture, GPT-2 pre-norm program)
+  - Host interface (AXI-Lite) or Vitis ap_ctrl_hs (FPGA target)
+  - KV cache decode mode (prefill + autoregressive single-token decode)
+
+FPGA deployment (Alveo U280):
+  - 6 AXI4 master ports to HBM (2 wgt, 2 act, 1 flush, 1 DMA)
+  - Vitis RTL kernel packaging (.xo) via build.tcl
+  - v++ link with AltSpreadLogic_high placement directive
+  - XRT host application for GPT-2 medium text generation
+
+Repository Structure
+--------------------
+  rtl/              RTL source files
+    defines.vh        Centralized parameters (dimensions, bus widths, FSM states)
+    top_level.v       Top-level: generates engines, wires shared infrastructure
+    fsm_controller.v  Step-table FSM orchestrator (GPT-2 pre-norm / post-norm)
+    host_interface.v  AXI-Lite slave (simulation)
+    matmul_engine.v   32x32 outer-product MAC engine + per-engine controller
+    mac_unit.v        Single pipelined MAC (3-stage, DSP48E2 target)
+    agu.v             Address generation for tiled matmul
+    tiling_engine.v   Master tile dispatcher (N engines)
+    tile_loader.v     HBM -> local buffer AXI4 read loader
+    mem_arbiter.v     Round-robin arbiter for multi-engine activation BRAM
+    uram_accum_buf.v  URAM output buffer with write serialization
+    uram_flush.v      URAM -> HBM flush via AXI4 write bursts
+    uram_nm_adapter.v Scalar <-> URAM bus-width bridge
+    act_dma.v         Scalar <-> HBM DMA bridge
+    sim_hbm_port.v    HBM simulation stub (not synthesized)
+    softmax.v         3-pass softmax with causal masking
+    layernorm.v       3-pass layer normalization (BRAM-buffered)
+    activation.v      ReLU activation
+    residual_add.v    Saturating residual addition
+    quant_layer.v     INT16 -> INT8 quantization
+    positional_embedding.v  Token + position embedding addition
+    bram_controller.v Legacy BRAM controller
+
+  fpga/             FPGA build files (Alveo U280)
+    rtl/
+      fpga_kernel.v   Vitis RTL kernel wrapper (port renaming, addr conversion)
+      vitis_control.v Vitis ap_ctrl_hs AXI-Lite slave
+    kernel.xml        Vitis kernel descriptor
+    connectivity.cfg  HBM bank mapping (sp= assignments)
+    build.tcl         Vivado batch: package RTL -> .xo
+    Makefile          Build targets: package, link-emu, link-hw, link-hw-spread
+    host.cpp          XRT host: GPT-2 text generation (BPE tokenize -> FPGA -> decode)
+    gpt2_bpe.h        Header-only GPT-2 BPE tokenizer (C++17)
+    report.md         Build/congestion analysis notes
+
+  tb/               Testbenches (Verilator)
+    tb_top.v          Full pipeline (SIM_SMALL)
+    tb_top_1k.v       Production-scale (1024-dim, SIM_1K)
+    tb_top_decode.v   Decode mode (prefill + KV cache decode, SIM_1K)
+    tb_top_matmul1k.v Single matmul 1024x1024
+    tb_matmul.v       Matmul engine unit test
+    tb_*.v            Per-module testbenches
+
+  verify/           Co-simulation and golden model verification
+    golden/           Python golden models (matmul, softmax, layernorm, etc.)
+    tb_cosim/         RTL co-sim testbenches for individual modules
+    run_cosim.py      Compares RTL output against golden models
+    test_top.py       Full SIM_SMALL integration test
+    test_top_1k.py    Production-scale 1024-dim full pipeline test
+    test_matmul1k.py  1024x1024 single matmul test
+    test_decode_1k.py Decode mode test (prefill seq=8 + decode seq=1)
+
+  scripts/          Build/sim scripts
+    verilator.f       Verilator flags (SIM_SMALL)
+    verilator_1k.f    Verilator flags (SIM_1K)
+    verilator_decode.f Verilator flags (decode mode)
+    export_gpt2.py    Export GPT-2 weights to FPGA binary format
+
+  tasks/            Project tracking
+    summary.md        Module interface reference
+    todo.md           Current task tracker
+    lessons.md        Debugging patterns and lessons learned
+
+Configuration
+-------------
+All parameters are centralized in rtl/defines.vh. Three compile-time configs:
+
+  SIM_SMALL:    MODEL_DIM=64,  NUM_ENGINES=2, MAX_SEQ_LEN=32  (fast sim)
+  SIM_1K:       MODEL_DIM=1024, NUM_ENGINES=4, MAX_SEQ_LEN=128 (verification)
+  Production:   MODEL_DIM=1024, NUM_ENGINES=2, MAX_SEQ_LEN=128 (FPGA, reduced for routing)
+
+HBM bank layout (connectivity.cfg):
+  HBM[0:3]  Weight buffer (~576 MB across 4 banks)
+  HBM[4]    Activation buffer (16 MB)
+  HBM[5]    Output buffer (4 MB)
+
+Running Tests
+-------------
+Prerequisites: Verilator, Python 3 with numpy
+
+  make cosim              # Co-sim all modules (matmul, softmax, LN, ReLU, residual)
+  make test-small         # Full SIM_SMALL pipeline (64-dim, 2 engines)
+  make test-1k            # Production-scale full pipeline (1024-dim)
+  make test-decode        # Decode mode (prefill seq=8 + decode seq=1 with KV cache)
+  make test-matmul1k      # Single 1024x1024 matmul verification
+
+FPGA Build (Alveo U280)
+------------------------
+Prerequisites: Vivado 2022.2, Vitis 2022.2, XRT, U280 platform
+
+  cd fpga
+  make clean              # Remove stale build artifacts
+  make package            # Vivado: package RTL -> fpga_kernel.xo
+  make link-hw-spread     # v++: link -> fpga_kernel_hw.xclbin (hours)
+
+  # Or for hardware emulation (faster, no FPGA needed):
+  make link-emu           # v++: link -> fpga_kernel_hw_emu.xclbin
+
+GPT-2 Inference
+---------------
+1. Export weights (while synthesis runs):
+    pip install torch transformers numpy
+    python scripts/export_gpt2.py --output-dir fpga/data
+
+2. Download tokenizer:
+    cd fpga/data
+    wget https://huggingface.co/gpt2-medium/resolve/main/vocab.json
+    wget https://huggingface.co/gpt2-medium/resolve/main/merges.txt
+
+3. Compile host:
+    cd fpga
+    make host
+
+4. Run inference (after synthesis):
+    ./host fpga_kernel_hw.xclbin data "The meaning of life is" 50
+    ./host fpga_kernel_hw.xclbin data "Once upon a time" 100 0.8
+
+Known Limitations
+-----------------
+- GELU replaced with ReLU (GPT-2 uses GELU — reduced output quality)
+- No bias in matmul (GPT-2 linears have bias — skipped)
+- Final LayerNorm (ln_f) runs on host, not in RTL
+- INT8 symmetric per-tensor weight quantization loses precision
+- quant_layer memory interface tied off (needs HBM adapter)
+- Per-engine dedicated HBM ports limit engine scaling (see fpga/report.md)

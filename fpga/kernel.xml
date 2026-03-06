@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root versionMajor="1" versionMinor="9">
+  <kernel name="fpga_kernel" language="ip_c" vlnv="user.org:kernel:fpga_kernel:1.0"
+          attributes="" preferredWorkGroupSizeMultiple="0"
+          workGroupSize="1" interrupt="true" hwControlProtocol="ap_ctrl_hs">
+
+    <ports>
+      <!-- AXI-Lite slave port -->
+      <port name="s_axi_control" mode="slave" range="0x100" dataWidth="32" portType="addressable" base="0x0"/>
+      <!-- 6 AXI4 master ports to HBM (2 engines) -->
+      <port name="m_axi_hbm00" mode="master" range="0x200000000" dataWidth="256" portType="addressable" base="0x0"/>
+      <port name="m_axi_hbm01" mode="master" range="0x200000000" dataWidth="256" portType="addressable" base="0x0"/>
+      <port name="m_axi_hbm06" mode="master" range="0x200000000" dataWidth="256" portType="addressable" base="0x0"/>
+      <port name="m_axi_hbm07" mode="master" range="0x200000000" dataWidth="256" portType="addressable" base="0x0"/>
+      <port name="m_axi_hbm12" mode="master" range="0x200000000" dataWidth="256" portType="addressable" base="0x0"/>
+      <port name="m_axi_hbm13" mode="master" range="0x200000000" dataWidth="256" portType="addressable" base="0x0"/>
+    </ports>
+
+    <args>
+      <!-- Scalar arguments (offsets must match vitis_control.v register map) -->
+      <arg name="batch_size"   addressQualifier="0" id="0" port="s_axi_control" size="0x4" offset="0x10" type="uint"   hostOffset="0x0" hostSize="0x4"/>
+      <arg name="seq_len"      addressQualifier="0" id="1" port="s_axi_control" size="0x4" offset="0x18" type="uint"   hostOffset="0x0" hostSize="0x4"/>
+      <!-- Weight buffer: hbm00+hbm01 share weight_ptr register at 0x20 -->
+      <arg name="weight_ptr"   addressQualifier="1" id="2" port="m_axi_hbm00" size="0x8" offset="0x20" type="uint*" hostOffset="0x0" hostSize="0x8"/>
+      <arg name="weight_ptr_1" addressQualifier="1" id="3" port="m_axi_hbm01" size="0x8" offset="0x20" type="uint*" hostOffset="0x0" hostSize="0x8"/>
+      <!-- Activation buffer: hbm06+hbm07+hbm12 share act_ptr register at 0x28 -->
+      <arg name="act_ptr"      addressQualifier="1" id="4" port="m_axi_hbm06" size="0x8" offset="0x28" type="uint*" hostOffset="0x0" hostSize="0x8"/>
+      <arg name="act_ptr_1"    addressQualifier="1" id="5" port="m_axi_hbm07" size="0x8" offset="0x28" type="uint*" hostOffset="0x0" hostSize="0x8"/>
+      <arg name="flush_ptr"    addressQualifier="1" id="6" port="m_axi_hbm12" size="0x8" offset="0x28" type="uint*" hostOffset="0x0" hostSize="0x8"/>
+      <!-- Output/DMA buffer: hbm13 at 0x30 -->
+      <arg name="output_ptr"   addressQualifier="1" id="7" port="m_axi_hbm13" size="0x8" offset="0x30" type="uint*" hostOffset="0x0" hostSize="0x8"/>
+      <arg name="decode_mode"  addressQualifier="0" id="8" port="s_axi_control" size="0x4" offset="0x38" type="uint" hostOffset="0x0" hostSize="0x4"/>
+      <arg name="cache_len"    addressQualifier="0" id="9" port="s_axi_control" size="0x4" offset="0x40" type="uint" hostOffset="0x0" hostSize="0x4"/>
+    </args>
+
+  </kernel>
+</root>

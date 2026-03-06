@@ -1,0 +1,13 @@
+============================================================
+PRODUCTION 1K INTEGRATION TEST - RTL vs GOLDEN COMPARISON
+============================================================
+
+--- Final Output: Residual 2 (flush HBM) ---
+  residual2_flush: 32768/32768 match
+
+--- URAM Contents (should be residual2) ---
+  residual2_uram: 32768/32768 match
+
+============================================================
+SUMMARY: 65536/65536 elements match
+ALL CHECKS PASSED

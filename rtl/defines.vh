@@ -15,15 +15,13 @@
 // =============================================================================
 
 `ifdef SIM_SMALL
-// --- Shrunk parameters for fast integration tests ---
-// Memory footprint: 6 HBMs x 4096 x 32B = 768KB (vs 29MB production)
-// URAM: 32 x 8 x 32B = 8KB (vs 8MB production)
-parameter MODEL_DIM     = 64;
-parameter NUM_HEADS     = 2;
+// --- Minimal parameters for fast XSim / integration tests ---
+parameter MODEL_DIM     = 32;
+parameter NUM_HEADS     = 1;
 parameter HEAD_DIM      = MODEL_DIM / NUM_HEADS;   // 32
-parameter F_DIM         = 128;
-parameter INPUT_DIM     = 64;
-parameter MAX_SEQ_LEN   = 32;
+parameter F_DIM         = 32;
+parameter INPUT_DIM     = 32;
+parameter MAX_SEQ_LEN   = 4;
 parameter MAX_BATCH     = 1;
 parameter NUM_ENC_LAYERS = 1;
 parameter NUM_DEN_LAYERS = 0;
@@ -87,8 +85,8 @@ parameter HBM_NUM_CH    = 10;           // Channels used (of 32 available)
 
 // URAM Configuration (output accumulation buffer)
 `ifdef SIM_SMALL
-parameter URAM_ROWS     = 32;           // MAX_SEQ_LEN
-parameter URAM_COLS     = 128;          // F_DIM
+parameter URAM_ROWS     = 4;            // MAX_SEQ_LEN
+parameter URAM_COLS     = 32;           // F_DIM
 `else
 parameter URAM_ROWS     = 1024;         // MODEL_DIM
 parameter URAM_COLS     = 4096;         // F_DIM (widened for non-matmul URAM staging)

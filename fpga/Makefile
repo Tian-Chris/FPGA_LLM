@@ -127,7 +127,7 @@ HOST_EMU_EXE := host_emu
 package-small: $(SMALL_XO)
 
 $(SMALL_XO): build.tcl kernel.xml rtl/fpga_kernel.v rtl/vitis_control.v $(wildcard ../rtl/*.v ../rtl/*.vh)
-	cd .. && EMU_SMALL=1 $(VIVADO) -mode batch -source fpga/build.tcl -tclargs
+	cd .. && export EMU_SMALL=1 && $(VIVADO) -mode batch -source fpga/build.tcl -tclargs
 	@echo "=== Package-small complete: $(SMALL_XO) ==="
 
 link-emu-small: $(SMALL_XCLBIN)

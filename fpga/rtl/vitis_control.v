@@ -321,6 +321,11 @@ module vitis_control #(
                 start    <= 1'b1;
                 ap_idle  <= 1'b0;
                 ap_start <= 1'b0;
+                // synthesis translate_off
+                $display("[VITIS_CTRL %0t] ap_start fired: batch=%0d seq=%0d wgt=0x%0h act=0x%0h out=0x%0h",
+                         $time, batch_size, seq_len, {weight_ptr_hi, weight_ptr_lo},
+                         {act_ptr_hi, act_ptr_lo}, {output_ptr_hi, output_ptr_lo});
+                // synthesis translate_on
             end
 
             // ap_done: set on done pulse from FSM

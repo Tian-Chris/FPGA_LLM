@@ -346,6 +346,10 @@ module fsm_controller #(
                         nm_row_cnt     <= {DIM_W{1'b0}};
                         nm_addr_offset <= {DIM_W{1'b0}};
                         state     <= S_DECODE;
+                        // synthesis translate_off
+                        $display("[FSM %0t] START: batch=%0d seq=%0d decode=%0d cache_len=%0d",
+                                 $time, batch_size, seq_len, decode_mode, cache_len);
+                        // synthesis translate_on
                     end
                 end
 
@@ -355,6 +359,10 @@ module fsm_controller #(
                 S_DECODE: begin
                     step_bt  <= step_entry[7:4];
                     step_cfg <= step_entry[3:0];
+                    // synthesis translate_off
+                    $display("[FSM %0t] DECODE step[%0d]: bt=%0d cfg=%0d",
+                             $time, step_idx, step_entry[7:4], step_entry[3:0]);
+                    // synthesis translate_on
                     case (step_entry[7:4])
                         BT_LN:     state <= S_LN_RUN;
                         BT_QKV:    begin state <= S_QKV_MM; qkv_phase <= 2'd0; end
@@ -383,8 +391,14 @@ module fsm_controller #(
                             endcase
                             ln_start <= 1'b1;
                             ln_dim   <= MODEL_DIM;
+                            // synthesis translate_off
+                            $display("[FSM %0t] LN_RUN: row=%0d/%0d dim=%0d", $time, nm_row_cnt, bt, MODEL_DIM);
+                            // synthesis translate_on
                         end
                         if (ln_done) begin
+                            // synthesis translate_off
+                            $display("[FSM %0t] LN_DONE: row=%0d", $time, nm_row_cnt);
+                            // synthesis translate_on
                             if (nm_row_cnt == bt - 1) begin
                                 nm_row_cnt     <= {DIM_W{1'b0}};
                                 nm_addr_offset <= {DIM_W{1'b0}};
@@ -747,6 +761,10 @@ module fsm_controller #(
                 // S_NEXT_STEP: advance step_idx, handle BT_END -> layer loop
                 // ---------------------------------------------------------
                 S_NEXT_STEP: begin
+                    // synthesis translate_off
+                    $display("[FSM %0t] NEXT_STEP: step_idx=%0d step_bt=%0d layer=%0d",
+                             $time, step_idx, step_bt, layer_cnt);
+                    // synthesis translate_on
                     if (step_bt == BT_END) begin
                         // Layer complete
                         if (layer_cnt < NUM_ENC_LAYERS - 1) begin
@@ -781,6 +799,9 @@ module fsm_controller #(
 
                 // ---------------------------------------------------------
                 S_DONE: begin
+                    // synthesis translate_off
+                    $display("[FSM %0t] DONE — kernel complete", $time);
+                    // synthesis translate_on
                     done <= 1'b1;
                     busy <= 1'b0;
                     state <= S_IDLE;

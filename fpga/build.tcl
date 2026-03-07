@@ -121,6 +121,30 @@ ipx::update_checksums $core
 ipx::save_core $core
 
 # =============================================================================
+# EMU_SMALL: inject `define SIM_SMALL into the IP copy of fpga_kernel.v
+# This ensures XSim sees SIM_SMALL when v++ compiles from the .xo.
+# =============================================================================
+if {[info exists ::env(EMU_SMALL)]} {
+    # Inject into defines.vh — every .v file includes it, and XSim compiles
+    # each file as a separate compilation unit so a define in one file
+    # doesn't propagate to others.
+    set ip_defines "${ip_root_dir}/src/defines.vh"
+    if {[file exists $ip_defines]} {
+        set fd [open $ip_defines r]
+        set orig [read $fd]
+        close $fd
+        set fd [open $ip_defines w]
+        puts $fd "`define SIM_SMALL"
+        puts $fd "`define FPGA_TARGET"
+        puts -nonewline $fd $orig
+        close $fd
+        puts "INFO: Injected SIM_SMALL define into $ip_defines"
+    } else {
+        puts "WARNING: Could not find $ip_defines to inject SIM_SMALL"
+    }
+}
+
+# =============================================================================
 # Package .xo
 # =============================================================================
 if {[file exists $xo_file]} {

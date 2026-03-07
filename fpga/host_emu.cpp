@@ -23,11 +23,11 @@
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_kernel.h"
 
-// SIM_SMALL constants
-static constexpr int MODEL_DIM    = 64;
+// SIM_SMALL constants (must match defines.vh SIM_SMALL)
+static constexpr int MODEL_DIM    = 32;
 static constexpr int BUS_ELEMS    = 16;
 static constexpr int WORD_BYTES   = 32;
-static constexpr int MODEL_STRIDE = MODEL_DIM / BUS_ELEMS;  // 4
+static constexpr int MODEL_STRIDE = MODEL_DIM / BUS_ELEMS;  // 2
 
 // Buffer sizes (generous for small dims)
 static constexpr size_t WEIGHT_BUF_SIZE = 1 * 1024 * 1024;   // 1 MB
@@ -35,7 +35,7 @@ static constexpr size_t ACT_BUF_SIZE    = 256 * 1024;         // 256 KB
 static constexpr size_t OUTPUT_BUF_SIZE = 64 * 1024;          // 64 KB
 
 // Test parameters
-static constexpr int SEQ_LEN   = 2;
+static constexpr int SEQ_LEN   = 1;
 static constexpr int BATCH_SIZE = 1;
 
 int main(int argc, char* argv[]) {
@@ -129,27 +129,33 @@ int main(int argc, char* argv[]) {
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
+    std::cout << "Launching kernel..." << std::flush;
     auto run = kernel(batch_size, seq_len,
                       bo_weight, bo_weight,       // args 2-3: hbm00+01
                       bo_act, bo_act, bo_act,     // args 4-6: hbm06+07+12(flush)
                       bo_output,                  // arg 7: hbm13(dma/output)
                       decode_mode, cache_len);    // args 8-9
+    std::cout << " launched. Polling...\n" << std::flush;
 
     // -----------------------------------------------------------------
     // Poll with 120s timeout (hw_emu is slow)
     // -----------------------------------------------------------------
     bool timed_out = true;
-    int poll_count = 1200;  // 1200 x 100ms = 120s
+    int poll_count = 120000;  // 120000 x 1ms = 120s
 
     for (int p = 0; p < poll_count; ++p) {
-        auto state = run.wait(std::chrono::milliseconds(100));
+        auto state = run.wait(std::chrono::milliseconds(1));
 
-        // Print status periodically
-        if (p < 10 || (p % 50) == 0) {
+        // Print status periodically (~every 1s, plus first 10)
+        if (p < 10 || (p % 1000) == 0) {
             auto elapsed = std::chrono::duration<double>(
                 std::chrono::high_resolution_clock::now() - t0).count();
-            std::cout << "  Poll[" << p << "] " << elapsed << "s: state="
-                      << static_cast<int>(state) << "\n";
+            uint32_t fsm_state = kernel.read_register(0x48);
+            uint32_t fsm_layer = kernel.read_register(0x50);
+            std::cout << "  Poll[" << p << "] " << elapsed << "s: ert="
+                      << static_cast<int>(state)
+                      << " fsm=" << fsm_state
+                      << " layer=" << fsm_layer << std::endl;
         }
 
         if (state == ERT_CMD_STATE_COMPLETED) {

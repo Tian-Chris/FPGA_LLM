@@ -9,7 +9,11 @@
 
 set project_name "fpga_kernel_pkg"
 set kernel_name  "fpga_kernel"
-set xo_file      "[pwd]/fpga/${kernel_name}.xo"
+if {[info exists ::env(EMU_SMALL)]} {
+    set xo_file "[pwd]/fpga/${kernel_name}_small.xo"
+} else {
+    set xo_file "[pwd]/fpga/${kernel_name}.xo"
+}
 set rtl_dir      "[pwd]/rtl"
 set fpga_rtl_dir "[pwd]/fpga/rtl"
 set kernel_xml   "[pwd]/fpga/kernel.xml"
@@ -39,8 +43,13 @@ add_files -norecurse $filtered_files
 # FPGA-specific RTL
 add_files -norecurse [glob ${fpga_rtl_dir}/*.v]
 
-# Set defines.vh include path and FPGA_TARGET define
-set_property verilog_define {FPGA_TARGET} [current_fileset]
+# Set defines.vh include path and verilog defines
+if {[info exists ::env(EMU_SMALL)]} {
+    set_property verilog_define {FPGA_TARGET SIM_SMALL} [current_fileset]
+    puts "INFO: EMU_SMALL mode — using SIM_SMALL dimensions"
+} else {
+    set_property verilog_define {FPGA_TARGET} [current_fileset]
+}
 set_property include_dirs $rtl_dir [current_fileset]
 
 # Mark all .v files as SystemVerilog (defines.vh uses root-scope

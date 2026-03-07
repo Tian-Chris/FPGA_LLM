@@ -28,7 +28,7 @@ int main(int argc, char* argv[]) {
 
     // Open device
     std::cout << "Opening device...\n";
-    auto device = xrt::device(0);
+    auto device = xrt::device(1);
 
     std::cout << "Loading xclbin: " << xclbin_path << "\n";
     auto uuid = device.load_xclbin(xclbin_path);

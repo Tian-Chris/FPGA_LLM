@@ -95,6 +95,8 @@ module vitis_control #(
     localparam ADDR_OUTPUT_HI   = 7'h34;
     localparam ADDR_DECODE_MODE = 7'h38;
     localparam ADDR_CACHE_LEN   = 7'h40;
+    localparam ADDR_DBG_STATE   = 7'h48;
+    localparam ADDR_DBG_LAYER   = 7'h50;
 
     // -------------------------------------------------------------------------
     // Internal registers
@@ -241,6 +243,8 @@ module vitis_control #(
                             ADDR_OUTPUT_HI:   s_axi_rdata <= output_ptr_hi;
                             ADDR_DECODE_MODE: s_axi_rdata <= {31'd0, decode_mode};
                             ADDR_CACHE_LEN:   s_axi_rdata <= {16'd0, cache_len};
+                            ADDR_DBG_STATE:   s_axi_rdata <= {26'd0, current_state};
+                            ADDR_DBG_LAYER:   s_axi_rdata <= {16'd0, current_layer};
                             default:          s_axi_rdata <= 32'd0;
                         endcase
                         rd_state <= RD_DATA;

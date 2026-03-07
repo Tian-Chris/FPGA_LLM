@@ -435,6 +435,7 @@ int main(int argc, char* argv[]) {
     }
     if (timed_out) {
         std::cerr << "ERROR: Kernel timed out after 30s\n";
+        std::cerr << "  Run: ./dbg_read " << xclbin_path << "   (to read FSM state)\n";
         std::cerr << "--- Checking CU status via xbutil ---\n";
         system("xbutil examine -d 0000:3b:00.1 --report dynamic-regions 2>&1");
         return 1;
@@ -510,6 +511,7 @@ int main(int argc, char* argv[]) {
             if (st == ERT_CMD_STATE_COMPLETED) break;
             if (p == 99) {
                 std::cerr << "\nERROR: Decode timed out\n";
+                std::cerr << "  Run: ./dbg_read " << xclbin_path << "\n";
                 system("xbutil examine -d 0000:3b:00.1 --report dynamic-regions 2>&1");
                 return 1;
             }

@@ -3,6 +3,7 @@ FPGA Transformer Accelerator — GPT-2 on Alveo U280
 
 Fixed-point transformer inference engine targeting Xilinx Alveo U280.
 INT16 datapath, INT32 accumulation, HBM2 memory hierarchy.
+GPT-2 Medium (1024-dim, 16 heads, 24 layers, 4096 FFN) with KV cache decode.
 
 Architecture
 ------------
@@ -33,16 +34,16 @@ Control:
 FPGA deployment (Alveo U280):
   - 6 AXI4 master ports to HBM (2 wgt, 2 act, 1 flush, 1 DMA)
   - Vitis RTL kernel packaging (.xo) via build.tcl
-  - v++ link with AltSpreadLogic_high placement directive
+  - v++ link with AltSpreadLogic_high placement directive (148 MHz achieved)
   - XRT host application for GPT-2 medium text generation
 
 Repository Structure
 --------------------
-  rtl/              RTL source files
+  rtl/              RTL source files (~9000 lines, Verilator-compatible)
     defines.vh        Centralized parameters (dimensions, bus widths, FSM states)
     top_level.v       Top-level: generates engines, wires shared infrastructure
     fsm_controller.v  Step-table FSM orchestrator (GPT-2 pre-norm / post-norm)
-    host_interface.v  AXI-Lite slave (simulation)
+    host_interface.v  AXI-Lite slave (simulation only)
     matmul_engine.v   32x32 outer-product MAC engine + per-engine controller
     mac_unit.v        Single pipelined MAC (3-stage, DSP48E2 target)
     agu.v             Address generation for tiled matmul
@@ -97,10 +98,32 @@ Repository Structure
     verilator_decode.f Verilator flags (decode mode)
     export_gpt2.py    Export GPT-2 weights to FPGA binary format
 
+  test_ctrl/        Minimal ap_ctrl_hs test kernel (for debugging XRT handshake)
+
   tasks/            Project tracking
     summary.md        Module interface reference
     todo.md           Current task tracker
     lessons.md        Debugging patterns and lessons learned
+
+Module Hierarchy
+----------------
+  top_level (diffusion_transformer_top)
+  ├── vitis_control / host_interface    (AXI-Lite control, swapped by FPGA_TARGET)
+  ├── fsm_controller                    (step-table FSM, 17 states)
+  ├── tiling_engine                     (M×N tile dispatch to engines)
+  ├── [per-engine ×2]:
+  │   ├── tile_loader (weight)          (HBM → 64-word local BRAM)
+  │   ├── tile_loader (activation)
+  │   ├── sim_hbm_port ×2              (sim only, ifdef'd out for FPGA)
+  │   └── matmul_controller             (K-loop + matmul_engine 32×32 MAC array)
+  ├── uram_accum_buf                    (1024×4096, round-robin write arbiter)
+  ├── uram_flush                        (URAM → HBM AXI4 write master)
+  ├── uram_nm_adapter                   (scalar ↔ URAM, 1-word cache)
+  ├── act_dma                           (scalar ↔ HBM, for params + skip)
+  ├── softmax                           (3-pass, LUT exp/recip, causal mask)
+  ├── layernorm                         (3-pass, BRAM buffer, 2-stage pipeline)
+  ├── activation_unit                   (ReLU)
+  └── residual_add                      (saturating INT16 add)
 
 Configuration
 -------------
@@ -110,57 +133,204 @@ All parameters are centralized in rtl/defines.vh. Three compile-time configs:
   SIM_1K:       MODEL_DIM=1024, NUM_ENGINES=4, MAX_SEQ_LEN=128 (verification)
   Production:   MODEL_DIM=1024, NUM_ENGINES=2, MAX_SEQ_LEN=128 (FPGA, reduced for routing)
 
-HBM bank layout (connectivity.cfg):
-  HBM[0:3]  Weight buffer (~576 MB across 4 banks)
-  HBM[4]    Activation buffer (16 MB)
-  HBM[5]    Output buffer (4 MB)
+Fixed hardware constants:
+  DATA_WIDTH    = 16      INT16 inputs/weights/outputs
+  ACC_WIDTH     = 32      INT32 accumulation in MAC units
+  TILE_SIZE     = 32      32×32 outer-product MAC array
+  BUS_WIDTH     = 256     16 INT16 elements per AXI beat
+  HBM_ADDR_W    = 28      256-bit word address, covers 8GB
+
+Architecture selection:
+  ARCHITECTURE = 0   GPT-2 Pre-Norm (LN before attention/FFN)
+  ARCHITECTURE = 1   Post-Norm (LN after attention/FFN, original transformer)
+
+HBM Memory Layout
+-----------------
+Weight buffer (HBM[0:3], ~576 MB for GPT-2 Medium):
+  Per-layer (786,688 words × 32 bytes/word ≈ 24 MB):
+    Offset 0:        W_Q   (1024×1024)
+    Offset 65536:    W_K   (1024×1024)
+    Offset 131072:   W_V   (1024×1024)
+    Offset 196608:   W_O   (1024×1024)
+    Offset 262144:   FFN1  (1024×4096)
+    Offset 524288:   FFN2  (4096×1024)
+    Offset 786432:   LN1 gamma/beta (2×1024 elements)
+    Offset 786560:   LN2 gamma/beta (2×1024 elements)
+
+Activation buffer (HBM[4], ~16 MB):
+    ACT_EMBED:  seq×1024     Embeddings / residual output
+    ACT_Q:      seq×1024     Query projections
+    ACT_K:      seq×1024     Key projections (+ KV cache)
+    ACT_V:      seq×1024     Value projections (+ KV cache)
+    ACT_ATTN:   seq×seq      Attention scores
+    ACT_TEMP:   seq×1024     Staging (LN output for pre-norm)
+
+HBM bank assignment (connectivity.cfg):
+    m_axi_hbm00/01  Read   HBM[0:3]  Weight loaders (engine 0/1)
+    m_axi_hbm06/07  Read   HBM[4]    Act loaders (engine 0/1)
+    m_axi_hbm12     Write  HBM[4]    URAM flush
+    m_axi_hbm13     R/W    HBM[0:5]  DMA (params, skip, output)
+
+All data is INT16, packed 16 elements per 256-bit word, row-major.
+
+FSM Layer Program (GPT-2 Pre-Norm)
+-----------------------------------
+Each layer executes 16 steps from a step table (fsm_controller.v):
+
+  Step  Block    Config  Description
+  ────  ───────  ──────  ───────────────────────────
+   0    LN       0       LayerNorm1 on embeddings
+   1    FLUSH    1       LN1 output → ACT_TEMP
+   2    QKV      1       Q/K/V matmuls (from ACT_TEMP, 3 phases)
+   3    ATTN     0       Multi-head attention (score→softmax→output, 16 heads)
+   4    MATMUL   0       Output projection (W_O)
+   5    RES      0       Residual1 (embeddings + projected attention)
+   6    FLUSH    0       Residual1 → ACT_EMBED
+   7    LN       1       LayerNorm2
+   8    FLUSH    1       LN2 output → ACT_TEMP
+   9    MATMUL   2       FFN1 (from ACT_TEMP, 1024→4096)
+  10    ACT      0       ReLU on FFN1 output
+  11    FLUSH    2       FFN1 output → ACT_FFN
+  12    MATMUL   3       FFN2 (4096→1024)
+  13    RES      0       Residual2 (residual1 + FFN output)
+  14    FLUSH    0       Residual2 → ACT_EMBED
+  15    END      0       Layer done → loop or finish
+
+Block types: BT_LN(0), BT_QKV(1), BT_ATTN(2), BT_MATMUL(3),
+             BT_ACT(4), BT_RES(5), BT_FLUSH(6), BT_END(15)
+
+Decode mode (KV cache): When decode_mode=1, only 4 states change:
+  S_QKV_MM:    K/V appended at cache_len offset
+  S_ATT_SCORE: Q(1×d) × K_cached^T → scores(1×cache_total)
+  S_ATT_SM:    Softmax over cache_total columns, causal at row=cache_len
+  S_ATT_OUT:   Scores(1×cache_total) × V_cached → output(1×d)
+
+Changing the Model
+------------------
+1. Different dimensions:
+   Edit rtl/defines.vh in the appropriate ifdef block. Change MODEL_DIM,
+   F_DIM, NUM_HEADS. Update URAM_ROWS/COLS to fit. Weight layout offsets
+   in fsm_controller.v auto-compute from MODEL_DIM and F_DIM.
+
+2. Different architecture (pre-norm vs post-norm):
+   Set ARCHITECTURE=0 (pre-norm) or ARCHITECTURE=1 (post-norm) in defines.vh.
+   Each has its own step table in fsm_controller.v.
+
+3. New architecture:
+   Define a new step table (16 entries max) in fsm_controller.v:
+     localparam [8*MAX_STEPS-1:0] PROG_CUSTOM = {
+         {BT_END,    4'd0},   // step 15
+         ...                   // your steps
+         {BT_LN,     4'd0}    // step 0
+     };
+   Add it to the PROGRAM selection logic. If you need new block types,
+   add new states to the FSM case statement.
+
+4. Different activation:
+   Replace ReLU logic in activation_unit.v. GELU needs a LUT or polynomial
+   approximation (similar to softmax's exp LUT approach).
+
+5. Add bias to matmul:
+   Option A: Fuse bias into a residual_add step after each matmul
+   Option B: Add bias accumulation to matmul_engine.v output stage
+
+6. More layers / different model:
+   Change NUM_ENC_LAYERS. FSM loops automatically. Weight buffer grows
+   proportionally. Re-export weights with scripts/export_gpt2.py.
+
+7. Longer sequences:
+   Increase MAX_SEQ_LEN. Update URAM_ROWS if needed. Activation buffer
+   grows proportionally.
 
 Running Tests
 -------------
 Prerequisites: Verilator, Python 3 with numpy
 
+  make lint               # Verilator lint check
   make cosim              # Co-sim all modules (matmul, softmax, LN, ReLU, residual)
-  make test-small         # Full SIM_SMALL pipeline (64-dim, 2 engines)
-  make test-1k            # Production-scale full pipeline (1024-dim)
-  make test-decode        # Decode mode (prefill seq=8 + decode seq=1 with KV cache)
+  make cosim-matmul       # Co-sim matmul only
+  make cosim-softmax      # Co-sim softmax only
+  make cosim-layernorm    # Co-sim layernorm only
+  make test-small         # Full SIM_SMALL pipeline (64-dim, 2 engines, ~10 min)
+  make test-1k            # Production-scale full pipeline (1024-dim, ~30 min)
+  make test-decode        # Decode mode (prefill seq=8 + decode seq=1, ~20 min)
   make test-matmul1k      # Single 1024x1024 matmul verification
+  make sim TARGET=<module> # Run individual module testbench
+  make wave               # Open gtkwave on last trace
+
+Co-simulation system (verify/):
+  Python golden models in verify/golden/ replicate exact LUT values and
+  fixed-point arithmetic from RTL for bit-exact comparison. run_cosim.py
+  generates random inputs, compiles RTL with Verilator, runs, and compares
+  element-by-element against golden output.
+
+Latency tolerance testing (all testbenches accept Verilator -G overrides):
+  ./obj_dir/Vtb_top -GHBM_RD_LATENCY=100 -GURAM_RD_LATENCY=4
+  Tested: HBM={2,5,10,100,200} × URAM={1,2,4} — all pass.
 
 FPGA Build (Alveo U280)
 ------------------------
 Prerequisites: Vivado 2022.2, Vitis 2022.2, XRT, U280 platform
 
-  cd fpga
-  make clean              # Remove stale build artifacts
-  make package            # Vivado: package RTL -> fpga_kernel.xo
-  make link-hw-spread     # v++: link -> fpga_kernel_hw.xclbin (hours)
+  cd fpga/
 
-  # Or for hardware emulation (faster, no FPGA needed):
-  make link-emu           # v++: link -> fpga_kernel_hw_emu.xclbin
+  # Package RTL → .xo (~5 min)
+  make package
+
+  # Hardware emulation (~10 min, no FPGA needed)
+  make link-emu
+  make host
+  make run-emu
+
+  # Full hardware build (~7 hours)
+  nohup bash -c "make package && make link-hw-spread" > synth_log 2>&1 &
+
+  # Run on FPGA
+  make host
+  make run-hw
+
+Build tips:
+  - Don't make clean before rebuild — .ipcache speeds synthesis significantly
+  - Check synth_log for timing (WNS). 148 MHz achieved with AltSpreadLogic_high
+  - fpga/report.md has detailed SLR utilization analysis
 
 GPT-2 Inference
 ---------------
-1. Export weights (while synthesis runs):
+1. Export weights:
     pip install torch transformers numpy
-    python scripts/export_gpt2.py --output-dir fpga/data
+    python3 scripts/export_gpt2.py --model gpt2-medium --output-dir fpga/data/
 
 2. Download tokenizer:
-    cd fpga/data
-    wget https://huggingface.co/gpt2-medium/resolve/main/vocab.json
-    wget https://huggingface.co/gpt2-medium/resolve/main/merges.txt
+    python3 -c "from transformers import GPT2Tokenizer; \
+      t=GPT2Tokenizer.from_pretrained('gpt2'); t.save_pretrained('fpga/data')"
 
-3. Compile host:
-    cd fpga
+3. Compile and run:
+    cd fpga/
     make host
+    source /opt/xilinx/xrt/setup.sh
+    ./host fpga_kernel_hw.xclbin data/ "The meaning of life is" 50
+    ./host fpga_kernel_hw.xclbin data/ "Once upon a time" 100 0.8
 
-4. Run inference (after synthesis):
-    ./host fpga_kernel_hw.xclbin data "The meaning of life is" 50
-    ./host fpga_kernel_hw.xclbin data "Once upon a time" 100 0.8
+End-to-end flow:
+  1. Host loads tokenizer (vocab.json + merges.txt)
+  2. Host loads embeddings (embed.bin: wte 50257×1024, wpe 1024×1024, ln_f)
+  3. Host opens U280, loads xclbin, allocates XRT buffers (576 MB wgt, 16 MB act, 4 MB out)
+  4. Host loads weights.bin → HBM, syncs to device
+  5. PREFILL: tokenize → embed (wte+wpe) → quantize INT16 → launch kernel
+     (batch=1, seq=prompt_len, decode=0) → FPGA runs 24 layers × 16 steps
+  6. Host reads output, applies ln_f (FP32), unembeds (hidden × wte^T → logits)
+  7. Sample/argmax → first generated token
+  8. DECODE LOOP: embed new token → launch kernel (seq=1, decode=1, cache=total_pos)
+     → FPGA reuses KV cache → ln_f → unembed → sample → print token → repeat
 
 Known Limitations
 -----------------
 - GELU replaced with ReLU (GPT-2 uses GELU — reduced output quality)
 - No bias in matmul (GPT-2 linears have bias — skipped)
-- Final LayerNorm (ln_f) runs on host, not in RTL
-- INT8 symmetric per-tensor weight quantization loses precision
+- Final LayerNorm (ln_f) runs on host CPU, not in RTL
+- INT8 symmetric per-tensor weight quantization (may need per-channel for larger models)
+- 128 max sequence length (increase MAX_SEQ_LEN + URAM sizing for more)
+- 2 engines on FPGA (SLR0 routing congestion limits scaling)
+- 148 MHz (target 200 MHz — deeper pipelining needed)
+- No attention position encoding (ALiBi/RoPE not supported)
 - quant_layer memory interface tied off (needs HBM adapter)
-- Per-engine dedicated HBM ports limit engine scaling (see fpga/report.md)

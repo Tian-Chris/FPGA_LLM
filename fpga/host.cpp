@@ -44,6 +44,16 @@ static constexpr int F_DIM         = 4096;
 static constexpr int MAX_SEQ_LEN   = 128;
 static constexpr int NUM_LAYERS    = 24;
 static constexpr int BUS_ELEMS     = 16;   // 256-bit / 16-bit
+
+// AXI-Lite debug register offsets (match vitis_control.v)
+static constexpr uint32_t REG_DBG_STATE = 0x48;
+static constexpr uint32_t REG_DBG_LAYER = 0x50;
+static const char* FSM_NAMES[] = {
+    "IDLE", "DECODE", "LN_RUN", "QKV_MM", "QKV_FL",
+    "ATT_SCORE", "ATT_SM", "ATT_SM_FL", "ATT_OUT", "ATT_OUT_FL",
+    "MM_RUN", "ACT_RUN", "RES_RUN", "UF_RUN", "NEXT_STEP",
+    "DONE", "OUTPUT_COPY"
+};
 static constexpr int WORD_BYTES    = 32;   // 256 bits = 32 bytes
 static constexpr int MODEL_STRIDE  = MODEL_DIM / BUS_ELEMS;  // 64 words
 
@@ -342,7 +352,8 @@ int main(int argc, char* argv[]) {
     auto uuid = device.load_xclbin(xclbin_path);
 
     std::cout << "Creating kernel handle...\n";
-    xrt::kernel kernel(device, uuid, "fpga_kernel");
+    xrt::kernel kernel(device, uuid, "fpga_kernel",
+                       xrt::kernel::cu_access_mode::exclusive);
 
     // -----------------------------------------------------------------
     // Allocate device buffers
@@ -421,8 +432,16 @@ int main(int argc, char* argv[]) {
     bool timed_out = true;
     for (int p = 0; p < 300; ++p) {
         auto state = run.wait(std::chrono::milliseconds(100));
-        if (p < 10 || (p % 10) == 0) {
-            std::cout << "  Poll[" << p << "]: state=" << static_cast<int>(state) << "\n";
+        if (p < 10 || (p % 50) == 0) {
+            auto elapsed = std::chrono::duration<double>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            uint32_t fsm_st = kernel.read_register(REG_DBG_STATE);
+            uint32_t fsm_ly = kernel.read_register(REG_DBG_LAYER);
+            const char* sname = (fsm_st < 17) ? FSM_NAMES[fsm_st] : "???";
+            std::cout << "  Poll[" << p << "] " << elapsed << "s: ert="
+                      << static_cast<int>(state)
+                      << " fsm=" << fsm_st << "(" << sname << ")"
+                      << " layer=" << fsm_ly << "\n";
         }
         if (state == ERT_CMD_STATE_COMPLETED) {
             timed_out = false;
@@ -434,9 +453,12 @@ int main(int argc, char* argv[]) {
         }
     }
     if (timed_out) {
+        uint32_t fsm_st = kernel.read_register(REG_DBG_STATE);
+        uint32_t fsm_ly = kernel.read_register(REG_DBG_LAYER);
+        const char* sname = (fsm_st < 17) ? FSM_NAMES[fsm_st] : "???";
         std::cerr << "ERROR: Kernel timed out after 30s\n";
-        std::cerr << "  Run: ./dbg_read " << xclbin_path << "   (to read FSM state)\n";
-        std::cerr << "--- Checking CU status via xbutil ---\n";
+        std::cerr << "  Stuck at FSM state=" << fsm_st << " (" << sname
+                  << ") layer=" << fsm_ly << "\n";
         system("xbutil examine -d 0000:3b:00.1 --report dynamic-regions 2>&1");
         return 1;
     }
@@ -506,12 +528,27 @@ int main(int argc, char* argv[]) {
                            bo_act, bo_act, bo_act,
                            bo_output,
                            decode_mode, cache_len);
-        for (int p = 0; p < 100; ++p) {
+        for (int p = 0; p < 3000; ++p) {
             auto st = drun.wait(std::chrono::milliseconds(100));
+            if (p < 10 || (p % 50) == 0) {
+                auto elapsed = std::chrono::duration<double>(
+                    std::chrono::high_resolution_clock::now() - td0).count();
+                uint32_t fsm_st = kernel.read_register(REG_DBG_STATE);
+                uint32_t fsm_ly = kernel.read_register(REG_DBG_LAYER);
+                const char* sname = (fsm_st < 17) ? FSM_NAMES[fsm_st] : "???";
+                std::cout << "  Decode Poll[" << p << "] " << elapsed
+                          << "s: ert=" << static_cast<int>(st)
+                          << " fsm=" << fsm_st << "(" << sname << ")"
+                          << " layer=" << fsm_ly << "\n";
+            }
             if (st == ERT_CMD_STATE_COMPLETED) break;
-            if (p == 99) {
-                std::cerr << "\nERROR: Decode timed out\n";
-                std::cerr << "  Run: ./dbg_read " << xclbin_path << "\n";
+            if (p == 2999) {
+                uint32_t fsm_st = kernel.read_register(REG_DBG_STATE);
+                uint32_t fsm_ly = kernel.read_register(REG_DBG_LAYER);
+                const char* sname = (fsm_st < 17) ? FSM_NAMES[fsm_st] : "???";
+                std::cerr << "\nERROR: Decode timed out after 5min\n";
+                std::cerr << "  Stuck at FSM state=" << fsm_st << " (" << sname
+                          << ") layer=" << fsm_ly << "\n";
                 system("xbutil examine -d 0000:3b:00.1 --report dynamic-regions 2>&1");
                 return 1;
             }

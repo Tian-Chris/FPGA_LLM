@@ -25,6 +25,9 @@ set_property vitis_drc {ctrl_protocol ap_ctrl_hs} $core
 # s_axi_control
 ipx::associate_bus_interfaces -busif s_axi_control -clock ap_clk $core
 
+# m_axi_hbm0
+ipx::associate_bus_interfaces -busif m_axi_hbm0 -clock ap_clk $core
+
 # Merge kernel.xml
 set fd [open "kernel.xml" r]
 set xml [read $fd]

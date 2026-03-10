@@ -424,6 +424,10 @@ module fsm_controller #(
                 // ---------------------------------------------------------
                 S_QKV_MM: begin
                     if (mm_cmd_ready && !mm_cmd_valid && !waiting_mm) begin
+                        // synthesis translate_off
+                        $display("[FSM %0t] QKV_MM ISSUED: phase=%0d m=%0d k=%0d n=%0d",
+                                 $time, qkv_phase, bt, MODEL_DIM, MODEL_DIM);
+                        // synthesis translate_on
                         mm_cmd_valid   <= 1'b1;
                         mm_cmd_op      <= OP_MATMUL;
                         mm_cmd_m       <= bt;
@@ -455,6 +459,9 @@ module fsm_controller #(
                         waiting_mm          <= 1'b1;
                     end
                     if (mm_cmd_done && waiting_mm) begin
+                        // synthesis translate_off
+                        $display("[FSM %0t] QKV_MM DONE: phase=%0d", $time, qkv_phase);
+                        // synthesis translate_on
                         waiting_mm <= 1'b0;
                         state      <= S_QKV_FL;
                     end

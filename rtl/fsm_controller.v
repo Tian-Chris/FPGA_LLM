@@ -36,8 +36,8 @@ module fsm_controller #(
     input  wire [DIM_W-1:0]         seq_len,
     input  wire                     decode_mode,
     input  wire [DIM_W-1:0]         cache_len,
-    output reg                      done,
-    output reg                      busy,
+    (* mark_debug = "true" *) output reg                      done,
+    (* mark_debug = "true" *) output reg                      busy,
 
     // HBM base addresses (from host_interface)
     input  wire [HBM_ADDR_W-1:0]   weight_base,
@@ -45,7 +45,7 @@ module fsm_controller #(
     input  wire [HBM_ADDR_W-1:0]   output_base,
 
     // Matmul / tiling_engine command interface
-    output reg                      mm_cmd_valid,
+    (* mark_debug = "true" *) output reg                      mm_cmd_valid,
     output reg  [2:0]               mm_cmd_op,
     output reg  [DIM_W-1:0]         mm_cmd_m,
     output reg  [DIM_W-1:0]         mm_cmd_k,
@@ -55,22 +55,22 @@ module fsm_controller #(
     output reg  [HBM_ADDR_W-1:0]   mm_cmd_a_stride,
     output reg  [HBM_ADDR_W-1:0]   mm_cmd_b_stride,
     output reg  [7:0]               mm_cmd_out_col_offset,
-    input  wire                     mm_cmd_ready,
-    input  wire                     mm_cmd_done,
+    (* mark_debug = "true" *) input  wire                     mm_cmd_ready,
+    (* mark_debug = "true" *) input  wire                     mm_cmd_done,
 
     // URAM flush control
-    output reg                      uram_flush_start,
+    (* mark_debug = "true" *) output reg                      uram_flush_start,
     output reg  [9:0]               uram_flush_num_rows,
     output reg  [7:0]               uram_flush_num_col_words,
     output reg  [7:0]               uram_flush_start_col,
     output reg  [HBM_ADDR_W-1:0]   uram_flush_hbm_base,
     output reg  [HBM_ADDR_W-1:0]   uram_flush_hbm_stride,
-    input  wire                     uram_flush_done,
+    (* mark_debug = "true" *) input  wire                     uram_flush_done,
 
     // Non-matmul adapter control
     output reg  [3:0]               nm_cfg_col_bits,
     output reg                      nm_adapter_flush,
-    input  wire                     nm_adapter_flush_done,
+    (* mark_debug = "true" *) input  wire                     nm_adapter_flush_done,
     output reg  [DIM_W-1:0]         nm_addr_offset,
 
     // act_dma base address control
@@ -84,22 +84,22 @@ module fsm_controller #(
     output reg  [DIM_W-1:0]         sm_seq_len,
     output reg  [DIM_W-1:0]         sm_row_idx,
     output reg  [3:0]               sm_scale_shift,
-    input  wire                     sm_done,
+    (* mark_debug = "true" *) input  wire                     sm_done,
 
     // LayerNorm controller interface
     output reg                      ln_start,
     output reg  [DIM_W-1:0]         ln_dim,
-    input  wire                     ln_done,
+    (* mark_debug = "true" *) input  wire                     ln_done,
 
     // Activation unit interface
     output reg                      act_start,
     output reg  [DIM_W-1:0]         act_dim,
-    input  wire                     act_done,
+    (* mark_debug = "true" *) input  wire                     act_done,
 
     // Residual add interface
     output reg                      res_start,
     output reg  [DIM_W-1:0]         res_dim,
-    input  wire                     res_done,
+    (* mark_debug = "true" *) input  wire                     res_done,
 
     // Quantization layer interface
     output reg                      quant_start,
@@ -212,20 +212,20 @@ module fsm_controller #(
     // =====================================================================
     // Internal Registers
     // =====================================================================
-    reg [4:0] state;
+    (* mark_debug = "true" *) reg [4:0] state;
 
     reg [DIM_W-1:0] batch_r, seq_r;
-    reg              decode_r;
+    (* mark_debug = "true" *) reg              decode_r;
     reg [DIM_W-1:0]  cache_len_r;
-    reg [DIM_W-1:0] layer_cnt;
-    reg [3:0]       step_idx;
-    reg [3:0]       step_bt;      // block type from decoded step
+    (* mark_debug = "true" *) reg [DIM_W-1:0] layer_cnt;
+    (* mark_debug = "true" *) reg [3:0]       step_idx;
+    (* mark_debug = "true" *) reg [3:0]       step_bt;      // block type from decoded step
     reg [3:0]       step_cfg;     // config id from decoded step
-    reg [1:0]       qkv_phase;
-    reg              waiting_mm;
-    reg              nm_flush_phase;
-    reg [DIM_W-1:0]  nm_row_cnt;
-    reg [DIM_W-1:0]  head_cnt;
+    (* mark_debug = "true" *) reg [1:0]       qkv_phase;
+    (* mark_debug = "true" *) reg              waiting_mm;
+    (* mark_debug = "true" *) reg              nm_flush_phase;
+    (* mark_debug = "true" *) reg [DIM_W-1:0]  nm_row_cnt;
+    (* mark_debug = "true" *) reg [DIM_W-1:0]  head_cnt;
     reg              flush_sent;
 
     // Computed values

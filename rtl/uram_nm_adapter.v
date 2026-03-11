@@ -121,7 +121,7 @@ module uram_nm_adapter #(
     // =====================================================================
     // Read Cache — 1 bus word
     // =====================================================================
-    reg                 cache_valid;
+    (* mark_debug = "true" *) reg                 cache_valid;
     reg [ROW_W-1:0]     cache_row;
     reg [COL_W-1:0]     cache_col_word;
     reg [BUS_W-1:0]     cache_data;
@@ -133,7 +133,7 @@ module uram_nm_adapter #(
     // =====================================================================
     // Write Buffer — 1 bus word
     // =====================================================================
-    reg                 wb_dirty;
+    (* mark_debug = "true" *) reg                 wb_dirty;
     reg [ROW_W-1:0]     wb_row;
     reg [COL_W-1:0]     wb_col_word;
     reg [BUS_W-1:0]     wb_data;
@@ -143,7 +143,7 @@ module uram_nm_adapter #(
     // =====================================================================
     localparam AD_IDLE     = 3'd0;
     localparam AD_RD_WAIT  = 3'd1;   // Waiting for URAM read (cache miss)
-    reg [2:0]   ad_state;
+    (* mark_debug = "true" *) reg [2:0]   ad_state;
     reg [EL_W-1:0] pending_el_idx;   // Element index for pending read
 
     always @(posedge clk or negedge rst_n) begin

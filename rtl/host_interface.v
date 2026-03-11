@@ -56,7 +56,7 @@ module host_interface #(
     input  wire                         s_axi_rready,
 
     // Control outputs to FSM
-    output reg                          start,
+    (* mark_debug = "true" *) output reg                          start,
     output reg  [DIM_WIDTH-1:0]         batch_size,
     output reg  [DIM_WIDTH-1:0]         seq_len,
 

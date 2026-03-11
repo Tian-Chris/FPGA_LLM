@@ -42,8 +42,8 @@ module tiling_engine #(
     input  wire [HBM_ADDR_W-1:0] cmd_a_stride,
     input  wire [HBM_ADDR_W-1:0] cmd_b_stride,
     input  wire [URAM_COL_W-1:0] cmd_out_col_offset, // URAM column offset (for multi-head concat)
-    output reg                  cmd_ready,
-    output reg                  cmd_done,
+    (* mark_debug = "true" *) output reg                  cmd_ready,
+    (* mark_debug = "true" *) output reg                  cmd_done,
 
     // Per-engine tile command interface
     output reg  [N_ENG-1:0]                    eng_cmd_valid,
@@ -64,7 +64,7 @@ module tiling_engine #(
     localparam TILE_COL_WORDS = TILE / BUS_ELEMS;  // 2 bus words per tile column
 
     // State machine
-    reg [2:0] state;
+    (* mark_debug = "true" *) reg [2:0] state;
     localparam ST_IDLE     = 3'd0;
     localparam ST_SETUP    = 3'd1;
     localparam ST_DISPATCH = 3'd2;
@@ -82,12 +82,12 @@ module tiling_engine #(
     reg [DIM_W-1:0] num_n_tiles;
 
     // Tile cursor (row-major iteration)
-    reg [DIM_W-1:0] cur_m;
-    reg [DIM_W-1:0] cur_n;
-    reg             all_dispatched;
+    (* mark_debug = "true" *) reg [DIM_W-1:0] cur_m;
+    (* mark_debug = "true" *) reg [DIM_W-1:0] cur_n;
+    (* mark_debug = "true" *) reg             all_dispatched;
 
     // Outstanding tile counter
-    reg [DIM_W-1:0] tiles_outstanding;
+    (* mark_debug = "true" *) reg [DIM_W-1:0] tiles_outstanding;
 
     // Per-tile HBM base address calculations
     // A tile at (cur_m, cur_n): A starts at row cur_m*TILE, stride = words/row

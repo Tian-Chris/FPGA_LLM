@@ -65,7 +65,14 @@ static constexpr size_t ACT_BUF_SIZE     = 16 * 1024 * 1024;   // 16 MB
 static constexpr size_t OUTPUT_BUF_SIZE  =  4 * 1024 * 1024;   //  4 MB
 
 // Activation memory layout (word offsets, matching fsm_controller.v)
+// WE = BUS_ELEMS = 16
 static constexpr int ACT_EMBED_OFFSET = 0;
+static constexpr int ACT_Q_OFFSET     = MAX_SEQ_LEN * MODEL_DIM / BUS_ELEMS;      // 8192
+static constexpr int ACT_K_OFFSET     = 2 * MAX_SEQ_LEN * MODEL_DIM / BUS_ELEMS;  // 16384
+static constexpr int ACT_V_OFFSET     = 3 * MAX_SEQ_LEN * MODEL_DIM / BUS_ELEMS;  // 24576
+static constexpr int ACT_ATTN_OFFSET  = 4 * MAX_SEQ_LEN * MODEL_DIM / BUS_ELEMS;  // 32768
+static constexpr int ACT_TEMP_OFFSET  = 5 * MAX_SEQ_LEN * MODEL_DIM / BUS_ELEMS;  // 40960
+static constexpr int ACT_FFN_OFFSET   = 0;  // reuses embed region
 
 // =============================================================================
 // Embedding Data (loaded from embed.bin)
@@ -267,6 +274,84 @@ static void read_output_fp32(const int16_t* output_buf, int seq_pos,
 }
 
 // =============================================================================
+// HBM Activation Region Checker — shows which flush stages have completed
+// =============================================================================
+// GPT-2 pre-norm step order and flush targets:
+//   Step 0:  LN1          (no flush yet)
+//   Step 1:  flush LN1     → ACT_TEMP
+//   Step 2:  QKV matmul    → Q/K/V regions (3 internal flushes)
+//   Step 3:  attention     → ATT scores → ACT_ATTN, ATT output → ACT_Q+head offsets
+//   Step 4:  proj matmul   (result in URAM)
+//   Step 5:  residual1     (result in URAM)
+//   Step 6:  flush res1    → ACT_EMBED
+//   Step 7:  LN2           (no flush yet)
+//   Step 8:  flush LN2     → ACT_TEMP
+//   Step 9:  FFN1 matmul   (result in URAM)
+//   Step 10: ReLU          (result in URAM)
+//   Step 11: flush act     → ACT_FFN (=0, overlaps ACT_EMBED)
+//   Step 12: FFN2 matmul   (result in URAM)
+//   Step 13: residual2     (result in URAM)
+//   Step 14: flush res2    → ACT_EMBED
+//   Step 15: END
+
+struct ActRegion {
+    const char* name;
+    int word_offset;    // relative to act_base (in 256-bit words)
+    int num_words;      // how many words to sample
+};
+
+static const ActRegion ACT_REGIONS[] = {
+    {"EMBED",  0,                                               8},
+    {"Q",      MAX_SEQ_LEN * MODEL_DIM / BUS_ELEMS,            8},
+    {"K",      2 * MAX_SEQ_LEN * MODEL_DIM / BUS_ELEMS,        8},
+    {"V",      3 * MAX_SEQ_LEN * MODEL_DIM / BUS_ELEMS,        8},
+    {"ATTN",   4 * MAX_SEQ_LEN * MODEL_DIM / BUS_ELEMS,        8},
+    {"TEMP",   5 * MAX_SEQ_LEN * MODEL_DIM / BUS_ELEMS,        8},
+};
+static constexpr int NUM_ACT_REGIONS = sizeof(ACT_REGIONS) / sizeof(ACT_REGIONS[0]);
+
+// Check if a region has non-zero data (sample first num_words 256-bit words)
+static bool region_has_data(const int16_t* act_buf, int word_offset, int num_words) {
+    for (int w = 0; w < num_words; ++w) {
+        // Each 256-bit word = 16 INT16 elements
+        size_t base_idx = static_cast<size_t>((word_offset + w) * WORD_BYTES / 2);
+        for (int e = 0; e < BUS_ELEMS; ++e) {
+            if (act_buf[base_idx + e] != 0) return true;
+        }
+    }
+    return false;
+}
+
+// Compute a simple fingerprint (sum of absolute values of first N elements)
+static int64_t region_fingerprint(const int16_t* act_buf, int word_offset, int num_words) {
+    int64_t sum = 0;
+    for (int w = 0; w < num_words; ++w) {
+        size_t base_idx = static_cast<size_t>((word_offset + w) * WORD_BYTES / 2);
+        for (int e = 0; e < BUS_ELEMS; ++e) {
+            sum += std::abs(static_cast<int>(act_buf[base_idx + e]));
+        }
+    }
+    return sum;
+}
+
+static void dump_activation_progress(xrt::bo& bo_act, const int16_t* act_buf) {
+    // Sync activation buffer back from device
+    bo_act.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+    std::cout << "  [ACT HBM] ";
+    for (int r = 0; r < NUM_ACT_REGIONS; ++r) {
+        bool has = region_has_data(act_buf, ACT_REGIONS[r].word_offset,
+                                   ACT_REGIONS[r].num_words);
+        int64_t fp = has ? region_fingerprint(act_buf, ACT_REGIONS[r].word_offset,
+                                               ACT_REGIONS[r].num_words) : 0;
+        std::cout << ACT_REGIONS[r].name << "="
+                  << (has ? std::to_string(fp) : "empty") << " ";
+    }
+    std::cout << "\n";
+    std::cout.flush();
+}
+
+// =============================================================================
 // File loading helper
 // =============================================================================
 static bool load_file(const char* path, std::vector<char>& buf) {
@@ -352,8 +437,7 @@ int main(int argc, char* argv[]) {
     auto uuid = device.load_xclbin(xclbin_path);
 
     std::cout << "Creating kernel handle...\n";
-    xrt::kernel kernel(device, uuid, "fpga_kernel",
-                       xrt::kernel::cu_access_mode::exclusive);
+    xrt::kernel kernel(device, uuid, "fpga_kernel");
 
     // -----------------------------------------------------------------
     // Allocate device buffers
@@ -428,21 +512,15 @@ int main(int argc, char* argv[]) {
                       bo_output,
                       decode_mode, cache_len);
 
-    // Poll with timeout — check every 100ms for up to 30s
+    // Poll forever (Ctrl+C to stop) — print status every 1s, dump HBM every 5s
     bool timed_out = true;
-    for (int p = 0; p < 300; ++p) {
-        auto state = run.wait(std::chrono::milliseconds(100));
-        if (p < 10 || (p % 50) == 0) {
-            auto elapsed = std::chrono::duration<double>(
-                std::chrono::high_resolution_clock::now() - t0).count();
-            uint32_t fsm_st = kernel.read_register(REG_DBG_STATE);
-            uint32_t fsm_ly = kernel.read_register(REG_DBG_LAYER);
-            const char* sname = (fsm_st < 17) ? FSM_NAMES[fsm_st] : "???";
-            std::cout << "  Poll[" << p << "] " << elapsed << "s: ert="
-                      << static_cast<int>(state)
-                      << " fsm=" << fsm_st << "(" << sname << ")"
-                      << " layer=" << fsm_ly << "\n";
-        }
+    for (int p = 0; ; ++p) {
+        auto state = run.wait(std::chrono::milliseconds(1000));
+        auto elapsed = std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+        std::cout << "  Poll[" << p << "] " << elapsed << "s: ert="
+                  << static_cast<int>(state) << "\n";
+        std::cout.flush();
         if (state == ERT_CMD_STATE_COMPLETED) {
             timed_out = false;
             break;
@@ -451,16 +529,10 @@ int main(int argc, char* argv[]) {
             std::cerr << "ERROR: Kernel error state: " << static_cast<int>(state) << "\n";
             return 1;
         }
-    }
-    if (timed_out) {
-        uint32_t fsm_st = kernel.read_register(REG_DBG_STATE);
-        uint32_t fsm_ly = kernel.read_register(REG_DBG_LAYER);
-        const char* sname = (fsm_st < 17) ? FSM_NAMES[fsm_st] : "???";
-        std::cerr << "ERROR: Kernel timed out after 30s\n";
-        std::cerr << "  Stuck at FSM state=" << fsm_st << " (" << sname
-                  << ") layer=" << fsm_ly << "\n";
-        system("xbutil examine -d 0000:3b:00.1 --report dynamic-regions 2>&1");
-        return 1;
+        // Every 5 polls (~5s), dump activation HBM progress
+        if (p % 5 == 4) {
+            dump_activation_progress(bo_act, act_map);
+        }
     }
     auto t1 = std::chrono::high_resolution_clock::now();
     double prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -528,29 +600,21 @@ int main(int argc, char* argv[]) {
                            bo_act, bo_act, bo_act,
                            bo_output,
                            decode_mode, cache_len);
-        for (int p = 0; p < 3000; ++p) {
-            auto st = drun.wait(std::chrono::milliseconds(100));
-            if (p < 10 || (p % 50) == 0) {
-                auto elapsed = std::chrono::duration<double>(
-                    std::chrono::high_resolution_clock::now() - td0).count();
-                uint32_t fsm_st = kernel.read_register(REG_DBG_STATE);
-                uint32_t fsm_ly = kernel.read_register(REG_DBG_LAYER);
-                const char* sname = (fsm_st < 17) ? FSM_NAMES[fsm_st] : "???";
-                std::cout << "  Decode Poll[" << p << "] " << elapsed
-                          << "s: ert=" << static_cast<int>(st)
-                          << " fsm=" << fsm_st << "(" << sname << ")"
-                          << " layer=" << fsm_ly << "\n";
-            }
+        for (int p = 0; ; ++p) {
+            auto st = drun.wait(std::chrono::milliseconds(1000));
+            auto elapsed = std::chrono::duration<double>(
+                std::chrono::high_resolution_clock::now() - td0).count();
+            std::cout << "  Decode Poll[" << p << "] " << elapsed
+                      << "s: ert=" << static_cast<int>(st) << "\n";
+            std::cout.flush();
             if (st == ERT_CMD_STATE_COMPLETED) break;
-            if (p == 2999) {
-                uint32_t fsm_st = kernel.read_register(REG_DBG_STATE);
-                uint32_t fsm_ly = kernel.read_register(REG_DBG_LAYER);
-                const char* sname = (fsm_st < 17) ? FSM_NAMES[fsm_st] : "???";
-                std::cerr << "\nERROR: Decode timed out after 5min\n";
-                std::cerr << "  Stuck at FSM state=" << fsm_st << " (" << sname
-                          << ") layer=" << fsm_ly << "\n";
-                system("xbutil examine -d 0000:3b:00.1 --report dynamic-regions 2>&1");
+            if (st == ERT_CMD_STATE_ERROR || st == ERT_CMD_STATE_ABORT) {
+                std::cerr << "ERROR: Decode kernel error: " << static_cast<int>(st) << "\n";
                 return 1;
+            }
+            // Every 5 polls (~5s), dump activation HBM progress
+            if (p % 5 == 4) {
+                dump_activation_progress(bo_act, act_map);
             }
         }
         auto td1 = std::chrono::high_resolution_clock::now();

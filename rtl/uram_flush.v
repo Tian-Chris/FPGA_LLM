@@ -34,7 +34,7 @@ module uram_flush #(
     input  wire [COL_W-1:0]        start_col_word,  // Starting URAM column word (for multi-head flush)
     input  wire [HBM_ADDR_W-1:0]  hbm_base,        // HBM destination base address
     input  wire [HBM_ADDR_W-1:0]  hbm_stride,      // HBM word stride between rows
-    output reg                     done,
+    (* mark_debug = "true" *) output reg                     done,
 
     // -----------------------------------------------------------------
     // URAM read port (to uram_accum_buf)
@@ -51,23 +51,23 @@ module uram_flush #(
     output reg  [ID_W-1:0]        m_axi_awid,
     output reg  [HBM_ADDR_W-1:0] m_axi_awaddr,
     output reg  [LEN_W-1:0]      m_axi_awlen,
-    output reg                    m_axi_awvalid,
-    input  wire                   m_axi_awready,
+    (* mark_debug = "true" *) output reg                    m_axi_awvalid,
+    (* mark_debug = "true" *) input  wire                   m_axi_awready,
 
     // -----------------------------------------------------------------
     // AXI4 Write Data Channel
     // -----------------------------------------------------------------
     output reg  [BUS_W-1:0]      m_axi_wdata,
     output reg                    m_axi_wlast,
-    output reg                    m_axi_wvalid,
-    input  wire                   m_axi_wready,
+    (* mark_debug = "true" *) output reg                    m_axi_wvalid,
+    (* mark_debug = "true" *) input  wire                   m_axi_wready,
 
     // -----------------------------------------------------------------
     // AXI4 Write Response Channel
     // -----------------------------------------------------------------
     input  wire [ID_W-1:0]       m_axi_bid,
     input  wire [1:0]            m_axi_bresp,
-    input  wire                   m_axi_bvalid,
+    (* mark_debug = "true" *) input  wire                   m_axi_bvalid,
     output reg                    m_axi_bready
 );
 
@@ -80,8 +80,8 @@ module uram_flush #(
     localparam FL_WR_RESP = 3'd3;   // Wait for write response
     localparam FL_DONE    = 3'd4;
 
-    reg [2:0]              fl_state;
-    reg [ROW_W-1:0]        cur_row;         // Current flush row index
+    (* mark_debug = "true" *) reg [2:0]              fl_state;
+    (* mark_debug = "true" *) reg [ROW_W-1:0]        cur_row;         // Current flush row index
     reg [ROW_W-1:0]        num_rows_r;
     reg [COL_W-1:0]        num_col_words_r;
     reg [COL_W-1:0]        start_col_r;
@@ -89,8 +89,8 @@ module uram_flush #(
     reg [HBM_ADDR_W-1:0]  hbm_stride_r;
 
     // Read/write counters
-    reg [COL_W-1:0]        rd_col_cnt;      // URAM read column counter
-    reg [COL_W-1:0]        wr_beat_cnt;     // AXI write beat counter
+    (* mark_debug = "true" *) reg [COL_W-1:0]        rd_col_cnt;      // URAM read column counter
+    (* mark_debug = "true" *) reg [COL_W-1:0]        wr_beat_cnt;     // AXI write beat counter
     reg                    rd_done;         // All URAM reads issued for current row
     reg                    rd_inflight;     // 1 if URAM read issued, response pending
 

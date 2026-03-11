@@ -65,8 +65,8 @@ module act_dma #(
     output reg  [ID_W-1:0]        m_axi_arid,
     output reg  [HBM_ADDR_W-1:0] m_axi_araddr,
     output reg  [LEN_W-1:0]      m_axi_arlen,
-    output reg                    m_axi_arvalid,
-    input  wire                   m_axi_arready,
+    (* mark_debug = "true" *) output reg                    m_axi_arvalid,
+    (* mark_debug = "true" *) input  wire                   m_axi_arready,
 
     // -----------------------------------------------------------------
     // AXI4 Read Data Channel
@@ -75,7 +75,7 @@ module act_dma #(
     input  wire [BUS_W-1:0]      m_axi_rdata,
     input  wire [1:0]            m_axi_rresp,
     input  wire                   m_axi_rlast,
-    input  wire                   m_axi_rvalid,
+    (* mark_debug = "true" *) input  wire                   m_axi_rvalid,
     output reg                    m_axi_rready,
 
     // -----------------------------------------------------------------
@@ -124,7 +124,7 @@ module act_dma #(
     // =====================================================================
     reg [BUS_W-1:0]     rcache_data;
     reg [WORD_AW-1:0]   rcache_tag;
-    reg                  rcache_valid;
+    (* mark_debug = "true" *) reg                  rcache_valid;
 
     // Pending read
     reg                  rd_pending;
@@ -135,7 +135,7 @@ module act_dma #(
     // =====================================================================
     reg [BUS_W-1:0]     wbuf_data;
     reg [WORD_AW-1:0]   wbuf_tag;
-    reg                  wbuf_dirty;
+    (* mark_debug = "true" *) reg                  wbuf_dirty;
 
     // =====================================================================
     // AXI FSM
@@ -146,7 +146,7 @@ module act_dma #(
     localparam AX_WR_AW    = 3'd3;   // Issue write address
     localparam AX_WR_DATA  = 3'd4;   // Issue write data
     localparam AX_WR_RESP  = 3'd5;   // Wait for write response
-    reg [2:0] ax_state;
+    (* mark_debug = "true" *) reg [2:0] ax_state;
 
     // After write buffer flush, what to do next
     reg        wr_after_flush;         // 1: pending write after flush, 0: return to idle

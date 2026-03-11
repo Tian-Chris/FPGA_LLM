@@ -35,7 +35,7 @@ module layernorm #(
 
     localparam EPS = 32'd1;
 
-    reg [2:0] state;
+    (* mark_debug = "true" *) reg [2:0] state;
     localparam ST_IDLE      = 3'd0;
     localparam ST_COMP_MEAN = 3'd1;
     localparam ST_COMP_VAR  = 3'd2;

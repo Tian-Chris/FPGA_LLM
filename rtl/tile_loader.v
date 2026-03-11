@@ -47,8 +47,8 @@ module tile_loader #(
     output reg  [ID_W-1:0]         m_axi_arid,
     output reg  [HBM_ADDR_W-1:0]  m_axi_araddr,
     output reg  [LEN_W-1:0]       m_axi_arlen,
-    output reg                     m_axi_arvalid,
-    input  wire                    m_axi_arready,
+    (* mark_debug = "true" *) output reg                     m_axi_arvalid,
+    (* mark_debug = "true" *) input  wire                    m_axi_arready,
 
     // -----------------------------------------------------------------
     // AXI4 Read Data Channel (HBM → master)
@@ -57,7 +57,7 @@ module tile_loader #(
     input  wire [BUS_W-1:0]        m_axi_rdata,
     input  wire [1:0]              m_axi_rresp,
     input  wire                    m_axi_rlast,
-    input  wire                    m_axi_rvalid,
+    (* mark_debug = "true" *) input  wire                    m_axi_rvalid,
     output reg                     m_axi_rready,
 
     // -----------------------------------------------------------------
@@ -87,7 +87,7 @@ module tile_loader #(
     localparam LD_DATA = 2'd2;
     localparam LD_DONE = 2'd3;
 
-    reg [1:0]              ld_state;
+    (* mark_debug = "true" *) reg [1:0]              ld_state;
     reg [5:0]              cur_row;         // Current row being loaded (0..tile_rows-1)
     reg [5:0]              tile_rows_r;     // Registered tile_rows
     reg [HBM_ADDR_W-1:0]  hbm_addr_r;     // Current HBM address (accumulator)

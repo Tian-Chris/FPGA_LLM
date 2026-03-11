@@ -26,8 +26,8 @@ module matmul_engine #(
     // Control interface
     input  wire                 start,
     input  wire [2:0]           op_type,
-    output reg                  busy,
-    output reg                  done,
+    (* mark_debug = "true" *) output reg                  busy,
+    (* mark_debug = "true" *) output reg                  done,
 
     // Data input - A matrix (256-bit bus = 16 INT16 elements per read)
     input  wire                 a_valid,
@@ -45,13 +45,13 @@ module matmul_engine #(
     input  wire                 first_tile,    // Clear MACs only on first k-tile
 
     // Output interface: BUS_EL (16) INT16 per write = 256 bits
-    output reg                  out_valid,
+    (* mark_debug = "true" *) output reg                  out_valid,
     output reg  [BUS_W-1:0]     out_data,
     output reg  [4:0]           out_row,
     output reg  [4:0]           out_col,
 
     // Backpressure from URAM write arbiter
-    input  wire                 out_stall,
+    (* mark_debug = "true" *) input  wire                 out_stall,
 
     // Compute phase done pulse (for controller handshake)
     output wire                 compute_done
@@ -484,8 +484,8 @@ module matmul_controller #(
     input  wire [HBM_ADDR_W-1:0]   cmd_b_stride,     // B row stride in HBM words
     input  wire [URAM_ROW_W-1:0]   cmd_out_row,      // URAM output starting row
     input  wire [URAM_COL_W-1:0]   cmd_out_col_word, // URAM output starting col word
-    output reg                      cmd_ready,
-    output reg                      cmd_done,
+    (* mark_debug = "true" *) output reg                      cmd_ready,
+    (* mark_debug = "true" *) output reg                      cmd_done,
 
     // -----------------------------------------------------------------
     // Weight tile_loader command interface
@@ -555,7 +555,7 @@ module matmul_controller #(
     // =====================================================================
     // State Machine
     // =====================================================================
-    reg [3:0] state;
+    (* mark_debug = "true" *) reg [3:0] state;
     localparam ST_IDLE          = 4'd0;
     localparam ST_LOAD_CMD      = 4'd1;   // Issue tile_loader commands
     localparam ST_WAIT_LOAD     = 4'd2;   // Wait for both loaders done

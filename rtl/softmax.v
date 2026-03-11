@@ -34,7 +34,7 @@ module softmax #(
     // -------------------------------------------------------------------------
     // State Machine
     // -------------------------------------------------------------------------
-    reg [2:0] state;
+    (* mark_debug = "true" *) reg [2:0] state;
     localparam ST_IDLE      = 3'd0;
     localparam ST_FIND_MAX  = 3'd1;
     localparam ST_COMP_EXP  = 3'd2;

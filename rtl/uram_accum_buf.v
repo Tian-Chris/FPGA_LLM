@@ -79,7 +79,7 @@ module uram_accum_buf #(
     // =====================================================================
     // Clear logic — done over multiple cycles (background)
     // =====================================================================
-    reg         clearing;
+    (* mark_debug = "true" *) reg         clearing;
     reg [ADDR_W-1:0] clear_idx;
     localparam CLEAR_MAX = ROWS * WORDS - 1;
 

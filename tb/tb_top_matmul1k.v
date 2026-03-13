@@ -145,48 +145,19 @@ module tb_top_matmul1k;
         // Wait for sim_hbm_port zero-init to complete, then overwrite
         #1;
 
-        // Load weight + activation data into ALL engine HBMs (both wgt and act).
+        // Load weight + activation data into shared prefetch HBM ports.
         // Weight hex: W_q at addresses 0..65535
         // Activation hex: embeddings at addresses 65536+
         // Load wgt first, then act on top (non-overlapping regions).
 
-        // Engine 0
-        $readmemh("verify/test_data/hbm_wgt_1k.hex", dut.gen_eng[0].u_hbm_wgt.mem);
-        $readmemh("verify/test_data/hbm_act_1k.hex", dut.gen_eng[0].u_hbm_wgt.mem);
-        $readmemh("verify/test_data/hbm_wgt_1k.hex", dut.gen_eng[0].u_hbm_act.mem);
-        $readmemh("verify/test_data/hbm_act_1k.hex", dut.gen_eng[0].u_hbm_act.mem);
+        // Shared weight prefetch HBM
+        $readmemh("verify/test_data/hbm_wgt_1k.hex", dut.u_hbm_pf_wgt.mem);
+        $readmemh("verify/test_data/hbm_act_1k.hex", dut.u_hbm_pf_wgt.mem);
+        // Shared activation prefetch HBM
+        $readmemh("verify/test_data/hbm_wgt_1k.hex", dut.u_hbm_pf_act.mem);
+        $readmemh("verify/test_data/hbm_act_1k.hex", dut.u_hbm_pf_act.mem);
 
-        // Engine 1
-        $readmemh("verify/test_data/hbm_wgt_1k.hex", dut.gen_eng[1].u_hbm_wgt.mem);
-        $readmemh("verify/test_data/hbm_act_1k.hex", dut.gen_eng[1].u_hbm_wgt.mem);
-        $readmemh("verify/test_data/hbm_wgt_1k.hex", dut.gen_eng[1].u_hbm_act.mem);
-        $readmemh("verify/test_data/hbm_act_1k.hex", dut.gen_eng[1].u_hbm_act.mem);
-
-        // Engine 2
-        $readmemh("verify/test_data/hbm_wgt_1k.hex", dut.gen_eng[2].u_hbm_wgt.mem);
-        $readmemh("verify/test_data/hbm_act_1k.hex", dut.gen_eng[2].u_hbm_wgt.mem);
-        $readmemh("verify/test_data/hbm_wgt_1k.hex", dut.gen_eng[2].u_hbm_act.mem);
-        $readmemh("verify/test_data/hbm_act_1k.hex", dut.gen_eng[2].u_hbm_act.mem);
-
-        // Engine 3
-        $readmemh("verify/test_data/hbm_wgt_1k.hex", dut.gen_eng[3].u_hbm_wgt.mem);
-        $readmemh("verify/test_data/hbm_act_1k.hex", dut.gen_eng[3].u_hbm_wgt.mem);
-        $readmemh("verify/test_data/hbm_wgt_1k.hex", dut.gen_eng[3].u_hbm_act.mem);
-        $readmemh("verify/test_data/hbm_act_1k.hex", dut.gen_eng[3].u_hbm_act.mem);
-
-        // Engine 4
-        $readmemh("verify/test_data/hbm_wgt_1k.hex", dut.gen_eng[4].u_hbm_wgt.mem);
-        $readmemh("verify/test_data/hbm_act_1k.hex", dut.gen_eng[4].u_hbm_wgt.mem);
-        $readmemh("verify/test_data/hbm_wgt_1k.hex", dut.gen_eng[4].u_hbm_act.mem);
-        $readmemh("verify/test_data/hbm_act_1k.hex", dut.gen_eng[4].u_hbm_act.mem);
-
-        // Engine 5
-        $readmemh("verify/test_data/hbm_wgt_1k.hex", dut.gen_eng[5].u_hbm_wgt.mem);
-        $readmemh("verify/test_data/hbm_act_1k.hex", dut.gen_eng[5].u_hbm_wgt.mem);
-        $readmemh("verify/test_data/hbm_wgt_1k.hex", dut.gen_eng[5].u_hbm_act.mem);
-        $readmemh("verify/test_data/hbm_act_1k.hex", dut.gen_eng[5].u_hbm_act.mem);
-
-        $display("[%0t] tb_top_matmul1k: HBM preloading complete (6 engines)", $time);
+        $display("[%0t] tb_top_matmul1k: HBM preloading complete (shared prefetch ports)", $time);
         $fflush();
     end
 
@@ -330,18 +301,8 @@ module tb_top_matmul1k;
                 for (mirror_r = 0; mirror_r <= saved_flush_rows; mirror_r = mirror_r + 1) begin
                     for (mirror_c = 0; mirror_c <= saved_flush_cols; mirror_c = mirror_c + 1) begin
                         mirror_addr = saved_flush_base + mirror_r * saved_flush_stride + mirror_c;
-                        dut.gen_eng[0].u_hbm_act.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.gen_eng[1].u_hbm_act.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.gen_eng[2].u_hbm_act.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.gen_eng[3].u_hbm_act.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.gen_eng[4].u_hbm_act.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.gen_eng[5].u_hbm_act.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.gen_eng[0].u_hbm_wgt.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.gen_eng[1].u_hbm_wgt.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.gen_eng[2].u_hbm_wgt.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.gen_eng[3].u_hbm_wgt.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.gen_eng[4].u_hbm_wgt.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.gen_eng[5].u_hbm_wgt.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
+                        dut.u_hbm_pf_act.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
+                        dut.u_hbm_pf_wgt.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
                     end
                 end
                 flush_params_valid <= 1'b0;

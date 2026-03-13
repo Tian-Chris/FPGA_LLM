@@ -1,14 +1,15 @@
 `include "defines.vh"
 
 // =============================================================================
-// top_level.v — HBM-Based Transformer Inference Top Level
+// top_level.v — URAM Prefetch Transformer Inference Top Level
 // =============================================================================
 //
 // Architecture:
-//   Per engine (4x): sim_hbm_port(wgt) + tile_loader(wgt) +
-//                    sim_hbm_port(act) + tile_loader(act) +
-//                    matmul_controller
-//   Shared:          tiling_engine, uram_accum_buf,
+//   Shared prefetch: hbm_prefetch(wgt) + uram_prefetch_buf(wgt) +
+//                    hbm_prefetch(act) + uram_prefetch_buf(act)
+//   Per engine:      matmul_controller (reads from prefetch URAMs)
+//   Shared:          tiling_engine (coordinates prefetch + dispatch),
+//                    uram_accum_buf,
 //                    uram_flush + sim_hbm_port(flush),
 //                    uram_nm_adapter (scalar↔URAM bridge),
 //                    act_dma + sim_hbm_port(dma)
@@ -262,16 +263,60 @@ module diffusion_transformer_top #(
     wire [DIM_W-1:0]            current_layer;
 
     // =========================================================================
-    // Tiling Engine ↔ Per-Engine Command Buses
+    // Tiling Engine ↔ Per-Engine Command Buses (URAM prefetch offsets)
     // =========================================================================
+    localparam PF_ROW_W = $clog2(PREFETCH_ROWS);  // 10
+    localparam PF_COL_W = $clog2(PREFETCH_COL_WORDS); // 6
+
     wire [N_ENG-1:0]                te_eng_cmd_valid;
     wire [3*N_ENG-1:0]              te_eng_cmd_op;
     wire [DIM_W*N_ENG-1:0]         te_eng_cmd_m, te_eng_cmd_k, te_eng_cmd_n;
-    wire [HBM_ADDR_W*N_ENG-1:0]   te_eng_cmd_a_base, te_eng_cmd_b_base;
-    wire [HBM_ADDR_W*N_ENG-1:0]   te_eng_cmd_a_stride, te_eng_cmd_b_stride;
+    wire [PF_ROW_W*N_ENG-1:0]     te_eng_cmd_a_row_off, te_eng_cmd_b_row_off;
+    wire [PF_COL_W*N_ENG-1:0]     te_eng_cmd_a_col_off, te_eng_cmd_b_col_off;
     wire [URAM_ROW_W*N_ENG-1:0]   te_eng_cmd_out_row;
     wire [URAM_COL_W*N_ENG-1:0]   te_eng_cmd_out_col_word;
     wire [N_ENG-1:0]                eng_cmd_ready, eng_cmd_done;
+
+    // =========================================================================
+    // Prefetch Command Buses (tiling_engine ↔ hbm_prefetch)
+    // =========================================================================
+    wire        pf_act_cmd_valid, pf_act_cmd_ready, pf_act_cmd_done;
+    wire [HBM_ADDR_W-1:0] pf_act_hbm_base, pf_act_hbm_stride;
+    wire [DIM_W-1:0]      pf_act_num_rows;
+    wire [DIM_W-1:0]      pf_act_num_col_words;
+
+    wire        pf_wgt_cmd_valid, pf_wgt_cmd_ready, pf_wgt_cmd_done;
+    wire [HBM_ADDR_W-1:0] pf_wgt_hbm_base, pf_wgt_hbm_stride;
+    wire [DIM_W-1:0]      pf_wgt_num_rows;
+    wire [DIM_W-1:0]      pf_wgt_num_col_words;
+
+    // =========================================================================
+    // Prefetch URAM Read Buses (per-engine matmul_controller ↔ uram_prefetch_buf)
+    // =========================================================================
+    wire [N_ENG-1:0]              eng_wgt_uram_rd_en;
+    wire [PF_ROW_W*N_ENG-1:0]   eng_wgt_uram_rd_row;
+    wire [PF_COL_W*N_ENG-1:0]   eng_wgt_uram_rd_col_word;
+
+    wire [N_ENG-1:0]              eng_act_uram_rd_en;
+    wire [PF_ROW_W*N_ENG-1:0]   eng_act_uram_rd_row;
+    wire [PF_COL_W*N_ENG-1:0]   eng_act_uram_rd_col_word;
+
+    // Shared read data/valid from prefetch buffers (broadcast to all engines)
+    wire [BUS_WIDTH-1:0]  pf_wgt_rd_data;
+    wire                   pf_wgt_rd_valid;
+    wire [BUS_WIDTH-1:0]  pf_act_rd_data;
+    wire                   pf_act_rd_valid;
+
+    // Prefetch URAM write buses (hbm_prefetch → uram_prefetch_buf)
+    wire                   pf_wgt_wr_en;
+    wire [PF_ROW_W-1:0]  pf_wgt_wr_row;
+    wire [PF_COL_W-1:0]  pf_wgt_wr_col_word;
+    wire [BUS_WIDTH-1:0] pf_wgt_wr_data;
+
+    wire                   pf_act_wr_en;
+    wire [PF_ROW_W-1:0]  pf_act_wr_row;
+    wire [PF_COL_W-1:0]  pf_act_wr_col_word;
+    wire [BUS_WIDTH-1:0] pf_act_wr_data;
 
     // =========================================================================
     // Per-Engine URAM Write Buses (packed for uram_accum_buf)
@@ -475,7 +520,9 @@ module diffusion_transformer_top #(
     // =========================================================================
     tiling_engine #(
         .N_ENG(N_ENG), .TILE(TILE_SIZE), .DIM_W(DIM_W),
-        .URAM_ROW_W(URAM_ROW_W), .URAM_COL_W(URAM_COL_W)
+        .URAM_ROW_W(URAM_ROW_W), .URAM_COL_W(URAM_COL_W),
+        .PF_ROW_W(PF_ROW_W), .PF_COL_W(PF_COL_W),
+        .PREFETCH_DIM(PREFETCH_ROWS)
     ) u_tiling_engine (
         .clk(clk), .rst_n(rst_n),
         .cmd_valid(fsm_mm_cmd_valid),
@@ -490,15 +537,31 @@ module diffusion_transformer_top #(
         .cmd_out_col_offset(fsm_mm_cmd_out_col_offset[URAM_COL_W-1:0]),
         .cmd_ready(mm_cmd_ready),
         .cmd_done(mm_cmd_done),
+        // Prefetch commands
+        .pf_act_cmd_valid(pf_act_cmd_valid),
+        .pf_act_cmd_ready(pf_act_cmd_ready),
+        .pf_act_cmd_done(pf_act_cmd_done),
+        .pf_act_hbm_base(pf_act_hbm_base),
+        .pf_act_hbm_stride(pf_act_hbm_stride),
+        .pf_act_num_rows(pf_act_num_rows),
+        .pf_act_num_col_words(pf_act_num_col_words),
+        .pf_wgt_cmd_valid(pf_wgt_cmd_valid),
+        .pf_wgt_cmd_ready(pf_wgt_cmd_ready),
+        .pf_wgt_cmd_done(pf_wgt_cmd_done),
+        .pf_wgt_hbm_base(pf_wgt_hbm_base),
+        .pf_wgt_hbm_stride(pf_wgt_hbm_stride),
+        .pf_wgt_num_rows(pf_wgt_num_rows),
+        .pf_wgt_num_col_words(pf_wgt_num_col_words),
+        // Per-engine dispatch
         .eng_cmd_valid(te_eng_cmd_valid),
         .eng_cmd_op(te_eng_cmd_op),
         .eng_cmd_m(te_eng_cmd_m),
         .eng_cmd_k(te_eng_cmd_k),
         .eng_cmd_n(te_eng_cmd_n),
-        .eng_cmd_a_base(te_eng_cmd_a_base),
-        .eng_cmd_b_base(te_eng_cmd_b_base),
-        .eng_cmd_a_stride(te_eng_cmd_a_stride),
-        .eng_cmd_b_stride(te_eng_cmd_b_stride),
+        .eng_cmd_a_row_off(te_eng_cmd_a_row_off),
+        .eng_cmd_a_col_off(te_eng_cmd_a_col_off),
+        .eng_cmd_b_row_off(te_eng_cmd_b_row_off),
+        .eng_cmd_b_col_off(te_eng_cmd_b_col_off),
         .eng_cmd_out_row(te_eng_cmd_out_row),
         .eng_cmd_out_col_word(te_eng_cmd_out_col_word),
         .eng_cmd_ready(eng_cmd_ready),
@@ -506,128 +569,14 @@ module diffusion_transformer_top #(
     );
 
     // =========================================================================
-    // Per-Engine: sim_hbm_port(wgt) + tile_loader(wgt) +
-    //             sim_hbm_port(act) + tile_loader(act) +
-    //             matmul_controller
+    // Per-Engine: matmul_controller (reads from shared prefetch URAMs)
     // =========================================================================
     genvar e;
     generate
         for (e = 0; e < N_ENG; e = e + 1) begin : gen_eng
-            // ----- AXI wires: weight tile_loader ↔ weight HBM -----
-            wire [ID_W-1:0]        wgt_arid;
-            wire [HBM_ADDR_W-1:0] wgt_araddr;
-            wire [LEN_W-1:0]      wgt_arlen;
-            wire                   wgt_arvalid, wgt_arready;
-            wire [ID_W-1:0]        wgt_rid;
-            wire [BUS_WIDTH-1:0]  wgt_rdata;
-            wire [1:0]            wgt_rresp;
-            wire                   wgt_rlast, wgt_rvalid, wgt_rready;
-
-            // ----- AXI wires: act tile_loader ↔ act HBM -----
-            wire [ID_W-1:0]        act_arid;
-            wire [HBM_ADDR_W-1:0] act_araddr;
-            wire [LEN_W-1:0]      act_arlen;
-            wire                   act_arvalid, act_arready;
-            wire [ID_W-1:0]        act_rid;
-            wire [BUS_WIDTH-1:0]  act_rdata;
-            wire [1:0]            act_rresp;
-            wire                   act_rlast, act_rvalid, act_rready;
-
-            // ----- tile_loader ↔ matmul_controller (weight) -----
-            wire        wgt_lc_valid, wgt_lc_ready, wgt_lc_done;
-            wire [HBM_ADDR_W-1:0] wgt_lc_base, wgt_lc_stride;
-            wire [5:0]  wgt_lc_rows;
-            wire        wgt_lr_en;
-            wire [5:0]  wgt_lr_addr;
-            wire [BUS_WIDTH-1:0] wgt_lr_data;
-            wire        wgt_lr_valid;
-
-            // ----- tile_loader ↔ matmul_controller (activation) -----
-            wire        act_lc_valid, act_lc_ready, act_lc_done;
-            wire [HBM_ADDR_W-1:0] act_lc_base, act_lc_stride;
-            wire [5:0]  act_lc_rows;
-            wire        act_lr_en;
-            wire [5:0]  act_lr_addr;
-            wire [BUS_WIDTH-1:0] act_lr_data;
-            wire        act_lr_valid;
-
-            // ---- Weight HBM (read-only) ----
-`ifndef FPGA_TARGET
-            sim_hbm_port #(.DEPTH(SIM_HBM_DEPTH), .RD_LATENCY_CYCLES(HBM_RD_LATENCY)) u_hbm_wgt (
-                .clk(clk), .rst_n(rst_n),
-                .s_axi_arid(wgt_arid), .s_axi_araddr(wgt_araddr),
-                .s_axi_arlen(wgt_arlen), .s_axi_arvalid(wgt_arvalid),
-                .s_axi_arready(wgt_arready),
-                .s_axi_rid(wgt_rid), .s_axi_rdata(wgt_rdata),
-                .s_axi_rresp(wgt_rresp), .s_axi_rlast(wgt_rlast),
-                .s_axi_rvalid(wgt_rvalid), .s_axi_rready(wgt_rready),
-                // Write channels tied off
-                .s_axi_awid({ID_W{1'b0}}), .s_axi_awaddr({HBM_ADDR_W{1'b0}}),
-                .s_axi_awlen({LEN_W{1'b0}}), .s_axi_awvalid(1'b0),
-                .s_axi_awready(),
-                .s_axi_wdata({BUS_WIDTH{1'b0}}), .s_axi_wlast(1'b0),
-                .s_axi_wvalid(1'b0), .s_axi_wready(),
-                .s_axi_bid(), .s_axi_bresp(), .s_axi_bvalid(),
-                .s_axi_bready(1'b0)
-            );
-`endif
-
-            // ---- Weight Tile Loader ----
-            tile_loader #(.TILE(TILE_SIZE)) u_tl_wgt (
-                .clk(clk), .rst_n(rst_n),
-                .cmd_valid(wgt_lc_valid), .cmd_ready(wgt_lc_ready),
-                .cmd_hbm_base(wgt_lc_base), .cmd_tile_rows(wgt_lc_rows),
-                .cmd_stride(wgt_lc_stride), .cmd_done(wgt_lc_done),
-                .m_axi_arid(wgt_arid), .m_axi_araddr(wgt_araddr),
-                .m_axi_arlen(wgt_arlen), .m_axi_arvalid(wgt_arvalid),
-                .m_axi_arready(wgt_arready),
-                .m_axi_rid(wgt_rid), .m_axi_rdata(wgt_rdata),
-                .m_axi_rresp(wgt_rresp), .m_axi_rlast(wgt_rlast),
-                .m_axi_rvalid(wgt_rvalid), .m_axi_rready(wgt_rready),
-                .local_rd_en(wgt_lr_en), .local_rd_addr(wgt_lr_addr),
-                .local_rd_data(wgt_lr_data), .local_rd_valid(wgt_lr_valid)
-            );
-
-            // ---- Activation HBM (read-only) ----
-`ifndef FPGA_TARGET
-            sim_hbm_port #(.DEPTH(SIM_HBM_DEPTH), .RD_LATENCY_CYCLES(HBM_RD_LATENCY)) u_hbm_act (
-                .clk(clk), .rst_n(rst_n),
-                .s_axi_arid(act_arid), .s_axi_araddr(act_araddr),
-                .s_axi_arlen(act_arlen), .s_axi_arvalid(act_arvalid),
-                .s_axi_arready(act_arready),
-                .s_axi_rid(act_rid), .s_axi_rdata(act_rdata),
-                .s_axi_rresp(act_rresp), .s_axi_rlast(act_rlast),
-                .s_axi_rvalid(act_rvalid), .s_axi_rready(act_rready),
-                // Write channels tied off
-                .s_axi_awid({ID_W{1'b0}}), .s_axi_awaddr({HBM_ADDR_W{1'b0}}),
-                .s_axi_awlen({LEN_W{1'b0}}), .s_axi_awvalid(1'b0),
-                .s_axi_awready(),
-                .s_axi_wdata({BUS_WIDTH{1'b0}}), .s_axi_wlast(1'b0),
-                .s_axi_wvalid(1'b0), .s_axi_wready(),
-                .s_axi_bid(), .s_axi_bresp(), .s_axi_bvalid(),
-                .s_axi_bready(1'b0)
-            );
-`endif
-
-            // ---- Activation Tile Loader ----
-            tile_loader #(.TILE(TILE_SIZE)) u_tl_act (
-                .clk(clk), .rst_n(rst_n),
-                .cmd_valid(act_lc_valid), .cmd_ready(act_lc_ready),
-                .cmd_hbm_base(act_lc_base), .cmd_tile_rows(act_lc_rows),
-                .cmd_stride(act_lc_stride), .cmd_done(act_lc_done),
-                .m_axi_arid(act_arid), .m_axi_araddr(act_araddr),
-                .m_axi_arlen(act_arlen), .m_axi_arvalid(act_arvalid),
-                .m_axi_arready(act_arready),
-                .m_axi_rid(act_rid), .m_axi_rdata(act_rdata),
-                .m_axi_rresp(act_rresp), .m_axi_rlast(act_rlast),
-                .m_axi_rvalid(act_rvalid), .m_axi_rready(act_rready),
-                .local_rd_en(act_lr_en), .local_rd_addr(act_lr_addr),
-                .local_rd_data(act_lr_data), .local_rd_valid(act_lr_valid)
-            );
-
-            // ---- Matmul Controller ----
             matmul_controller #(
-                .URAM_ROW_W(URAM_ROW_W), .URAM_COL_W(URAM_COL_W)
+                .URAM_ROW_W(URAM_ROW_W), .URAM_COL_W(URAM_COL_W),
+                .PF_ROW_W(PF_ROW_W), .PF_COL_W(PF_COL_W)
             ) u_mc (
                 .clk(clk), .rst_n(rst_n),
                 .cmd_valid(te_eng_cmd_valid[e]),
@@ -635,37 +584,27 @@ module diffusion_transformer_top #(
                 .cmd_m(te_eng_cmd_m[e*DIM_W +: DIM_W]),
                 .cmd_k(te_eng_cmd_k[e*DIM_W +: DIM_W]),
                 .cmd_n(te_eng_cmd_n[e*DIM_W +: DIM_W]),
-                .cmd_a_base(te_eng_cmd_a_base[e*HBM_ADDR_W +: HBM_ADDR_W]),
-                .cmd_b_base(te_eng_cmd_b_base[e*HBM_ADDR_W +: HBM_ADDR_W]),
-                .cmd_a_stride(te_eng_cmd_a_stride[e*HBM_ADDR_W +: HBM_ADDR_W]),
-                .cmd_b_stride(te_eng_cmd_b_stride[e*HBM_ADDR_W +: HBM_ADDR_W]),
+                .cmd_a_row_off(te_eng_cmd_a_row_off[e*PF_ROW_W +: PF_ROW_W]),
+                .cmd_a_col_off(te_eng_cmd_a_col_off[e*PF_COL_W +: PF_COL_W]),
+                .cmd_b_row_off(te_eng_cmd_b_row_off[e*PF_ROW_W +: PF_ROW_W]),
+                .cmd_b_col_off(te_eng_cmd_b_col_off[e*PF_COL_W +: PF_COL_W]),
                 .cmd_out_row(te_eng_cmd_out_row[e*URAM_ROW_W +: URAM_ROW_W]),
                 .cmd_out_col_word(te_eng_cmd_out_col_word[e*URAM_COL_W +: URAM_COL_W]),
                 .cmd_ready(eng_cmd_ready[e]),
                 .cmd_done(eng_cmd_done[e]),
-                // Weight tile_loader
-                .wgt_load_cmd_valid(wgt_lc_valid),
-                .wgt_load_cmd_ready(wgt_lc_ready),
-                .wgt_load_hbm_base(wgt_lc_base),
-                .wgt_load_tile_rows(wgt_lc_rows),
-                .wgt_load_stride(wgt_lc_stride),
-                .wgt_load_cmd_done(wgt_lc_done),
-                .wgt_local_rd_en(wgt_lr_en),
-                .wgt_local_rd_addr(wgt_lr_addr),
-                .wgt_local_rd_data(wgt_lr_data),
-                .wgt_local_rd_valid(wgt_lr_valid),
-                // Activation tile_loader
-                .act_load_cmd_valid(act_lc_valid),
-                .act_load_cmd_ready(act_lc_ready),
-                .act_load_hbm_base(act_lc_base),
-                .act_load_tile_rows(act_lc_rows),
-                .act_load_stride(act_lc_stride),
-                .act_load_cmd_done(act_lc_done),
-                .act_local_rd_en(act_lr_en),
-                .act_local_rd_addr(act_lr_addr),
-                .act_local_rd_data(act_lr_data),
-                .act_local_rd_valid(act_lr_valid),
-                // URAM write
+                // Weight URAM prefetch read
+                .wgt_uram_rd_en(eng_wgt_uram_rd_en[e]),
+                .wgt_uram_rd_row(eng_wgt_uram_rd_row[e*PF_ROW_W +: PF_ROW_W]),
+                .wgt_uram_rd_col_word(eng_wgt_uram_rd_col_word[e*PF_COL_W +: PF_COL_W]),
+                .wgt_uram_rd_data(pf_wgt_rd_data),
+                .wgt_uram_rd_valid(pf_wgt_rd_valid),
+                // Activation URAM prefetch read
+                .act_uram_rd_en(eng_act_uram_rd_en[e]),
+                .act_uram_rd_row(eng_act_uram_rd_row[e*PF_ROW_W +: PF_ROW_W]),
+                .act_uram_rd_col_word(eng_act_uram_rd_col_word[e*PF_COL_W +: PF_COL_W]),
+                .act_uram_rd_data(pf_act_rd_data),
+                .act_uram_rd_valid(pf_act_rd_valid),
+                // URAM accum write
                 .uram_wr_en(eng_uram_wr_en[e]),
                 .uram_wr_row(eng_uram_wr_row[e*URAM_ROW_W +: URAM_ROW_W]),
                 .uram_wr_col_word(eng_uram_wr_col_word[e*URAM_COL_W +: URAM_COL_W]),
@@ -676,65 +615,193 @@ module diffusion_transformer_top #(
     endgenerate
 
     // =========================================================================
-    // FPGA Target: Wire generate-internal AXI signals to flat module ports
+    // Shared URAM Prefetch Buffers + HBM Prefetch DMA Engines
+    // =========================================================================
+    // With N_ENG=1, no read-port arbitration needed. Engine 0 reads directly.
+    // For multi-engine, only engine 0's read signals are connected (single engine debug).
+
+    // --- Weight prefetch URAM buffer ---
+    uram_prefetch_buf #(
+        .ROWS(PREFETCH_ROWS), .COLS(PREFETCH_COLS),
+        .ROW_W(PF_ROW_W), .COL_W(PF_COL_W)
+    ) u_pf_wgt_buf (
+        .clk(clk),
+        .wr_en(pf_wgt_wr_en),
+        .wr_row(pf_wgt_wr_row),
+        .wr_col_word(pf_wgt_wr_col_word),
+        .wr_data(pf_wgt_wr_data),
+        .rd_en(eng_wgt_uram_rd_en[0]),
+        .rd_row(eng_wgt_uram_rd_row[0*PF_ROW_W +: PF_ROW_W]),
+        .rd_col_word(eng_wgt_uram_rd_col_word[0*PF_COL_W +: PF_COL_W]),
+        .rd_data(pf_wgt_rd_data),
+        .rd_valid(pf_wgt_rd_valid)
+    );
+
+    // --- Activation prefetch URAM buffer ---
+    uram_prefetch_buf #(
+        .ROWS(PREFETCH_ROWS), .COLS(PREFETCH_COLS),
+        .ROW_W(PF_ROW_W), .COL_W(PF_COL_W)
+    ) u_pf_act_buf (
+        .clk(clk),
+        .wr_en(pf_act_wr_en),
+        .wr_row(pf_act_wr_row),
+        .wr_col_word(pf_act_wr_col_word),
+        .wr_data(pf_act_wr_data),
+        .rd_en(eng_act_uram_rd_en[0]),
+        .rd_row(eng_act_uram_rd_row[0*PF_ROW_W +: PF_ROW_W]),
+        .rd_col_word(eng_act_uram_rd_col_word[0*PF_COL_W +: PF_COL_W]),
+        .rd_data(pf_act_rd_data),
+        .rd_valid(pf_act_rd_valid)
+    );
+
+    // --- Weight HBM Prefetch DMA ---
+    wire [ID_W-1:0]        pf_wgt_arid;
+    wire [HBM_ADDR_W-1:0] pf_wgt_araddr;
+    wire [LEN_W-1:0]      pf_wgt_arlen;
+    wire                   pf_wgt_arvalid, pf_wgt_arready;
+    wire [ID_W-1:0]        pf_wgt_rid;
+    wire [BUS_WIDTH-1:0]  pf_wgt_rdata;
+    wire [1:0]            pf_wgt_rresp;
+    wire                   pf_wgt_rlast, pf_wgt_rvalid, pf_wgt_rready;
+
+    hbm_prefetch #(
+        .ROW_W(PF_ROW_W), .COL_W(PF_COL_W)
+    ) u_pf_wgt (
+        .clk(clk), .rst_n(rst_n),
+        .cmd_valid(pf_wgt_cmd_valid),
+        .cmd_ready(pf_wgt_cmd_ready),
+        .cmd_done(pf_wgt_cmd_done),
+        .cmd_hbm_base(pf_wgt_hbm_base),
+        .cmd_hbm_stride(pf_wgt_hbm_stride),
+        .cmd_num_rows(pf_wgt_num_rows),
+        .cmd_num_col_words(pf_wgt_num_col_words),
+        .m_axi_arid(pf_wgt_arid), .m_axi_araddr(pf_wgt_araddr),
+        .m_axi_arlen(pf_wgt_arlen), .m_axi_arvalid(pf_wgt_arvalid),
+        .m_axi_arready(pf_wgt_arready),
+        .m_axi_rid(pf_wgt_rid), .m_axi_rdata(pf_wgt_rdata),
+        .m_axi_rresp(pf_wgt_rresp), .m_axi_rlast(pf_wgt_rlast),
+        .m_axi_rvalid(pf_wgt_rvalid), .m_axi_rready(pf_wgt_rready),
+        .uram_wr_en(pf_wgt_wr_en),
+        .uram_wr_row(pf_wgt_wr_row),
+        .uram_wr_col_word(pf_wgt_wr_col_word),
+        .uram_wr_data(pf_wgt_wr_data)
+    );
+
+    // --- Activation HBM Prefetch DMA ---
+    wire [ID_W-1:0]        pf_act_arid;
+    wire [HBM_ADDR_W-1:0] pf_act_araddr;
+    wire [LEN_W-1:0]      pf_act_arlen;
+    wire                   pf_act_arvalid, pf_act_arready;
+    wire [ID_W-1:0]        pf_act_rid;
+    wire [BUS_WIDTH-1:0]  pf_act_rdata;
+    wire [1:0]            pf_act_rresp;
+    wire                   pf_act_rlast, pf_act_rvalid, pf_act_rready;
+
+    hbm_prefetch #(
+        .ROW_W(PF_ROW_W), .COL_W(PF_COL_W)
+    ) u_pf_act (
+        .clk(clk), .rst_n(rst_n),
+        .cmd_valid(pf_act_cmd_valid),
+        .cmd_ready(pf_act_cmd_ready),
+        .cmd_done(pf_act_cmd_done),
+        .cmd_hbm_base(pf_act_hbm_base),
+        .cmd_hbm_stride(pf_act_hbm_stride),
+        .cmd_num_rows(pf_act_num_rows),
+        .cmd_num_col_words(pf_act_num_col_words),
+        .m_axi_arid(pf_act_arid), .m_axi_araddr(pf_act_araddr),
+        .m_axi_arlen(pf_act_arlen), .m_axi_arvalid(pf_act_arvalid),
+        .m_axi_arready(pf_act_arready),
+        .m_axi_rid(pf_act_rid), .m_axi_rdata(pf_act_rdata),
+        .m_axi_rresp(pf_act_rresp), .m_axi_rlast(pf_act_rlast),
+        .m_axi_rvalid(pf_act_rvalid), .m_axi_rready(pf_act_rready),
+        .uram_wr_en(pf_act_wr_en),
+        .uram_wr_row(pf_act_wr_row),
+        .uram_wr_col_word(pf_act_wr_col_word),
+        .uram_wr_data(pf_act_wr_data)
+    );
+
+    // =========================================================================
+    // FPGA Target: Wire prefetch AXI to module ports, tie off unused ports
     // =========================================================================
 `ifdef FPGA_TARGET
-    // Weight tile loader AXI ports (read-only, 2 engines)
-    assign m_axi_wgt0_arid    = gen_eng[0].wgt_arid;
-    assign m_axi_wgt0_araddr  = gen_eng[0].wgt_araddr;
-    assign m_axi_wgt0_arlen   = gen_eng[0].wgt_arlen;
-    assign m_axi_wgt0_arvalid = gen_eng[0].wgt_arvalid;
-    assign m_axi_wgt0_rready  = gen_eng[0].wgt_rready;
+    // wgt0 → weight prefetch DMA
+    assign m_axi_wgt0_arid    = pf_wgt_arid;
+    assign m_axi_wgt0_araddr  = pf_wgt_araddr;
+    assign m_axi_wgt0_arlen   = pf_wgt_arlen;
+    assign m_axi_wgt0_arvalid = pf_wgt_arvalid;
+    assign m_axi_wgt0_rready  = pf_wgt_rready;
+    assign pf_wgt_arready     = m_axi_wgt0_arready;
+    assign pf_wgt_rid         = m_axi_wgt0_rid;
+    assign pf_wgt_rdata       = m_axi_wgt0_rdata;
+    assign pf_wgt_rresp       = m_axi_wgt0_rresp;
+    assign pf_wgt_rlast       = m_axi_wgt0_rlast;
+    assign pf_wgt_rvalid      = m_axi_wgt0_rvalid;
 
-    assign m_axi_wgt1_arid    = gen_eng[1].wgt_arid;
-    assign m_axi_wgt1_araddr  = gen_eng[1].wgt_araddr;
-    assign m_axi_wgt1_arlen   = gen_eng[1].wgt_arlen;
-    assign m_axi_wgt1_arvalid = gen_eng[1].wgt_arvalid;
-    assign m_axi_wgt1_rready  = gen_eng[1].wgt_rready;
+    // act0 → activation prefetch DMA
+    assign m_axi_act0_arid    = pf_act_arid;
+    assign m_axi_act0_araddr  = pf_act_araddr;
+    assign m_axi_act0_arlen   = pf_act_arlen;
+    assign m_axi_act0_arvalid = pf_act_arvalid;
+    assign m_axi_act0_rready  = pf_act_rready;
+    assign pf_act_arready     = m_axi_act0_arready;
+    assign pf_act_rid         = m_axi_act0_rid;
+    assign pf_act_rdata       = m_axi_act0_rdata;
+    assign pf_act_rresp       = m_axi_act0_rresp;
+    assign pf_act_rlast       = m_axi_act0_rlast;
+    assign pf_act_rvalid      = m_axi_act0_rvalid;
 
-    // Activation tile loader AXI ports (read-only, 2 engines)
-    assign m_axi_act0_arid    = gen_eng[0].act_arid;
-    assign m_axi_act0_araddr  = gen_eng[0].act_araddr;
-    assign m_axi_act0_arlen   = gen_eng[0].act_arlen;
-    assign m_axi_act0_arvalid = gen_eng[0].act_arvalid;
-    assign m_axi_act0_rready  = gen_eng[0].act_rready;
+    // wgt1 → tied off (kept for Vitis port layout)
+    assign m_axi_wgt1_arid    = {ID_W_PARAM{1'b0}};
+    assign m_axi_wgt1_araddr  = {HBM_ADDR_W{1'b0}};
+    assign m_axi_wgt1_arlen   = 8'd0;
+    assign m_axi_wgt1_arvalid = 1'b0;
+    assign m_axi_wgt1_rready  = 1'b0;
 
-    assign m_axi_act1_arid    = gen_eng[1].act_arid;
-    assign m_axi_act1_araddr  = gen_eng[1].act_araddr;
-    assign m_axi_act1_arlen   = gen_eng[1].act_arlen;
-    assign m_axi_act1_arvalid = gen_eng[1].act_arvalid;
-    assign m_axi_act1_rready  = gen_eng[1].act_rready;
+    // act1 → tied off (kept for Vitis port layout)
+    assign m_axi_act1_arid    = {ID_W_PARAM{1'b0}};
+    assign m_axi_act1_araddr  = {HBM_ADDR_W{1'b0}};
+    assign m_axi_act1_arlen   = 8'd0;
+    assign m_axi_act1_arvalid = 1'b0;
+    assign m_axi_act1_rready  = 1'b0;
 
-    // Weight tile loader read responses (from external HBM → internal wires)
-    assign gen_eng[0].wgt_arready = m_axi_wgt0_arready;
-    assign gen_eng[0].wgt_rid     = m_axi_wgt0_rid;
-    assign gen_eng[0].wgt_rdata   = m_axi_wgt0_rdata;
-    assign gen_eng[0].wgt_rresp   = m_axi_wgt0_rresp;
-    assign gen_eng[0].wgt_rlast   = m_axi_wgt0_rlast;
-    assign gen_eng[0].wgt_rvalid  = m_axi_wgt0_rvalid;
+`else
+    // Simulation: Weight prefetch HBM port
+    sim_hbm_port #(.DEPTH(SIM_HBM_DEPTH), .RD_LATENCY_CYCLES(HBM_RD_LATENCY)) u_hbm_pf_wgt (
+        .clk(clk), .rst_n(rst_n),
+        .s_axi_arid(pf_wgt_arid), .s_axi_araddr(pf_wgt_araddr),
+        .s_axi_arlen(pf_wgt_arlen), .s_axi_arvalid(pf_wgt_arvalid),
+        .s_axi_arready(pf_wgt_arready),
+        .s_axi_rid(pf_wgt_rid), .s_axi_rdata(pf_wgt_rdata),
+        .s_axi_rresp(pf_wgt_rresp), .s_axi_rlast(pf_wgt_rlast),
+        .s_axi_rvalid(pf_wgt_rvalid), .s_axi_rready(pf_wgt_rready),
+        // Write channels tied off
+        .s_axi_awid({ID_W{1'b0}}), .s_axi_awaddr({HBM_ADDR_W{1'b0}}),
+        .s_axi_awlen({LEN_W{1'b0}}), .s_axi_awvalid(1'b0),
+        .s_axi_awready(),
+        .s_axi_wdata({BUS_WIDTH{1'b0}}), .s_axi_wlast(1'b0),
+        .s_axi_wvalid(1'b0), .s_axi_wready(),
+        .s_axi_bid(), .s_axi_bresp(), .s_axi_bvalid(),
+        .s_axi_bready(1'b0)
+    );
 
-    assign gen_eng[1].wgt_arready = m_axi_wgt1_arready;
-    assign gen_eng[1].wgt_rid     = m_axi_wgt1_rid;
-    assign gen_eng[1].wgt_rdata   = m_axi_wgt1_rdata;
-    assign gen_eng[1].wgt_rresp   = m_axi_wgt1_rresp;
-    assign gen_eng[1].wgt_rlast   = m_axi_wgt1_rlast;
-    assign gen_eng[1].wgt_rvalid  = m_axi_wgt1_rvalid;
-
-    // Activation tile loader read responses
-    assign gen_eng[0].act_arready = m_axi_act0_arready;
-    assign gen_eng[0].act_rid     = m_axi_act0_rid;
-    assign gen_eng[0].act_rdata   = m_axi_act0_rdata;
-    assign gen_eng[0].act_rresp   = m_axi_act0_rresp;
-    assign gen_eng[0].act_rlast   = m_axi_act0_rlast;
-    assign gen_eng[0].act_rvalid  = m_axi_act0_rvalid;
-
-    assign gen_eng[1].act_arready = m_axi_act1_arready;
-    assign gen_eng[1].act_rid     = m_axi_act1_rid;
-    assign gen_eng[1].act_rdata   = m_axi_act1_rdata;
-    assign gen_eng[1].act_rresp   = m_axi_act1_rresp;
-    assign gen_eng[1].act_rlast   = m_axi_act1_rlast;
-    assign gen_eng[1].act_rvalid  = m_axi_act1_rvalid;
-
+    // Simulation: Activation prefetch HBM port
+    sim_hbm_port #(.DEPTH(SIM_HBM_DEPTH), .RD_LATENCY_CYCLES(HBM_RD_LATENCY)) u_hbm_pf_act (
+        .clk(clk), .rst_n(rst_n),
+        .s_axi_arid(pf_act_arid), .s_axi_araddr(pf_act_araddr),
+        .s_axi_arlen(pf_act_arlen), .s_axi_arvalid(pf_act_arvalid),
+        .s_axi_arready(pf_act_arready),
+        .s_axi_rid(pf_act_rid), .s_axi_rdata(pf_act_rdata),
+        .s_axi_rresp(pf_act_rresp), .s_axi_rlast(pf_act_rlast),
+        .s_axi_rvalid(pf_act_rvalid), .s_axi_rready(pf_act_rready),
+        // Write channels tied off
+        .s_axi_awid({ID_W{1'b0}}), .s_axi_awaddr({HBM_ADDR_W{1'b0}}),
+        .s_axi_awlen({LEN_W{1'b0}}), .s_axi_awvalid(1'b0),
+        .s_axi_awready(),
+        .s_axi_wdata({BUS_WIDTH{1'b0}}), .s_axi_wlast(1'b0),
+        .s_axi_wvalid(1'b0), .s_axi_wready(),
+        .s_axi_bid(), .s_axi_bresp(), .s_axi_bvalid(),
+        .s_axi_bready(1'b0)
+    );
 `endif
 
     // =========================================================================

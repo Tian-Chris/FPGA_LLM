@@ -44,7 +44,7 @@ MAX_SEQ_LEN   = 32
 MAX_BATCH     = 1
 NUM_ENC       = 1
 TILE_SIZE     = 32
-NUM_ENGINES   = 2
+NUM_ENGINES   = 1
 
 SEQ_LEN = 32
 BATCH   = 1

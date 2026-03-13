@@ -440,19 +440,19 @@ endmodule
 
 
 // =============================================================================
-// matmul_controller.v - Per-Engine Wrapper (HBM Architecture)
+// matmul_controller.v - Per-Engine Wrapper (URAM Prefetch Architecture)
 // =============================================================================
 //
-// Wraps matmul_engine with tile_loader interfaces and URAM output.
+// Wraps matmul_engine with URAM prefetch buffer read interfaces.
 // Tile commands come from the tiling_engine dispatcher.
 //
 // K-loop is managed here: for each k-tile, the controller:
-//   1. Issues load commands to weight and activation tile_loaders
-//   2. Waits for both loads to complete
-//   3. Streams data from local buffers into the matmul_engine
-//   4. Waits for engine compute phase to finish
-//   5. After the last k-tile, triggers output serialization
+//   1. Reads tile data from shared URAM prefetch buffers (act + wgt)
+//   2. Streams data into the matmul_engine
+//   3. Waits for engine compute phase to finish
+//   4. After the last k-tile, triggers output serialization
 //
+// No tile_loader or HBM access — data is pre-loaded into URAM by hbm_prefetch.
 // Output goes to URAM accumulation buffer (column-sharded write port).
 // =============================================================================
 
@@ -465,7 +465,9 @@ module matmul_controller #(
     parameter DIM_W       = 16,
     parameter HBM_ADDR_W  = 28,
     parameter URAM_ROW_W  = 10,    // $clog2(1024)
-    parameter URAM_COL_W  = 6      // $clog2(64)
+    parameter URAM_COL_W  = 6,     // $clog2(64)
+    parameter PF_ROW_W    = 10,    // prefetch buffer row width
+    parameter PF_COL_W    = 6      // prefetch buffer col width
 )(
     input  wire                     clk,
     input  wire                     rst_n,
@@ -478,46 +480,32 @@ module matmul_controller #(
     input  wire [DIM_W-1:0]         cmd_m,
     input  wire [DIM_W-1:0]         cmd_k,
     input  wire [DIM_W-1:0]         cmd_n,
-    input  wire [HBM_ADDR_W-1:0]   cmd_a_base,       // HBM base for A tile (k=0)
-    input  wire [HBM_ADDR_W-1:0]   cmd_b_base,       // HBM base for B tile (k=0)
-    input  wire [HBM_ADDR_W-1:0]   cmd_a_stride,     // A row stride in HBM words
-    input  wire [HBM_ADDR_W-1:0]   cmd_b_stride,     // B row stride in HBM words
-    input  wire [URAM_ROW_W-1:0]   cmd_out_row,      // URAM output starting row
-    input  wire [URAM_COL_W-1:0]   cmd_out_col_word, // URAM output starting col word
+    input  wire [PF_ROW_W-1:0]     cmd_a_row_off,     // A tile row offset in prefetch URAM
+    input  wire [PF_COL_W-1:0]     cmd_a_col_off,     // A tile col offset in prefetch URAM
+    input  wire [PF_ROW_W-1:0]     cmd_b_row_off,     // B tile row offset in prefetch URAM
+    input  wire [PF_COL_W-1:0]     cmd_b_col_off,     // B tile col offset in prefetch URAM
+    input  wire [URAM_ROW_W-1:0]   cmd_out_row,       // URAM output starting row
+    input  wire [URAM_COL_W-1:0]   cmd_out_col_word,  // URAM output starting col word
     (* mark_debug = "true" *) output reg                      cmd_ready,
     (* mark_debug = "true" *) output reg                      cmd_done,
 
     // -----------------------------------------------------------------
-    // Weight tile_loader command interface
+    // Weight URAM prefetch read interface
     // -----------------------------------------------------------------
-    output reg                      wgt_load_cmd_valid,
-    input  wire                     wgt_load_cmd_ready,
-    output reg  [HBM_ADDR_W-1:0]   wgt_load_hbm_base,
-    output reg  [5:0]               wgt_load_tile_rows,
-    output reg  [HBM_ADDR_W-1:0]   wgt_load_stride,
-    input  wire                     wgt_load_cmd_done,
-
-    // Weight tile_loader local read
-    output reg                      wgt_local_rd_en,
-    output reg  [5:0]               wgt_local_rd_addr,
-    input  wire [BUS_W-1:0]         wgt_local_rd_data,
-    input  wire                     wgt_local_rd_valid,
+    output reg                      wgt_uram_rd_en,
+    output reg  [PF_ROW_W-1:0]     wgt_uram_rd_row,
+    output reg  [PF_COL_W-1:0]     wgt_uram_rd_col_word,
+    input  wire [BUS_W-1:0]        wgt_uram_rd_data,
+    input  wire                     wgt_uram_rd_valid,
 
     // -----------------------------------------------------------------
-    // Activation tile_loader command interface
+    // Activation URAM prefetch read interface
     // -----------------------------------------------------------------
-    output reg                      act_load_cmd_valid,
-    input  wire                     act_load_cmd_ready,
-    output reg  [HBM_ADDR_W-1:0]   act_load_hbm_base,
-    output reg  [5:0]               act_load_tile_rows,
-    output reg  [HBM_ADDR_W-1:0]   act_load_stride,
-    input  wire                     act_load_cmd_done,
-
-    // Activation tile_loader local read
-    output reg                      act_local_rd_en,
-    output reg  [5:0]               act_local_rd_addr,
-    input  wire [BUS_W-1:0]         act_local_rd_data,
-    input  wire                     act_local_rd_valid,
+    output reg                      act_uram_rd_en,
+    output reg  [PF_ROW_W-1:0]     act_uram_rd_row,
+    output reg  [PF_COL_W-1:0]     act_uram_rd_col_word,
+    input  wire [BUS_W-1:0]        act_uram_rd_data,
+    input  wire                     act_uram_rd_valid,
 
     // -----------------------------------------------------------------
     // URAM write interface (to uram_accum_buf)
@@ -553,15 +541,13 @@ module matmul_controller #(
     reg         first_tile_r;
 
     // =====================================================================
-    // State Machine
+    // State Machine (no ST_LOAD_CMD / ST_WAIT_LOAD — data already in URAM)
     // =====================================================================
     (* mark_debug = "true" *) reg [3:0] state;
     localparam ST_IDLE          = 4'd0;
-    localparam ST_LOAD_CMD      = 4'd1;   // Issue tile_loader commands
-    localparam ST_WAIT_LOAD     = 4'd2;   // Wait for both loaders done
     localparam ST_TILE_START    = 4'd3;   // Pulse tile_start
-    localparam ST_FEED_A        = 4'd4;   // Stream A data from act loader
-    localparam ST_FEED_B        = 4'd5;   // Stream B data from wgt loader
+    localparam ST_FEED_A        = 4'd4;   // Stream A data from act URAM
+    localparam ST_FEED_B        = 4'd5;   // Stream B data from wgt URAM
     localparam ST_WAIT_COMPUTE  = 4'd6;   // Wait for engine compute phase
     localparam ST_NEXT_K        = 4'd7;   // Advance k-tile or finish
     localparam ST_FLUSH         = 4'd8;   // Wait for engine output complete
@@ -572,25 +558,19 @@ module matmul_controller #(
     // =====================================================================
     reg [2:0]              op_r;
     reg [DIM_W-1:0]        m_r, k_r, n_r;
-    reg [HBM_ADDR_W-1:0]  a_base_r, b_base_r;
-    reg [HBM_ADDR_W-1:0]  a_stride_r, b_stride_r;
+    reg [PF_ROW_W-1:0]    a_row_off_r, b_row_off_r;
+    reg [PF_COL_W-1:0]    a_col_off_r, b_col_off_r;
     reg [URAM_ROW_W-1:0]  out_row_start_r;
     reg [URAM_COL_W-1:0]  out_col_word_start_r;
 
     // K-loop state
     reg [DIM_W-1:0]        num_k_tiles;
     reg [DIM_W-1:0]        k_tile_idx;
-    reg [HBM_ADDR_W-1:0]  act_hbm_addr;    // Accumulator for A tile HBM base
-    reg [HBM_ADDR_W-1:0]  wgt_hbm_addr;    // Accumulator for B tile HBM base
-    wire [HBM_ADDR_W-1:0] wgt_k_step = {{(HBM_ADDR_W-DIM_W){1'b0}}, b_stride_r[DIM_W-1:0]} << TILE_W;
 
     // Data feed counter
     reg [6:0] feed_cnt;  // 0..64 (needs 7 bits)
 
-    // Tile_loader done tracking
-    reg wgt_load_launched;
-    reg act_load_launched;
-    reg mm_done_r;  // Latched mm_done for safe flush→done transition
+    reg mm_done_r;  // Latched mm_done for safe flush->done transition
 
     // =====================================================================
     // Main FSM
@@ -606,87 +586,39 @@ module matmul_controller #(
             feed_cnt         <= 7'd0;
             k_tile_idx       <= {DIM_W{1'b0}};
             num_k_tiles      <= {DIM_W{1'b0}};
-            act_hbm_addr     <= {HBM_ADDR_W{1'b0}};
-            wgt_hbm_addr     <= {HBM_ADDR_W{1'b0}};
-            wgt_load_cmd_valid <= 1'b0;
-            act_load_cmd_valid <= 1'b0;
-            wgt_local_rd_en  <= 1'b0;
-            act_local_rd_en  <= 1'b0;
-            wgt_load_launched <= 1'b0;
-            act_load_launched <= 1'b0;
+            wgt_uram_rd_en   <= 1'b0;
+            act_uram_rd_en   <= 1'b0;
             mm_done_r        <= 1'b0;
         end else begin
             // Defaults
             cmd_done         <= 1'b0;
             tile_start_r     <= 1'b0;
             tile_done_r      <= 1'b0;
-            wgt_load_cmd_valid <= 1'b0;
-            act_load_cmd_valid <= 1'b0;
-            wgt_local_rd_en  <= 1'b0;
-            act_local_rd_en  <= 1'b0;
+            wgt_uram_rd_en   <= 1'b0;
+            act_uram_rd_en   <= 1'b0;
 
             case (state)
                 // ---------------------------------------------------------
                 ST_IDLE: begin
                     cmd_ready <= 1'b1;
                     if (cmd_valid && cmd_ready) begin
-                        state         <= ST_LOAD_CMD;
+                        state         <= ST_TILE_START;
                         cmd_ready     <= 1'b0;
                         mm_done_r     <= 1'b0;
                         op_r          <= cmd_op;
                         m_r           <= cmd_m;
                         k_r           <= cmd_k;
                         n_r           <= cmd_n;
-                        a_base_r      <= cmd_a_base;
-                        b_base_r      <= cmd_b_base;
-                        a_stride_r    <= cmd_a_stride;
-                        b_stride_r    <= cmd_b_stride;
+                        a_row_off_r   <= cmd_a_row_off;
+                        a_col_off_r   <= cmd_a_col_off;
+                        b_row_off_r   <= cmd_b_row_off;
+                        b_col_off_r   <= cmd_b_col_off;
                         out_row_start_r     <= cmd_out_row;
                         out_col_word_start_r <= cmd_out_col_word;
                         // K-loop init
                         num_k_tiles   <= (cmd_k + TILE - 1) >> TILE_W;
                         k_tile_idx    <= {DIM_W{1'b0}};
-                        act_hbm_addr  <= cmd_a_base;
-                        wgt_hbm_addr  <= cmd_b_base;
                     end
-                end
-
-                // ---------------------------------------------------------
-                // Issue load commands to both tile_loaders
-                // ---------------------------------------------------------
-                ST_LOAD_CMD: begin
-                    // Weight tile_loader
-                    if (!wgt_load_launched) begin
-                        wgt_load_cmd_valid <= 1'b1;
-                        wgt_load_hbm_base  <= wgt_hbm_addr;
-                        wgt_load_tile_rows <= TILE[5:0];
-                        wgt_load_stride    <= b_stride_r;
-                        if (wgt_load_cmd_valid && wgt_load_cmd_ready)
-                            wgt_load_launched <= 1'b1;
-                    end
-                    // Activation tile_loader
-                    if (!act_load_launched) begin
-                        act_load_cmd_valid <= 1'b1;
-                        act_load_hbm_base  <= act_hbm_addr;
-                        act_load_tile_rows <= TILE[5:0];
-                        act_load_stride    <= a_stride_r;
-                        if (act_load_cmd_valid && act_load_cmd_ready)
-                            act_load_launched <= 1'b1;
-                    end
-                    // Both launched
-                    if (wgt_load_launched && act_load_launched) begin
-                        state <= ST_WAIT_LOAD;
-                        wgt_load_launched <= 1'b0;
-                        act_load_launched <= 1'b0;
-                    end
-                end
-
-                // ---------------------------------------------------------
-                // Wait for both tile_loaders to finish
-                // ---------------------------------------------------------
-                ST_WAIT_LOAD: begin
-                    if (wgt_load_cmd_done && act_load_cmd_done)
-                        state <= ST_TILE_START;
                 end
 
                 // ---------------------------------------------------------
@@ -700,30 +632,32 @@ module matmul_controller #(
                 end
 
                 // ---------------------------------------------------------
-                // Stream A data from activation tile_loader (64 beats)
+                // Stream A data from activation URAM prefetch buffer (64 beats)
+                // feed_cnt[6:1] = row within tile (0..31)
+                // feed_cnt[0]   = word within row (0..1)
                 // ---------------------------------------------------------
                 ST_FEED_A: begin
                     if (feed_cnt < BUF_DEPTH) begin
-                        act_local_rd_en   <= 1'b1;
-                        act_local_rd_addr <= feed_cnt[5:0];
+                        act_uram_rd_en       <= 1'b1;
+                        act_uram_rd_row      <= a_row_off_r + feed_cnt[5:1];
+                        act_uram_rd_col_word <= a_col_off_r + feed_cnt[0];
                         feed_cnt <= feed_cnt + 1;
                     end else begin
-                        // All A reads issued; last data arrives this cycle
                         feed_cnt <= 7'd0;
                         state    <= ST_FEED_B;
                     end
                 end
 
                 // ---------------------------------------------------------
-                // Stream B data from weight tile_loader (64 beats)
+                // Stream B data from weight URAM prefetch buffer (64 beats)
                 // ---------------------------------------------------------
                 ST_FEED_B: begin
                     if (feed_cnt < BUF_DEPTH) begin
-                        wgt_local_rd_en   <= 1'b1;
-                        wgt_local_rd_addr <= feed_cnt[5:0];
+                        wgt_uram_rd_en       <= 1'b1;
+                        wgt_uram_rd_row      <= b_row_off_r + feed_cnt[5:1];
+                        wgt_uram_rd_col_word <= b_col_off_r + feed_cnt[0];
                         feed_cnt <= feed_cnt + 1;
                     end else begin
-                        // All B reads issued; wait for engine compute phase
                         feed_cnt <= 7'd0;
                         state    <= ST_WAIT_COMPUTE;
                     end
@@ -734,7 +668,6 @@ module matmul_controller #(
                 // ---------------------------------------------------------
                 ST_WAIT_COMPUTE: begin
                     if (mm_compute_done) begin
-                        // Assert tile_done for the last k-tile
                         if (k_tile_idx == num_k_tiles - 1)
                             tile_done_r <= 1'b1;
                         state <= ST_NEXT_K;
@@ -746,14 +679,15 @@ module matmul_controller #(
                 // ---------------------------------------------------------
                 ST_NEXT_K: begin
                     if (k_tile_idx == num_k_tiles - 1) begin
-                        // All k-tiles done, wait for engine output
                         state <= ST_FLUSH;
                     end else begin
-                        // Next k-tile: update HBM addresses
-                        k_tile_idx   <= k_tile_idx + 1;
-                        act_hbm_addr <= act_hbm_addr + WORDS_PER_ROW[HBM_ADDR_W-1:0];
-                        wgt_hbm_addr <= wgt_hbm_addr + wgt_k_step;
-                        state        <= ST_LOAD_CMD;
+                        // Next k-tile: advance chunk-relative offsets
+                        k_tile_idx  <= k_tile_idx + 1;
+                        // A advances along K columns: col offset += WORDS_PER_ROW
+                        a_col_off_r <= a_col_off_r + WORDS_PER_ROW[PF_COL_W-1:0];
+                        // B advances along K rows: row offset += TILE
+                        b_row_off_r <= b_row_off_r + TILE[PF_ROW_W-1:0];
+                        state       <= ST_TILE_START;
                     end
                 end
 
@@ -763,7 +697,6 @@ module matmul_controller #(
                 ST_FLUSH: begin
                     if (mm_done)
                         mm_done_r <= 1'b1;
-                    // Transition only after engine done AND last write committed
                     if (mm_done_r && !wr_pending)
                         state <= ST_DONE;
                 end
@@ -796,10 +729,10 @@ module matmul_controller #(
         .op_type(op_r),
         .busy(mm_busy),
         .done(mm_done),
-        .a_valid(act_local_rd_valid),
-        .a_data(act_local_rd_data),
-        .b_valid(wgt_local_rd_valid),
-        .b_data(wgt_local_rd_data),
+        .a_valid(act_uram_rd_valid),
+        .a_data(act_uram_rd_data),
+        .b_valid(wgt_uram_rd_valid),
+        .b_data(wgt_uram_rd_data),
         .tile_start(tile_start_r),
         .tile_done(tile_done_r),
         .tile_row(5'd0),
@@ -816,18 +749,10 @@ module matmul_controller #(
     // =====================================================================
     // URAM Write Control — with backpressure from write arbiter
     // =====================================================================
-    // Output: 16 INT16 per write = 256 bits, 2 sub-col writes per row.
-    // The write is held (uram_wr_en stays high) until uram_wr_accept
-    // is asserted by the arbiter. The engine is stalled via mm_out_stall
-    // while a write is pending and not yet accepted.
-
     reg wr_sub_col;
     reg wr_pending;
     wire mm_out_stall = wr_pending && !uram_wr_accept;
 
-    // wr_sub_col toggles each time a GENUINE new output beat arrives.
-    // Gate on !mm_out_stall to ignore the stale out_valid that persists
-    // for one extra cycle after a stall begins (engine output is registered).
     wire mm_out_new = mm_out_valid && !mm_out_stall;
 
     always @(posedge clk or negedge rst_n) begin
@@ -844,18 +769,12 @@ module matmul_controller #(
             uram_wr_data     <= {BUS_W{1'b0}};
         end else begin
             if (mm_out_new) begin
-                // New write from engine — capture into holding register.
-                // If wr_pending was set, the previous write was just accepted
-                // this cycle (mm_out_stall=0 allowed the engine to advance).
                 wr_pending       <= 1'b1;
                 uram_wr_en       <= 1'b1;
                 uram_wr_data     <= mm_out_data;
-                uram_wr_row      <= out_row_start_r +
-                                    {{(URAM_ROW_W-5){1'b0}}, mm_out_row};
-                uram_wr_col_word <= out_col_word_start_r +
-                                    {{(URAM_COL_W-1){1'b0}}, wr_sub_col};
+                uram_wr_row      <= out_row_start_r + mm_out_row;
+                uram_wr_col_word <= out_col_word_start_r + wr_sub_col;
             end else if (wr_pending && uram_wr_accept) begin
-                // Write accepted, no new write from engine
                 wr_pending <= 1'b0;
                 uram_wr_en <= 1'b0;
             end

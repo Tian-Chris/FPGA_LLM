@@ -15,13 +15,13 @@
 // =============================================================================
 
 `ifdef SIM_SMALL
-// --- Minimal parameters for fast XSim / integration tests ---
-parameter MODEL_DIM     = 32;
-parameter NUM_HEADS     = 1;
+// --- SIM_SMALL parameters (must match verify/test_top.py) ---
+parameter MODEL_DIM     = 64;
+parameter NUM_HEADS     = 2;
 parameter HEAD_DIM      = MODEL_DIM / NUM_HEADS;   // 32
-parameter F_DIM         = 32;
-parameter INPUT_DIM     = 32;
-parameter MAX_SEQ_LEN   = 4;
+parameter F_DIM         = 128;
+parameter INPUT_DIM     = 64;
+parameter MAX_SEQ_LEN   = 32;
 parameter MAX_BATCH     = 1;
 parameter NUM_ENC_LAYERS = 1;
 parameter NUM_DEN_LAYERS = 0;
@@ -66,11 +66,7 @@ parameter ADDR_WIDTH    = 20;           // Legacy — local BRAM address width
 parameter TILE_SIZE     = 32;
 
 // Multi-Engine Configuration
-`ifdef SIM_SMALL
-parameter NUM_ENGINES   = 2;            // 2 engines for fast sim
-`else
-parameter NUM_ENGINES   = 2;            // Parallel matmul engines (reduced from 4 for SLR0 congestion)
-`endif
+parameter NUM_ENGINES   = 1;            // 1 engine for URAM prefetch debug phase
 
 // Memory Bus Configuration
 parameter BUS_WIDTH     = 256;                          // 256-bit memory bus
@@ -85,14 +81,24 @@ parameter HBM_NUM_CH    = 10;           // Channels used (of 32 available)
 
 // URAM Configuration (output accumulation buffer)
 `ifdef SIM_SMALL
-parameter URAM_ROWS     = 4;            // MAX_SEQ_LEN
-parameter URAM_COLS     = 32;           // F_DIM
+parameter URAM_ROWS     = 32;           // MAX_SEQ_LEN
+parameter URAM_COLS     = 128;          // F_DIM
 `else
 parameter URAM_ROWS     = 1024;         // MODEL_DIM
 parameter URAM_COLS     = 4096;         // F_DIM (widened for non-matmul URAM staging)
 `endif
 parameter URAM_DATA_W   = 16;           // INT16 output elements
-parameter URAM_COL_WORDS = URAM_COLS / BUS_ELEMS;  // SIM_SMALL: 4, Production: 256
+parameter URAM_COL_WORDS = URAM_COLS / BUS_ELEMS;  // SIM_SMALL: 8, Production: 256
+
+// Prefetch Buffer Configuration
+`ifdef SIM_SMALL
+parameter PREFETCH_ROWS      = 128;
+parameter PREFETCH_COLS      = 128;
+`else
+parameter PREFETCH_ROWS      = 1024;
+parameter PREFETCH_COLS      = 1024;
+`endif
+parameter PREFETCH_COL_WORDS = PREFETCH_COLS / BUS_ELEMS;  // SIM_SMALL: 8, Production: 64
 
 // -----------------------------------------------------------------------------
 // Architecture Selection (compile-time)

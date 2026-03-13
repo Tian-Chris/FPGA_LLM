@@ -153,26 +153,17 @@ module tb_top;
         // Wait for sim_hbm_port zero-init to complete, then overwrite
         #1;
 
-        // Load weight + activation data into ALL engine HBMs (both wgt and act).
+        // Load weight + activation data into shared prefetch HBM ports.
         // Weight data occupies addresses 0..519, activation data at 520+.
-        // The hex files use @addr directives (or are pre-padded) so they write
-        // to non-overlapping regions. Load wgt first, then act on top.
-        // This way OP_MATMUL_T/AA (which reads act data from wgt tile_loader)
-        // and normal OP_MATMUL (which reads wgt from wgt, act from act) both work.
+        // The hex files use @addr directives so they write to non-overlapping regions.
 
-        // Engine 0 weight HBM: weights + activations
-        $readmemh("verify/test_data/hbm_wgt.hex", dut.gen_eng[0].u_hbm_wgt.mem);
-        $readmemh("verify/test_data/hbm_act.hex", dut.gen_eng[0].u_hbm_wgt.mem);
-        // Engine 1 weight HBM: weights + activations
-        $readmemh("verify/test_data/hbm_wgt.hex", dut.gen_eng[1].u_hbm_wgt.mem);
-        $readmemh("verify/test_data/hbm_act.hex", dut.gen_eng[1].u_hbm_wgt.mem);
+        // Weight prefetch HBM: weights + activations
+        $readmemh("verify/test_data/hbm_wgt.hex", dut.u_hbm_pf_wgt.mem);
+        $readmemh("verify/test_data/hbm_act.hex", dut.u_hbm_pf_wgt.mem);
 
-        // Engine 0 activation HBM: weights + activations
-        $readmemh("verify/test_data/hbm_wgt.hex", dut.gen_eng[0].u_hbm_act.mem);
-        $readmemh("verify/test_data/hbm_act.hex", dut.gen_eng[0].u_hbm_act.mem);
-        // Engine 1 activation HBM: weights + activations
-        $readmemh("verify/test_data/hbm_wgt.hex", dut.gen_eng[1].u_hbm_act.mem);
-        $readmemh("verify/test_data/hbm_act.hex", dut.gen_eng[1].u_hbm_act.mem);
+        // Activation prefetch HBM: weights + activations
+        $readmemh("verify/test_data/hbm_wgt.hex", dut.u_hbm_pf_act.mem);
+        $readmemh("verify/test_data/hbm_act.hex", dut.u_hbm_pf_act.mem);
 
         // Load DMA HBM data (LN params, residual sub)
         $readmemh("verify/test_data/hbm_dma.hex", dut.u_hbm_dma.mem);
@@ -185,7 +176,7 @@ module tb_top;
             for (uram_c = 0; uram_c < MODEL_STRIDE_L; uram_c = uram_c + 1) begin
                 uram_src = URAM_EMBED_SRC + uram_r * MODEL_STRIDE_L + uram_c;
                 dut.u_uram.mem[uram_r * URAM_COL_WORDS_L + uram_c] =
-                    dut.gen_eng[0].u_hbm_act.mem[uram_src];
+                    dut.u_hbm_pf_act.mem[uram_src];
             end
         end
 
@@ -359,10 +350,8 @@ module tb_top;
                 for (mirror_r = 0; mirror_r <= saved_flush_rows; mirror_r = mirror_r + 1) begin
                     for (mirror_c = 0; mirror_c <= saved_flush_cols; mirror_c = mirror_c + 1) begin
                         mirror_addr = saved_flush_base + mirror_r * saved_flush_stride + mirror_c;
-                        dut.gen_eng[0].u_hbm_act.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.gen_eng[1].u_hbm_act.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.gen_eng[0].u_hbm_wgt.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.gen_eng[1].u_hbm_wgt.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
+                        dut.u_hbm_pf_act.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
+                        dut.u_hbm_pf_wgt.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
                     end
                 end
                 flush_params_valid <= 1'b0;

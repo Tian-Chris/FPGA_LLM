@@ -35,6 +35,8 @@ RTL_ALL = \
     $(RTL_DIR)/uram_flush.v \
     $(RTL_DIR)/act_dma.v \
     $(RTL_DIR)/uram_nm_adapter.v \
+    $(RTL_DIR)/uram_prefetch_buf.v \
+    $(RTL_DIR)/hbm_prefetch.v \
     $(RTL_DIR)/top_level.v
 
 ifeq ($(TARGET),top_level)

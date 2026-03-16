@@ -256,21 +256,22 @@ static int unembed_sample(const float* hidden, const EmbedData& ed, float temper
 }
 
 // =============================================================================
-// Read FPGA output and convert to FP32
+// Read FPGA output from activation buffer and convert to FP32
 // =============================================================================
-static void read_output_fp32(const int16_t* output_buf, int seq_pos,
+// After all layers, the final residual2 output is flushed to ACT_EMBED in
+// the activation buffer (step 14 of the step table). S_OUTPUT_COPY is skipped
+// because the flush port (hbm12) can only reach the activation bank (HBM[4]).
+static void read_output_fp32(const int16_t* act_buf, int seq_pos,
                               float* hidden_fp32) {
-    // Output is at word offset 0 + seq_pos * MODEL_STRIDE, MODEL_DIM INT16 elements
+    // Output is at ACT_EMBED_OFFSET + seq_pos * MODEL_STRIDE
     for (int d = 0; d < MODEL_DIM; ++d) {
         int word_in_row = d / BUS_ELEMS;
         int elem_in_word = d % BUS_ELEMS;
         size_t byte_offset = static_cast<size_t>(
-            (seq_pos * MODEL_STRIDE + word_in_row) * WORD_BYTES
+            (ACT_EMBED_OFFSET + seq_pos * MODEL_STRIDE + word_in_row) * WORD_BYTES
             + elem_in_word * 2);
 
-        int16_t raw = output_buf[byte_offset / 2];
-        // Convert back to approximate FP32 (scale is approximate since
-        // the RTL pipeline applies many transformations)
+        int16_t raw = act_buf[byte_offset / 2];
         hidden_fp32[d] = static_cast<float>(raw);
     }
 }
@@ -490,10 +491,6 @@ int main(int argc, char* argv[]) {
 
     bo_act.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-    // Clear output
-    std::memset(output_map, 0, OUTPUT_BUF_SIZE);
-    bo_output.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
     // Run kernel: prefill mode
     uint32_t batch_size  = 1;
     uint32_t seq_len     = static_cast<uint32_t>(prompt_len);
@@ -534,7 +531,7 @@ int main(int argc, char* argv[]) {
             std::cerr << "ERROR: Kernel error state: " << static_cast<int>(state) << "\n";
             return 1;
         }
-        // Every 5 polls (~5s), dump activation HBM progress
+        // Every 5 polls (~5s), read HBM to show progress
         if (p % 5 == 4) {
             dump_activation_progress(bo_act, act_map);
         }
@@ -543,14 +540,36 @@ int main(int argc, char* argv[]) {
     double prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     std::cout << "  Prefill done in " << prefill_ms << " ms\n";
 
-    // Read output for last position
-    bo_output.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    // Read output from activation buffer (final res2 is at ACT_EMBED)
+    bo_act.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+    // Verify all layers completed by checking KV cache per layer
+    // Each layer writes K/V to a unique address during QKV (step 2).
+    // KV region starts at ACT_SCRATCH_WORDS within bo_act.
+    std::cout << "  KV cache check:";
+    for (int l = 0; l < NUM_LAYERS; ++l) {
+        // Layer l's K starts at ACT_SCRATCH_WORDS + l * KV_LAYER_SIZE
+        int kv_word_offset = ACT_SCRATCH_WORDS + l * KV_LAYER_SIZE;
+        bool has = region_has_data(act_map, kv_word_offset, 4);
+        if (!has) {
+            std::cout << " L" << l << "=EMPTY";
+        }
+    }
+    bool last_layer_kv = region_has_data(act_map, ACT_SCRATCH_WORDS + (NUM_LAYERS - 1) * KV_LAYER_SIZE, 4);
+    bool embed_has_data = region_has_data(act_map, ACT_EMBED_OFFSET, 4);
+    if (last_layer_kv && embed_has_data) {
+        std::cout << " ALL " << NUM_LAYERS << " LAYERS OK\n";
+    } else {
+        std::cout << " INCOMPLETE (L" << NUM_LAYERS - 1 << "_KV="
+                  << (last_layer_kv ? "yes" : "no") << " embed="
+                  << (embed_has_data ? "yes" : "no") << ")\n";
+    }
 
     std::vector<float> hidden(MODEL_DIM);
     std::vector<float> normed(MODEL_DIM);
 
     // Last position = prompt_len - 1
-    read_output_fp32(output_map, prompt_len - 1, hidden.data());
+    read_output_fp32(act_map, prompt_len - 1, hidden.data());
 
     // Apply ln_f
     layer_norm(hidden.data(), normed.data(), MODEL_DIM,
@@ -585,15 +604,16 @@ int main(int argc, char* argv[]) {
         std::vector<float> single_embed;
         compute_embedding(ed, single_tok, total_pos, single_embed);
 
+        // Sync act buffer FROM device first to get latest KV cache state,
+        // then write new embedding at position 0 and sync back.
+        // (XRT partial sync broken on U280 — must do full sync)
+        bo_act.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
         // Write single embedding into activation buffer
         // For decode mode, we write at position 0 (seq_len=1)
-        std::memset(act_map, 0, MODEL_STRIDE * WORD_BYTES); // clear first row
+        std::memset(reinterpret_cast<char*>(act_map), 0, MODEL_STRIDE * WORD_BYTES);
         quantize_embed_to_int16(single_embed, act_map, 1);
         bo_act.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-        // Clear output
-        std::memset(output_map, 0, OUTPUT_BUF_SIZE);
-        bo_output.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
         // Run kernel: decode mode
         decode_mode = 1;
@@ -618,17 +638,13 @@ int main(int argc, char* argv[]) {
                 std::cerr << "ERROR: Decode kernel error: " << static_cast<int>(st) << "\n";
                 return 1;
             }
-            // Every 5 polls (~5s), dump activation HBM progress
-            if (p % 5 == 4) {
-                dump_activation_progress(bo_act, act_map);
-            }
         }
         auto td1 = std::chrono::high_resolution_clock::now();
         double decode_ms = std::chrono::duration<double, std::milli>(td1 - td0).count();
 
-        // Read output (position 0, since seq_len=1 in decode)
-        bo_output.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        read_output_fp32(output_map, 0, hidden.data());
+        // Read output from act buffer (position 0, since seq_len=1 in decode)
+        bo_act.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        read_output_fp32(act_map, 0, hidden.data());
 
         // ln_f + unembed
         layer_norm(hidden.data(), normed.data(), MODEL_DIM,

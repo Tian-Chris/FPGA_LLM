@@ -66,7 +66,7 @@ $(KERNEL)_%.xclbin: $(XO_FILE) $(CFG_FILE)
 	$(VPP) -t $* --platform $(PLATFORM_PATH) \
 		--link $(XO_FILE) \
 		--config $(CFG_FILE) \
-		--kernel_frequency 150 \
+		--kernel_frequency 100 \
 		--dk chipscope:fpga_kernel_1 \
 		-o $@
 	@echo "=== Link complete: $@ ==="
@@ -75,7 +75,7 @@ link-hw-spread: $(XO_FILE) $(CFG_FILE)
 	$(VPP) -t hw --platform $(PLATFORM_PATH) \
 		--link $(XO_FILE) \
 		--config $(CFG_FILE) \
-		--kernel_frequency 150 \
+		--kernel_frequency 100 \
 		--dk chipscope:fpga_kernel_1 \
 		--vivado.prop run.impl_1.STEPS.PLACE_DESIGN.ARGS.DIRECTIVE=AltSpreadLogic_high \
 		--vivado.prop run.impl_1.STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE=AlternateCLBRouting \
@@ -87,7 +87,7 @@ link-hw-ila: $(XO_FILE) $(CFG_FILE)
 	$(VPP) -t hw --platform $(PLATFORM_PATH) \
 		--link $(XO_FILE) \
 		--config $(CFG_FILE) \
-		--kernel_frequency 150 \
+		--kernel_frequency 100 \
 		--dk chipscope:fpga_kernel_1 \
 		--vivado.prop run.impl_1.STEPS.PLACE_DESIGN.ARGS.DIRECTIVE=AltSpreadLogic_high \
 		--vivado.prop run.impl_1.STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE=AlternateCLBRouting \
@@ -151,7 +151,7 @@ $(SMALL_XCLBIN): $(SMALL_XO) $(CFG_FILE)
 	$(VPP) -t hw_emu --platform $(PLATFORM_PATH) \
 		--link $(SMALL_XO) \
 		--config $(CFG_FILE) \
-		--kernel_frequency 150 \
+		--kernel_frequency 100 \
 		-o $@
 	@echo "=== Link-emu-small complete: $@ ==="
 

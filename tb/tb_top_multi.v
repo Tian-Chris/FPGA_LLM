@@ -233,11 +233,6 @@ module tb_top_multi;
             $fflush();
         end
 
-        // Debug: display L1 K[32] first word from flush HBM
-        $display("[%0t] DBG L1_K_row32_after_dec1: %h", $time,
-                 dut.u_hbm_flush.mem[KV_BASE + 1 * 16384 + 32 * MODEL_STRIDE_L]);
-        $fflush();
-
         // ============ INJECT DECODE EMBED 2 ============
         for (de_i = 0; de_i < MODEL_STRIDE_L; de_i = de_i + 1) begin
             dut.u_hbm_pf_act.mem[ACT_BASE + de_i]  = decode_embed_2[de_i];
@@ -327,12 +322,6 @@ module tb_top_multi;
             if (dut.u_fsm.layer_cnt !== prev_layer && dut.u_fsm.state != 0) begin
                 $display("[%0t] === Layer %0d started (decode=%0d) ===",
                          $time, dut.u_fsm.layer_cnt, dut.u_fsm.decode_r);
-                $display("[%0t] DBG_LAYER_CHG: layer=%0d decode=%0d w0=%h w5=%h w10=%h w20=%h w40=%h w63=%h",
-                         $time, dut.u_fsm.layer_cnt, dut.u_fsm.decode_r,
-                         dut.u_uram.mem[0], dut.u_uram.mem[5],
-                         dut.u_uram.mem[10], dut.u_uram.mem[20],
-                         dut.u_uram.mem[40], dut.u_uram.mem[63]);
-                $fflush();
                 prev_layer <= dut.u_fsm.layer_cnt;
             end
             prev_state <= dut.u_fsm.state;
@@ -368,11 +357,6 @@ module tb_top_multi;
 
             uf_done_prev <= dut.uf_done;
             if (dut.uf_done && !uf_done_prev && flush_params_valid) begin
-                $display("[%0t] MIRROR: base=0x%08h rows=%0d cols=%0d stride=%0d layer=%0d step=%0d cache_len=%0d qkv=%0d data0=%h",
-                         $time, saved_flush_base, saved_flush_rows, saved_flush_cols,
-                         saved_flush_stride, dut.u_fsm.layer_cnt, dut.u_fsm.step_idx,
-                         dut.u_fsm.cache_len_r, dut.u_fsm.qkv_phase,
-                         dut.u_hbm_flush.mem[saved_flush_base]);
                 for (mirror_r = 0; mirror_r <= saved_flush_rows; mirror_r = mirror_r + 1) begin
                     for (mirror_c = 0; mirror_c <= saved_flush_cols; mirror_c = mirror_c + 1) begin
                         mirror_addr = saved_flush_base + mirror_r * saved_flush_stride + mirror_c;
@@ -380,14 +364,6 @@ module tb_top_multi;
                         dut.u_hbm_pf_wgt.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
                         dut.u_hbm_dma.mem[mirror_addr]    = dut.u_hbm_flush.mem[mirror_addr];
                     end
-                end
-                // Debug: show first word at ACT_BASE after res2 flush
-                if (saved_flush_base == ACT_BASE) begin
-                    $display("[%0t] DBG_FLUSH_ACT: word0=%h word1=%h layer=%0d step=%0d",
-                             $time,
-                             dut.u_hbm_flush.mem[ACT_BASE],
-                             dut.u_hbm_flush.mem[ACT_BASE+1],
-                             dut.u_fsm.layer_cnt, dut.u_fsm.step_idx);
                 end
                 flush_params_valid <= 1'b0;
             end

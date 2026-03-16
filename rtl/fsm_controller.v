@@ -784,7 +784,7 @@ module fsm_controller #(
                             step_idx  <= 4'd0;
                             state     <= S_DECODE;
                         end else begin
-                            state <= S_OUTPUT_COPY;
+                            state <= S_DONE;
                         end
                     end else begin
                         step_idx <= step_idx + 1;

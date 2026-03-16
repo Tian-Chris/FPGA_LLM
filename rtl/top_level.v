@@ -826,9 +826,24 @@ module diffusion_transformer_top #(
     assign uram_rd_row_mux = uf_uram_rd_en ? uf_uram_rd_row : adp_uram_rd_row;
     assign uram_rd_col_mux = uf_uram_rd_en ? uf_uram_rd_col_word : adp_uram_rd_col_word;
 
-    // Broadcast read data/valid to both consumers
+    // URAM read ownership tracking — gate rd_valid per consumer
+    // Shift register matches URAM_RD_LATENCY to align valid with the issuer
+    reg [URAM_RD_LATENCY-1:0] uram_rd_owner_is_flush;
+    integer sr_i;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            uram_rd_owner_is_flush <= {URAM_RD_LATENCY{1'b0}};
+        else begin
+            uram_rd_owner_is_flush[0] <= uf_uram_rd_en;
+            for (sr_i = 1; sr_i < URAM_RD_LATENCY; sr_i = sr_i + 1)
+                uram_rd_owner_is_flush[sr_i] <= uram_rd_owner_is_flush[sr_i-1];
+        end
+    end
+    wire uram_rd_for_flush = uram_rd_owner_is_flush[URAM_RD_LATENCY-1];
+    wire adp_uram_rd_valid = uram_rd_valid_mux & ~uram_rd_for_flush;
+
     assign uf_uram_rd_data  = uram_rd_data_mux;
-    assign uf_uram_rd_valid = uram_rd_valid_mux;
+    assign uf_uram_rd_valid = uram_rd_valid_mux & uram_rd_for_flush;
 
     // =========================================================================
     // URAM Accumulation Buffer
@@ -950,7 +965,7 @@ module diffusion_transformer_top #(
         .uram_rd_row(adp_uram_rd_row),
         .uram_rd_col_word(adp_uram_rd_col_word),
         .uram_rd_data(uram_rd_data_mux),
-        .uram_rd_valid(uram_rd_valid_mux),
+        .uram_rd_valid(adp_uram_rd_valid),
         .uram_wr_en(adp_uram_wr_en),
         .uram_wr_row(adp_uram_wr_row),
         .uram_wr_col_word(adp_uram_wr_col_word),

@@ -114,11 +114,6 @@ module layernorm #(
             // BRAM write + registered read (single always block, simple dual-port)
             if (valid_r && state == ST_COMP_MEAN) begin
                 input_buffer[idx_r] <= data_r;
-                // synthesis translate_off
-                if (idx_r == 10)
-                    $display("[LN_WR %0t] input_buffer[10] <= %h (data_r=%h in_rd_data=%h idx=%0d)",
-                             $time, data_r, data_r, in_rd_data, idx);
-                // synthesis translate_on
             end
             bram_rd_data <= input_buffer[bram_rd_addr];
 
@@ -133,13 +128,6 @@ module layernorm #(
                 if (result_s2 > 31'sd32767)       out_wr_data <= 16'sd32767;
                 else if (result_s2 < -31'sd32768) out_wr_data <= 16'sh8000;
                 else                              out_wr_data <= result_s2[15:0];
-                // synthesis translate_off
-                if (mean == -32768 && (pipe1_wr_addr == 5 || pipe1_wr_addr == 10))
-                    $display("[LN %0t] elem=%0d bram_rd=%h norm_prod=%h norm_s2=%0d gamma=%0d beta=%0d result=%0d out=%h",
-                             $time, pipe1_wr_addr, bram_rd_data, pipe1_norm_prod,
-                             normalized_s2, pipe1_gamma, pipe1_beta, result_s2,
-                             result_s2[15:0]);
-                // synthesis translate_on
             end
 
             case (state)
@@ -175,11 +163,6 @@ module layernorm #(
                         state       <= ST_COMP_VAR;
                         idx         <= 0;
                         rd_inflight <= 1'b0;
-                        // synthesis translate_off
-                        $display("[LN_P1DONE %0t] mean=%0d sum=%0d dim=%0d buf[10]=%h buf[5]=%h",
-                                 $time, divide_by_dim(sum, dim_r), sum, dim_r,
-                                 input_buffer[10], input_buffer[5]);
-                        // synthesis translate_on
                     end
                 end
 
@@ -228,13 +211,6 @@ module layernorm #(
                         pipe1_beta      <= $signed(beta_data);
                         pipe1_wr_addr   <= idx - 1;
                         pipe1_valid     <= 1'b1;
-                        // synthesis translate_off
-                        if (mean == -32768 && ((idx-1) == 5 || (idx-1) == 10))
-                            $display("[LN %0t] S1 elem=%0d centered=%0d bram_rd=%h inv_std=%h",
-                                     $time, idx-1,
-                                     $signed({{(32-DATA_W){bram_rd_data[DATA_W-1]}}, bram_rd_data}) - mean,
-                                     bram_rd_data, inv_std);
-                        // synthesis translate_on
                     end
 
                     // Stage 2 handled above (outside case, fires on pipe1_valid)

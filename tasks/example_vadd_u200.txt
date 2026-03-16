@@ -1,0 +1,242 @@
+# ============================================================
+# REFERENCE: Old vadd RTL kernel project targeting Alveo U200
+# Saved for reference when building FPGA_LLM Vitis flow
+# ============================================================
+
+# ============================================================
+# Makefile
+# ============================================================
+PLATFORM := /opt/xilinx/platforms/xilinx_u200_gen3x16_xdma_2_202110_1/xilinx_u200_gen3x16_xdma_2_202110_1.xpfm
+TARGET := hw_emu
+
+.PHONY: all package link host run clean
+
+all: package link host
+
+package: vadd_rtl.xo
+vadd_rtl.xo: build.tcl kernel.xml src/vadd_core.v src/vadd_ctrl.v
+	vivado -mode batch -source build.tcl
+
+link: vadd_rtl.xclbin
+vadd_rtl.xclbin: vadd_rtl.xo
+	v++ -t $(TARGET) --platform $(PLATFORM) -l -o $@ $<
+
+host: host.cpp
+	g++ -std=c++17 -I$(XILINX_XRT)/include -o host host.cpp -L$(XILINX_XRT)/lib -lOpenCL -lxrt_coreutil
+
+run: host vadd_rtl.xclbin
+	XCL_EMULATION_MODE=$(TARGET) ./host vadd_rtl.xclbin
+
+clean:
+	rm -rf vadd_rtl.xo vadd_rtl.xclbin host
+	rm -rf vivado_project kernel_pack .Xil
+	rm -rf _x .run *.log *.jou
+
+# ============================================================
+# build.tcl (Vivado batch — packages RTL into .xo)
+# ============================================================
+
+set kernel_name "vadd_rtl"
+set project_dir "./vivado_project"
+set src_dir "./src"
+set part "xcu200-fsgd2104-2-e"
+
+# ==============================================================
+# Clean up
+# ==============================================================
+file delete -force $project_dir
+file delete -force ./kernel_pack
+file delete -force ./.Xil
+
+# ==============================================================
+# Create project and add sources
+# ==============================================================
+create_project $kernel_name $project_dir -part $part -force
+add_files -norecurse ${src_dir}/vadd_core.v
+add_files -norecurse ${src_dir}/vadd_ctrl.v
+update_compile_order -fileset sources_1
+
+# ==============================================================
+# Create block design
+# ==============================================================
+create_bd_design "vadd_bd"
+
+# Clock and reset
+create_bd_port -dir I -type clk ap_clk
+set_property CONFIG.FREQ_HZ 300000000 [get_bd_ports ap_clk]
+create_bd_port -dir I -type rst ap_rst_n
+set_property CONFIG.POLARITY ACTIVE_LOW [get_bd_ports ap_rst_n]
+
+# External AXI ports
+create_bd_intf_port -mode Master -vlnv xilinx.com:interface:aximm_rtl:1.0 m_axi_gmem
+set_property -dict [list CONFIG.DATA_WIDTH {32} CONFIG.ADDR_WIDTH {64} CONFIG.PROTOCOL {AXI4}] [get_bd_intf_ports m_axi_gmem]
+
+create_bd_intf_port -mode Slave -vlnv xilinx.com:interface:aximm_rtl:1.0 s_axi_control
+set_property -dict [list CONFIG.DATA_WIDTH {32} CONFIG.ADDR_WIDTH {16} CONFIG.PROTOCOL {AXI4LITE}] [get_bd_intf_ports s_axi_control]
+
+# ==============================================================
+# DataMover
+# ==============================================================
+create_bd_cell -type ip -vlnv xilinx.com:ip:axi_datamover:5.1 datamover
+set_property -dict [list \
+    CONFIG.c_m_axi_mm2s_data_width {32} \
+    CONFIG.c_m_axis_mm2s_tdata_width {32} \
+    CONFIG.c_m_axi_s2mm_data_width {32} \
+    CONFIG.c_s_axis_s2mm_tdata_width {32} \
+    CONFIG.c_include_mm2s {Full} \
+    CONFIG.c_include_s2mm {Full} \
+    CONFIG.c_mm2s_burst_size {64} \
+    CONFIG.c_s2mm_burst_size {64} \
+] [get_bd_cells datamover]
+
+# ==============================================================
+# Instantiate RTL modules
+# ==============================================================
+create_bd_cell -type module -reference vadd_core vadd_core_inst
+create_bd_cell -type module -reference vadd_ctrl vadd_ctrl_inst
+
+# ==============================================================
+# Connect clocks
+# ==============================================================
+connect_bd_net [get_bd_ports ap_clk] \
+    [get_bd_pins datamover/m_axi_mm2s_aclk] \
+    [get_bd_pins datamover/m_axi_s2mm_aclk] \
+    [get_bd_pins datamover/m_axis_mm2s_cmdsts_aclk] \
+    [get_bd_pins datamover/m_axis_s2mm_cmdsts_awclk] \
+    [get_bd_pins vadd_core_inst/clk] \
+    [get_bd_pins vadd_ctrl_inst/clk]
+
+# ==============================================================
+# Connect resets
+# ==============================================================
+connect_bd_net [get_bd_ports ap_rst_n] \
+    [get_bd_pins datamover/m_axi_mm2s_aresetn] \
+    [get_bd_pins datamover/m_axi_s2mm_aresetn] \
+    [get_bd_pins datamover/m_axis_mm2s_cmdsts_aresetn] \
+    [get_bd_pins datamover/m_axis_s2mm_cmdsts_aresetn] \
+    [get_bd_pins vadd_core_inst/rst_n] \
+    [get_bd_pins vadd_ctrl_inst/rst_n]
+
+# ==============================================================
+# Connect DataMover AXI master to external port
+# ==============================================================
+create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_ic
+set_property -dict [list CONFIG.NUM_SI {2} CONFIG.NUM_MI {1}] [get_bd_cells axi_ic]
+
+connect_bd_net [get_bd_ports ap_clk] \
+    [get_bd_pins axi_ic/ACLK] \
+    [get_bd_pins axi_ic/S00_ACLK] \
+    [get_bd_pins axi_ic/S01_ACLK] \
+    [get_bd_pins axi_ic/M00_ACLK]
+
+connect_bd_net [get_bd_ports ap_rst_n] \
+    [get_bd_pins axi_ic/ARESETN] \
+    [get_bd_pins axi_ic/S00_ARESETN] \
+    [get_bd_pins axi_ic/S01_ARESETN] \
+    [get_bd_pins axi_ic/M00_ARESETN]
+
+connect_bd_intf_net [get_bd_intf_pins datamover/M_AXI_MM2S] [get_bd_intf_pins axi_ic/S00_AXI]
+connect_bd_intf_net [get_bd_intf_pins datamover/M_AXI_S2MM] [get_bd_intf_pins axi_ic/S01_AXI]
+connect_bd_intf_net [get_bd_intf_pins axi_ic/M00_AXI] [get_bd_intf_ports m_axi_gmem]
+
+# ==============================================================
+# Connect DataMover streams to vadd_core
+# ==============================================================
+# MM2S output -> vadd_core input
+connect_bd_net [get_bd_pins datamover/m_axis_mm2s_tdata] [get_bd_pins vadd_core_inst/s_axis_in_tdata]
+connect_bd_net [get_bd_pins datamover/m_axis_mm2s_tvalid] [get_bd_pins vadd_core_inst/s_axis_in_tvalid]
+connect_bd_net [get_bd_pins vadd_core_inst/s_axis_in_tready] [get_bd_pins datamover/m_axis_mm2s_tready]
+connect_bd_net [get_bd_pins datamover/m_axis_mm2s_tlast] [get_bd_pins vadd_core_inst/s_axis_in_tlast]
+
+# vadd_core output -> S2MM input
+connect_bd_net [get_bd_pins vadd_core_inst/m_axis_out_tdata] [get_bd_pins datamover/s_axis_s2mm_tdata]
+connect_bd_net [get_bd_pins vadd_core_inst/m_axis_out_tvalid] [get_bd_pins datamover/s_axis_s2mm_tvalid]
+connect_bd_net [get_bd_pins datamover/s_axis_s2mm_tready] [get_bd_pins vadd_core_inst/m_axis_out_tready]
+connect_bd_net [get_bd_pins vadd_core_inst/m_axis_out_tlast] [get_bd_pins datamover/s_axis_s2mm_tlast]
+
+# tkeep signal (all bytes valid)
+create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 const_tkeep
+set_property -dict [list CONFIG.CONST_WIDTH {4} CONFIG.CONST_VAL {15}] [get_bd_cells const_tkeep]
+connect_bd_net [get_bd_pins const_tkeep/dout] [get_bd_pins datamover/s_axis_s2mm_tkeep]
+
+# ==============================================================
+# Connect vadd_ctrl to DataMover command/status
+# ==============================================================
+connect_bd_net [get_bd_pins vadd_ctrl_inst/mm2s_cmd_tdata] [get_bd_pins datamover/s_axis_mm2s_cmd_tdata]
+connect_bd_net [get_bd_pins vadd_ctrl_inst/mm2s_cmd_tvalid] [get_bd_pins datamover/s_axis_mm2s_cmd_tvalid]
+connect_bd_net [get_bd_pins datamover/s_axis_mm2s_cmd_tready] [get_bd_pins vadd_ctrl_inst/mm2s_cmd_tready]
+
+connect_bd_net [get_bd_pins datamover/m_axis_mm2s_sts_tdata] [get_bd_pins vadd_ctrl_inst/mm2s_sts_tdata]
+connect_bd_net [get_bd_pins datamover/m_axis_mm2s_sts_tvalid] [get_bd_pins vadd_ctrl_inst/mm2s_sts_tvalid]
+connect_bd_net [get_bd_pins vadd_ctrl_inst/mm2s_sts_tready] [get_bd_pins datamover/m_axis_mm2s_sts_tready]
+
+connect_bd_net [get_bd_pins vadd_ctrl_inst/s2mm_cmd_tdata] [get_bd_pins datamover/s_axis_s2mm_cmd_tdata]
+connect_bd_net [get_bd_pins vadd_ctrl_inst/s2mm_cmd_tvalid] [get_bd_pins datamover/s_axis_s2mm_cmd_tvalid]
+connect_bd_net [get_bd_pins datamover/s_axis_s2mm_cmd_tready] [get_bd_pins vadd_ctrl_inst/s2mm_cmd_tready]
+
+connect_bd_net [get_bd_pins datamover/m_axis_s2mm_sts_tdata] [get_bd_pins vadd_ctrl_inst/s2mm_sts_tdata]
+connect_bd_net [get_bd_pins datamover/m_axis_s2mm_sts_tvalid] [get_bd_pins vadd_ctrl_inst/s2mm_sts_tvalid]
+connect_bd_net [get_bd_pins vadd_ctrl_inst/s2mm_sts_tready] [get_bd_pins datamover/m_axis_s2mm_sts_tready]
+
+# Connect loading signals
+connect_bd_net [get_bd_pins vadd_ctrl_inst/loading_in1] [get_bd_pins vadd_core_inst/loading_in1]
+connect_bd_net [get_bd_pins vadd_ctrl_inst/loading_in2] [get_bd_pins vadd_core_inst/loading_in2]
+
+# ==============================================================
+# Control ports
+# ==============================================================
+create_bd_port -dir I ap_start
+create_bd_port -dir O ap_done
+create_bd_port -dir O ap_idle
+create_bd_port -dir I -from 63 -to 0 in1_addr
+create_bd_port -dir I -from 63 -to 0 in2_addr
+create_bd_port -dir I -from 63 -to 0 out_addr
+create_bd_port -dir I -from 31 -to 0 size
+
+connect_bd_net [get_bd_ports ap_start] [get_bd_pins vadd_ctrl_inst/ap_start]
+connect_bd_net [get_bd_pins vadd_ctrl_inst/ap_done] [get_bd_ports ap_done]
+connect_bd_net [get_bd_pins vadd_ctrl_inst/ap_idle] [get_bd_ports ap_idle]
+connect_bd_net [get_bd_ports in1_addr] [get_bd_pins vadd_ctrl_inst/in1_addr]
+connect_bd_net [get_bd_ports in2_addr] [get_bd_pins vadd_ctrl_inst/in2_addr]
+connect_bd_net [get_bd_ports out_addr] [get_bd_pins vadd_ctrl_inst/out_addr]
+connect_bd_net [get_bd_ports size] [get_bd_pins vadd_ctrl_inst/size]
+
+# ==============================================================
+# Validate and save
+# ==============================================================
+save_bd_design
+validate_bd_design
+
+# ==============================================================
+# Generate wrapper and package
+# ==============================================================
+make_wrapper -files [get_files ${project_dir}/${kernel_name}.srcs/sources_1/bd/vadd_bd/vadd_bd.bd] -top
+add_files -norecurse ${project_dir}/${kernel_name}.gen/sources_1/bd/vadd_bd/hdl/vadd_bd_wrapper.v
+update_compile_order -fileset sources_1
+
+ipx::package_project -root_dir ./kernel_pack -vendor user.org -library kernel -taxonomy /UserIP -import_files -set_current true -force
+
+set core [ipx::current_core]
+set_property sdx_kernel true $core
+set_property sdx_kernel_type rtl $core
+set_property ipi_drc {ignore_freq_hz true} $core
+set_property vitis_drc {ctrl_protocol ap_ctrl_hs} $core
+
+ipx::associate_bus_interfaces -busif m_axi_gmem -clock ap_clk $core
+ipx::associate_bus_interfaces -busif s_axi_control -clock ap_clk $core
+
+set_property core_revision 1 $core
+ipx::create_xgui_files $core
+ipx::update_checksums $core
+ipx::save_core $core
+
+package_xo -xo_path ./vadd_rtl.xo \
+    -kernel_name vadd_rtl \
+    -ip_directory ./kernel_pack \
+    -kernel_xml ./kernel.xml
+
+puts "============================================================"
+puts "SUCCESS: Created vadd_rtl.xo"
+puts "============================================================"
+
+close_project

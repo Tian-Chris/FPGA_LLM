@@ -1,0 +1,70 @@
+chris@Chriss-MacBook-Air fpga % ssh chris@yangzi.usc.edu 
+ssh: Could not resolve hostname yangzi.usc.edu: nodename nor servname provided, or not known
+chris@Chriss-MacBook-Air fpga % ssh chris@yangzi.usc.edu
+chris@yangzi.usc.edu's password: 
+Welcome to Ubuntu 18.04.6 LTS (GNU/Linux 5.4.0-150-generic x86_64)
+
+ * Documentation:  https://help.ubuntu.com
+ * Management:     https://landscape.canonical.com
+ * Support:        https://ubuntu.com/pro
+
+Expanded Security Maintenance for Infrastructure is not enabled.
+
+8 updates can be applied immediately.
+To see these additional updates run: apt list --upgradable
+
+297 additional security updates can be applied with ESM Infra.
+Learn more about enabling ESM Infra service for Ubuntu 18.04 at
+https://ubuntu.com/18-04
+
+New release '20.04.6 LTS' available.
+Run 'do-release-upgrade' to upgrade to it.
+
+Your Hardware Enablement Stack (HWE) is supported until April 2023.
+Last login: Wed Mar  4 21:06:47 2026 from 10.49.155.149
+chris@yangzi:~$ ls
+char_test  FPGA_LLM  mem_test  test_hls  test_rtl
+chris@yangzi:~$ cd FPGA_LLM/
+chris@yangzi:~/FPGA_LLM$ cd fpga/
+chris@yangzi:~/FPGA_LLM/fpga$ ls
+build.tcl				host.cpp
+connectivity.cfg			kernel.xml
+fpga_kernel_hw_emu.xclbin.info		Makefile
+fpga_kernel_hw_emu.xclbin.link_summary	rtl
+fpga_kernel_hw.xclbin.link_summary	synth_log
+fpga_kernel_pkg				v++_fpga_kernel_hw.log
+fpga_kernel_pkg_ip			_x
+fpga_kernel.xo				xcd.log
+gpt2_bpe.h
+chris@yangzi:~/FPGA_LLM/fpga$ nano synth_log 
+
+  GNU nano 2.9.3                                                                                    synth_log                                                                                               
+
+[21:45:29] Block-level synthesis in progress, 8 of 13 jobs complete, 4 jobs running.
+[21:45:59] Block-level synthesis in progress, 8 of 13 jobs complete, 4 jobs running.
+[21:46:29] Block-level synthesis in progress, 9 of 13 jobs complete, 3 jobs running.
+[21:46:53] Run vpl: Step synth: Failed
+[21:46:53] Run vpl: FINISHED. Run Status: synth ERROR
+
+===>The following messages were generated while  Compiling (synthesis checkpoint) kernel/IP: ulp_fpga_kernel_1_0 Log file: /data/chris/FPGA_LLM/fpga/_x/link/vivado/vpl/prj/prj.runs/ulp_fpga_kernel_1_0_sy$
+ERROR: [VPL 8-6038] cannot resolve hierarchical name for the item 'gen_eng' [/data/chris/FPGA_LLM/fpga/_x/link/vivado/vpl/prj/prj.gen/my_rm/bd/ulp/ipshared/2136/src/top_level.v:743]
+ERROR: [VPL 8-6156] failed synthesizing module 'diffusion_transformer_top' [/data/chris/FPGA_LLM/fpga/_x/link/vivado/vpl/prj/prj.gen/my_rm/bd/ulp/ipshared/2136/src/top_level.v:23]
+ERROR: [VPL 8-6156] failed synthesizing module 'fpga_kernel' [/data/chris/FPGA_LLM/fpga/_x/link/vivado/vpl/prj/prj.gen/my_rm/bd/ulp/ipshared/2136/src/fpga_kernel.v:24]
+ERROR: [VPL 8-6156] failed synthesizing module 'ulp_fpga_kernel_1_0' [/data/chris/FPGA_LLM/fpga/_x/link/vivado/vpl/prj/prj.gen/my_rm/bd/ulp/ip/ulp_fpga_kernel_1_0/synth/ulp_fpga_kernel_1_0.v:53]
+ERROR: [VPL 17-69] Command failed: Synthesis failed - please see the console or run log file for details
+ERROR: [VPL 60-773] In '/data/chris/FPGA_LLM/fpga/_x/link/vivado/vpl/vivado.log', caught Tcl error:  One or more synthesis runs failed during dynamic region dcp generation
+WARNING: [VPL 60-732] Link warning: No monitor points found for BD automation.
+ERROR: [VPL 60-704] Integration error, One or more synthesis runs failed during dynamic region dcp generation
+ERROR: [VPL 60-704] Integration error, run 'my_rm_synth_1' couldn't start because one or more of the prerequisite runs failed
+ERROR: [VPL 60-704] Integration error, run 'ulp_fpga_kernel_1_0_synth_1' failed, please look at the run log file '/data/chris/FPGA_LLM/fpga/_x/link/vivado/vpl/prj/prj.runs/ulp_fpga_kernel_1_0_synth_1/run$
+ERROR: [VPL 60-1328] Vpl run 'vpl' failed
+ERROR: [VPL 60-806] Failed to finish platform linker
+INFO: [v++ 60-1442] [21:46:54] Run run_link: Step vpl: Failed
+Time (s): cpu = 00:00:10 ; elapsed = 00:07:40 . Memory (MB): peak = 468.383 ; gain = 0.000 ; free physical = 94469 ; free virtual = 122511
+ERROR: [v++ 60-661] v++ link run 'run_link' failed
+ERROR: [v++ 60-626] Kernel link failed to complete
+ERROR: [v++ 60-703] Failed to finish linking
+INFO: [v++ 60-1653] Closing dispatch client.
+Makefile:74: recipe for target 'link-hw-spread' failed
+make: *** [link-hw-spread] Error 1
+

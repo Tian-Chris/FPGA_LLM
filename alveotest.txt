@@ -1,0 +1,200 @@
+Validate Device           : [0000:3b:00.1]
+    Platform              : xilinx_u280_gen3x16_xdma_base_1
+    SC Version            : 4.3.28
+    Platform ID           : 283BAB8F-654D-8674-968F-4DA57F7FA5D7
+-------------------------------------------------------------------------------
+Test 1 [0000:3b:00.1]     : aux-connection 
+    Test Status           : [PASSED]
+-------------------------------------------------------------------------------
+Test 2 [0000:3b:00.1]     : pcie-link 
+    Warning(s)            : Link is active
+                            Please make sure that the device is plugged into Gen 3x16,
+                            instead of Gen 3x8. Lower performance maybe experienced.
+    Test Status           : [PASSED WITH WARNINGS]
+-------------------------------------------------------------------------------
+Test 3 [0000:3b:00.1]     : sc-version 
+    Test Status           : [PASSED]
+-------------------------------------------------------------------------------
+Test 4 [0000:3b:00.1]     : verify 
+    Test Status           : [PASSED]                                            
+-------------------------------------------------------------------------------
+Test 5 [0000:3b:00.1]     : dma 
+    Details               : Buffer size - '16 MB'                               
+                            Host -> PCIe -> FPGA write bandwidth = 6496.8 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6531.8 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6509.5 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6523.6 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6473.1 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6513.5 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6506.4 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6543.5 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6479.7 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6516.2 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6512.5 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6529.9 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6476.6 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6519.1 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6512.3 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6543.0 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6483.8 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6518.8 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6510.5 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6528.9 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6478.7 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6509.9 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6510.5 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6532.3 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6483.0 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6502.1 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6521.3 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6528.3 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6486.6 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6518.1 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6481.8 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6510.4 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6509.2 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6525.6 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6478.1 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6508.2 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6513.0 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6526.0 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6477.6 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6512.3 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6506.4 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6526.3 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6480.0 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6520.0 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6512.7 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6531.4 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6477.6 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6500.1 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6513.3 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6537.1 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6479.2 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6509.0 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6513.5 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6528.4 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6479.0 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6510.2 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6509.4 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6534.1 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6480.4 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6505.4 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6513.8 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6536.4 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6486.4 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6517.8 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6567.4 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6620.9 MB/s
+                            Buffer size - '16 MB'
+                            Host -> PCIe -> FPGA write bandwidth = 6572.1 MB/s
+                            Host <- PCIe <- FPGA read bandwidth = 6621.0 MB/s
+    Test Status           : [PASSED]
+-------------------------------------------------------------------------------
+Test 6 [0000:3b:00.1]     : iops 
+    Details               : IOPS: 542432 (verify)                               
+    Test Status           : [PASSED]
+-------------------------------------------------------------------------------
+Test 7 [0000:3b:00.1]     : mem-bw 
+    Details               : Throughput (Type: DDR) (Bank count: 2) : 33929.3MB/s
+                            Throughput (Type: HBM) (Bank count: 1) : 12382.4MB/s
+    Test Status           : [PASSED]
+-------------------------------------------------------------------------------
+Test 8 [0000:3b:00.1]     : p2p 
+Test 9 [0000:3b:00.1]     : vcu 
+Test 10 [0000:3b:00.1]    : aie-pl 
+Validation completed, but with warnings. Please run the command '--verbose' option for more details
+
+
+chris@yangzi:~/mem_test$ xbutil examine --device 0000:3b:00.1 --report memory
+
+-------------------------------------------------
+[0000:3b:00.1] : xilinx_u280_gen3x16_xdma_base_1
+-------------------------------------------------
+
+  Memory Topology
+         Tag                 Type             Temp(C)  Size      Base Address    
+    [ 0] HBM[0]              MEM_HBM          50       256 MB    0x0             
+    [ 1] HBM[1]              MEM_DRAM         50       256 MB    0x10000000      
+    [ 2] HBM[2]              MEM_DRAM         50       256 MB    0x20000000      
+    [ 3] HBM[3]              MEM_DRAM         50       256 MB    0x30000000      
+    [ 4] HBM[4]              MEM_DRAM         50       256 MB    0x40000000      
+    [ 5] HBM[5]              MEM_DRAM         50       256 MB    0x50000000      
+    [ 6] HBM[6]              MEM_DRAM         50       256 MB    0x60000000      
+    [ 7] HBM[7]              MEM_DRAM         50       256 MB    0x70000000      
+    [ 8] HBM[8]              MEM_DRAM         50       256 MB    0x80000000      
+    [ 9] HBM[9]              MEM_DRAM         50       256 MB    0x90000000      
+    [10] HBM[10]             MEM_DRAM         50       256 MB    0xa0000000      
+    [11] HBM[11]             MEM_DRAM         50       256 MB    0xb0000000      
+    [12] HBM[12]             MEM_DRAM         50       256 MB    0xc0000000      
+    [13] HBM[13]             MEM_DRAM         50       256 MB    0xd0000000      
+    [14] HBM[14]             MEM_DRAM         50       256 MB    0xe0000000      
+    [15] HBM[15]             MEM_DRAM         50       256 MB    0xf0000000      
+    [16] HBM[16]             MEM_DRAM         50       256 MB    0x100000000     
+    [17] HBM[17]             MEM_DRAM         50       256 MB    0x110000000     
+    [18] HBM[18]             MEM_DRAM         50       256 MB    0x120000000     
+    [19] HBM[19]             MEM_DRAM         50       256 MB    0x130000000     
+    [20] HBM[20]             MEM_DRAM         50       256 MB    0x140000000     
+    [21] HBM[21]             MEM_DRAM         50       256 MB    0x150000000     
+    [22] HBM[22]             MEM_DRAM         50       256 MB    0x160000000     
+    [23] HBM[23]             MEM_DRAM         50       256 MB    0x170000000     
+    [24] HBM[24]             MEM_DRAM         50       256 MB    0x180000000     
+    [25] HBM[25]             MEM_DRAM         50       256 MB    0x190000000     
+    [26] HBM[26]             MEM_DRAM         50       256 MB    0x1a0000000     
+    [27] HBM[27]             MEM_DRAM         50       256 MB    0x1b0000000     
+    [28] HBM[28]             MEM_DRAM         50       256 MB    0x1c0000000     
+    [29] HBM[29]             MEM_DRAM         50       256 MB    0x1d0000000     
+    [30] HBM[30]             MEM_DRAM         50       256 MB    0x1e0000000     
+    [31] HBM[31]             MEM_DRAM         50       256 MB    0x1f0000000     
+    [32] bank0               MEM_DRAM         47       16 GB     0x1000000000    
+    [33] bank1               MEM_DRAM         43       16 GB     0x1400000000    
+    [34] PLRAM[0]            MEM_DRAM         N/A      128 KB    0x400000000     
+    [35] PLRAM[1]            MEM_DRAM         N/A      128 KB    0x400400000     
+    [36] PLRAM[2]            MEM_DRAM         N/A      128 KB    0x401000000     
+    [37] PLRAM[3]            MEM_DRAM         N/A      128 KB    0x401400000     
+    [38] PLRAM[4]            MEM_DRAM         N/A      128 KB    0x402000000     
+    [39] PLRAM[5]            MEM_DRAM         N/A      128 KB    0x402400000     
+    [40] HOST[0]             MEM_DRAM         N/A      0 Byte    0x2000000000    
+
+  Memory Status
+         Tag         Type        Size    Mem Usage       BO count
+    [ 0] MBG[0:31]   MEM_HBM     8 GB    0 Byte          0       
+
+  DMA Transfer Metrics
+    Chan[ 0].h2c:  6240 MB
+    Chan[ 0].c2h:  6239 MB
+    Chan[ 1].h2c:  6239 MB
+    Chan[ 1].c2h:  6144 MB
+

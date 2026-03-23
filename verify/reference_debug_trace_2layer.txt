@@ -1,0 +1,86 @@
+========================================================================
+FSM DEBUG TRACE — Reference Output (2-layer prefill, BT=32, MODEL_DIM=1024)
+Generated: 2026-03-22 from test-token cosim (real GPT-2 FP16 weights)
+========================================================================
+
+Pre-Norm Step Table (16 steps per layer):
+  step  0: BT_LN      — LN1 (layer norm on input)
+  step  1: BT_FLUSH   — flush LN1 output → ACT_TEMP
+  step  2: BT_QKV     — QKV matmul (3× projections: Q,K,V)
+  step  3: BT_ATTN    — attention block (score + softmax + output)
+  step  4: BT_MATMUL  — output projection
+  step  5: BT_RES     — residual1 (add skip connection)
+  step  6: BT_FLUSH   — flush res1 → ACT_EMBED
+  step  7: BT_LN      — LN2 (layer norm on residual1)
+  step  8: BT_FLUSH   — flush LN2 → ACT_TEMP
+  step  9: BT_MATMUL  — FFN1 (1024×4096)
+  step 10: BT_ACT     — GELU activation
+  step 11: BT_FLUSH   — flush GELU → ACT_FFN
+  step 12: BT_MATMUL  — FFN2 (4096×1024)
+  step 13: BT_RES     — residual2 (add skip connection)
+  step 14: BT_FLUSH   — flush res2 → ACT_EMBED
+  step 15: BT_END     — layer done, advance to next
+
+Debug Record Layout (256-bit):
+  [31:0]    cycle_counter
+  [47:32]   layer_cnt
+  [55:48]   state (0x0E = S_NEXT_STEP)
+  [63:56]   step_idx
+  [79:64]   step_bt:step_cfg (packed)
+  [95:80]   debug_write_idx
+  [123:96]  layer_wgt_base
+  [143:128] mm_cmd_m
+  [159:144] mm_cmd_n
+  [175:160] mm_cmd_k
+  [191:176] head_cnt
+  [207:192] nm_row_cnt
+  [223:208] cache_len_r
+  [231:224] decode_r
+
+========================================================================
+2-Layer Trace (32 records):
+========================================================================
+  [  0] cyc=  385508  L0  S_NEXT_STEP     step= 0 (BT_LN/LN1)
+  [  1] cyc=  391856  L0  S_NEXT_STEP     step= 1 (BT_FLUSH/flush LN1→ACT_TEMP)
+  [  2] cyc= 1143214  L0  S_NEXT_STEP     step= 2 (BT_QKV/QKV)  mm(32x1024x1024)
+  [  3] cyc= 1307238  L0  S_NEXT_STEP     step= 3 (BT_ATTN/attention block)  mm(32x64x32)
+  [  4] cyc= 1551356  L0  S_NEXT_STEP     step= 4 (BT_MATMUL/output projection)  mm(32x1024x1024)
+  [  5] cyc= 1659916  L0  S_NEXT_STEP     step= 5 (BT_RES/residual1)  mm(32x1024x1024)
+  [  6] cyc= 1666264  L0  S_NEXT_STEP     step= 6 (BT_FLUSH/flush res1→ACT_EMBED)  mm(32x1024x1024)
+  [  7] cyc= 2051779  L0  S_NEXT_STEP     step= 7 (BT_LN/LN2)  mm(32x1024x1024)
+  [  8] cyc= 2058127  L0  S_NEXT_STEP     step= 8 (BT_FLUSH/flush LN2→ACT_TEMP)  mm(32x1024x1024)
+  [  9] cyc= 3034554  L0  S_NEXT_STEP     step= 9 (BT_MATMUL/FFN1)  mm(32x4096x1024)
+  [ 10] cyc= 3444357  L0  S_NEXT_STEP     step=10 (BT_ACT/GELU)  mm(32x4096x1024)
+  [ 11] cyc= 3469137  L0  S_NEXT_STEP     step=11 (BT_FLUSH/flush act→ACT_FFN)  mm(32x4096x1024)
+  [ 12] cyc= 4445570  L0  S_NEXT_STEP     step=12 (BT_MATMUL/FFN2)  mm(32x1024x4096)
+  [ 13] cyc= 4554130  L0  S_NEXT_STEP     step=13 (BT_RES/residual2)  mm(32x1024x4096)
+  [ 14] cyc= 4560478  L0  S_NEXT_STEP     step=14 (BT_FLUSH/flush res2→ACT_EMBED)  mm(32x1024x4096)
+  [ 15] cyc= 4560486  L0  S_NEXT_STEP     step=15 (BT_END/END)  mm(32x1024x4096)
+  ────────────────────────────────────────────────────────────
+  [ 16] cyc= 4946001  L1  S_NEXT_STEP     step= 0 (BT_LN/LN1)  mm(32x1024x4096)
+  [ 17] cyc= 4952349  L1  S_NEXT_STEP     step= 1 (BT_FLUSH/flush LN1→ACT_TEMP)  mm(32x1024x4096)
+  [ 18] cyc= 5703707  L1  S_NEXT_STEP     step= 2 (BT_QKV/QKV)  mm(32x1024x1024)
+  [ 19] cyc= 5867731  L1  S_NEXT_STEP     step= 3 (BT_ATTN/attention block)  mm(32x64x32)
+  [ 20] cyc= 6111849  L1  S_NEXT_STEP     step= 4 (BT_MATMUL/output projection)  mm(32x1024x1024)
+  [ 21] cyc= 6220409  L1  S_NEXT_STEP     step= 5 (BT_RES/residual1)  mm(32x1024x1024)
+  [ 22] cyc= 6226757  L1  S_NEXT_STEP     step= 6 (BT_FLUSH/flush res1→ACT_EMBED)  mm(32x1024x1024)
+  [ 23] cyc= 6612272  L1  S_NEXT_STEP     step= 7 (BT_LN/LN2)  mm(32x1024x1024)
+  [ 24] cyc= 6618620  L1  S_NEXT_STEP     step= 8 (BT_FLUSH/flush LN2→ACT_TEMP)  mm(32x1024x1024)
+  [ 25] cyc= 7595047  L1  S_NEXT_STEP     step= 9 (BT_MATMUL/FFN1)  mm(32x4096x1024)
+  [ 26] cyc= 8004850  L1  S_NEXT_STEP     step=10 (BT_ACT/GELU)  mm(32x4096x1024)
+  [ 27] cyc= 8029630  L1  S_NEXT_STEP     step=11 (BT_FLUSH/flush act→ACT_FFN)  mm(32x4096x1024)
+  [ 28] cyc= 9006063  L1  S_NEXT_STEP     step=12 (BT_MATMUL/FFN2)  mm(32x1024x4096)
+  [ 29] cyc= 9114623  L1  S_NEXT_STEP     step=13 (BT_RES/residual2)  mm(32x1024x4096)
+  [ 30] cyc= 9120971  L1  S_NEXT_STEP     step=14 (BT_FLUSH/flush res2→ACT_EMBED)  mm(32x1024x4096)
+  [ 31] cyc= 9120979  L1  S_NEXT_STEP     step=15 (BT_END/END)  mm(32x1024x4096)
+
+Total: 8735471 cycles (385508 → 9120979)
+Per-layer: ~4.37M cycles (~43.7ms at 100MHz, ~29.5ms at 148MHz)
+
+Key observations:
+- QKV matmul (step 2) dominates: ~750K cycles (3× 32×1024×1024)
+- FFN1 (step 9) and FFN2 (step 12): ~976K cycles each (32×4096×1024)
+- Attention (step 3): ~164K cycles (16 heads × score + softmax + output)
+- LN/flush/residual steps: ~6K cycles each (lightweight)
+- Total per layer: ~4.17M cycles (consistent between L0 and L1)
+========================================================================

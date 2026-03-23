@@ -72,7 +72,8 @@ RTL_ALL = [
     "bram_controller.v", "mac_unit.v", "agu.v", "matmul_engine.v",
     "mem_arbiter.v", "tiling_engine.v", "softmax.v", "layernorm.v",
     "activation.v", "residual_add.v", "quant_layer.v", "host_interface.v",
-    "positional_embedding.v", "fsm_controller.v", "sim_hbm_port.v",
+    "positional_embedding.v", "fsm_controller.v", "sim_hbm.v",
+    "debug_writer.v",
     "uram_accum_buf.v", "tile_loader.v", "uram_flush.v", "act_dma.v",
     "uram_nm_adapter.v", "top_level.v",
 ]

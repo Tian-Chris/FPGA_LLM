@@ -75,7 +75,6 @@ module tb_top_matmul1k;
     integer dump_row, dump_col;
     integer dump_addr;
     integer dump_fd;
-    integer mirror_r, mirror_c, mirror_addr;
 
     // =========================================================================
     // Clock Generation
@@ -145,17 +144,14 @@ module tb_top_matmul1k;
         // Wait for sim_hbm_port zero-init to complete, then overwrite
         #1;
 
-        // Load weight + activation data into shared prefetch HBM ports.
+        // Load weight + activation data into shared HBM.
         // Weight hex: W_q at addresses 0..65535
         // Activation hex: embeddings at addresses 65536+
         // Load wgt first, then act on top (non-overlapping regions).
 
-        // Shared weight prefetch HBM
-        $readmemh("verify/test_data/hbm_wgt_1k.hex", dut.u_hbm_pf_wgt.mem);
-        $readmemh("verify/test_data/hbm_act_1k.hex", dut.u_hbm_pf_wgt.mem);
-        // Shared activation prefetch HBM
-        $readmemh("verify/test_data/hbm_wgt_1k.hex", dut.u_hbm_pf_act.mem);
-        $readmemh("verify/test_data/hbm_act_1k.hex", dut.u_hbm_pf_act.mem);
+        // Shared HBM: weights + activations
+        $readmemh("verify/test_data/hbm_wgt_1k.hex", dut.u_hbm.mem);
+        $readmemh("verify/test_data/hbm_act_1k.hex", dut.u_hbm.mem);
 
         $display("[%0t] tb_top_matmul1k: HBM preloading complete (shared prefetch ports)", $time);
         $fflush();
@@ -236,7 +232,7 @@ module tb_top_matmul1k;
             $fflush();
         end else begin
             for (dump_addr = 0; dump_addr < TB_HBM_DEPTH; dump_addr = dump_addr + 1) begin
-                $fwrite(dump_fd, "%064h\n", dut.u_hbm_flush.mem[dump_addr]);
+                $fwrite(dump_fd, "%064h\n", dut.u_hbm.mem[dump_addr]);
             end
             $fclose(dump_fd);
             $display("[%0t] Dumped flush HBM to verify/test_data/hbm_flush_1k_dump.hex (%0d words)",
@@ -266,53 +262,10 @@ module tb_top_matmul1k;
     end
 
     // =========================================================================
-    // Flush-to-Load Memory Mirroring (Region-Tracked)
+    // Flush-to-Load Memory Mirroring — NOT NEEDED with shared u_hbm
     // =========================================================================
-    reg uf_done_prev;
-    reg [27:0] saved_flush_base;
-    reg [27:0] saved_flush_stride;
-    reg [9:0]  saved_flush_rows;
-    reg [7:0]  saved_flush_cols;
-    reg        flush_params_valid;
-
-    initial begin
-        uf_done_prev = 0;
-        saved_flush_base = 0;
-        saved_flush_stride = 0;
-        saved_flush_rows = 0;
-        saved_flush_cols = 0;
-        flush_params_valid = 0;
-    end
-
-    always @(posedge clk) begin
-        if (rst_n) begin
-            // Capture flush parameters when flush starts
-            if (dut.u_fsm.uram_flush_start) begin
-                saved_flush_base   <= dut.u_fsm.uram_flush_hbm_base;
-                saved_flush_stride <= dut.u_fsm.uram_flush_hbm_stride;
-                saved_flush_rows   <= dut.u_fsm.uram_flush_num_rows;
-                saved_flush_cols   <= dut.u_fsm.uram_flush_num_col_words;
-                flush_params_valid <= 1'b1;
-            end
-
-            // Mirror on flush done — iterate exact flush region
-            uf_done_prev <= dut.uf_done;
-            if (dut.uf_done && !uf_done_prev && flush_params_valid) begin
-                for (mirror_r = 0; mirror_r <= saved_flush_rows; mirror_r = mirror_r + 1) begin
-                    for (mirror_c = 0; mirror_c <= saved_flush_cols; mirror_c = mirror_c + 1) begin
-                        mirror_addr = saved_flush_base + mirror_r * saved_flush_stride + mirror_c;
-                        dut.u_hbm_pf_act.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.u_hbm_pf_wgt.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                    end
-                end
-                flush_params_valid <= 1'b0;
-                $display("[%0t] FLUSH MIRROR: base=%0d stride=%0d rows=%0d cols=%0d (state=%0d)",
-                         $time, saved_flush_base, saved_flush_stride,
-                         saved_flush_rows + 1, saved_flush_cols + 1, dut.u_fsm.state);
-                $fflush();
-            end
-        end
-    end
+    // With a single shared HBM instance, flush writes are immediately visible
+    // to all readers. No mirroring required.
 
     // =========================================================================
     // Timeout Watchdog (120s = 12,000,000,000 cycles at 10ns)

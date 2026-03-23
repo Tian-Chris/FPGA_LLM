@@ -43,6 +43,9 @@ module tiling_engine #(
     input  wire [HBM_ADDR_W-1:0] cmd_a_stride,
     input  wire [HBM_ADDR_W-1:0] cmd_b_stride,
     input  wire [URAM_COL_W-1:0] cmd_out_col_offset,
+    input  wire                 cmd_has_bias,
+    input  wire [HBM_ADDR_W-1:0] cmd_bias_base,
+    input  wire [DIM_W-1:0]     cmd_bias_words,
     (* mark_debug = "true" *) output reg                  cmd_ready,
     (* mark_debug = "true" *) output reg                  cmd_done,
 
@@ -81,8 +84,29 @@ module tiling_engine #(
     output reg  [URAM_ROW_W*N_ENG-1:0]        eng_cmd_out_row,
     output reg  [URAM_COL_W*N_ENG-1:0]        eng_cmd_out_col_word,
     output reg  [N_ENG-1:0]                    eng_cmd_first_k_chunk,
+    output reg  [N_ENG-1:0]                    eng_cmd_last_k_chunk,
     input  wire [N_ENG-1:0]                    eng_cmd_ready,
-    input  wire [N_ENG-1:0]                    eng_cmd_done
+    input  wire [N_ENG-1:0]                    eng_cmd_done,
+
+    // -----------------------------------------------------------------
+    // Bias AXI read interface (time-shared with weight prefetch port)
+    // -----------------------------------------------------------------
+    output reg  [HBM_ADDR_W-1:0]   bias_axi_araddr,
+    output reg  [7:0]               bias_axi_arlen,
+    output reg                      bias_axi_arvalid,
+    input  wire                     bias_axi_arready,
+    input  wire [BUS_W-1:0]        bias_axi_rdata,
+    input  wire                     bias_axi_rvalid,
+    input  wire                     bias_axi_rlast,
+    output reg                      bias_axi_rready,
+    output reg                      bias_loading,      // 1 = bias loader owns weight HBM port
+
+    // -----------------------------------------------------------------
+    // Bias read port (matmul controller reads bias during URAM writes)
+    // -----------------------------------------------------------------
+    input  wire [7:0]               bias_rd_addr,
+    output wire [BUS_W-1:0]        bias_rd_data,
+    output reg                      bias_active        // 1 = current matmul has bias
 );
 
     localparam BUS_EL         = BUS_W / DATA_W;           // 16
@@ -103,6 +127,20 @@ module tiling_engine #(
     localparam ST_NEXT_N_CHUNK   = 4'd8;
     localparam ST_NEXT_K_CHUNK   = 4'd9;
     localparam ST_DONE           = 4'd10;
+    localparam ST_BIAS_LOAD      = 4'd11;
+
+    // =========================================================================
+    // Bias buffer (max 256 words = 4096 FP16 values for FFN1 bias)
+    // =========================================================================
+    reg [BUS_W-1:0] bias_buf [0:255];
+    reg [7:0]       bias_wr_idx;           // Write index during bias load
+    reg             has_bias_r;
+    reg [HBM_ADDR_W-1:0] bias_base_r;
+    reg [DIM_W-1:0] bias_words_r;
+    reg             bias_ar_sent;          // AR request sent flag
+
+    // Combinational read port for matmul controller
+    assign bias_rd_data = bias_buf[bias_rd_addr];
 
     // =========================================================================
     // Registered command
@@ -160,9 +198,11 @@ module tiling_engine #(
     wire [PF_ROW_W-1:0] a_row_off_tile = cur_m * TILE;
     wire [PF_COL_W-1:0] a_col_off_tile = {PF_COL_W{1'b0}};  // K-loop starts at 0
 
-    // B tile at (cur_n): row = 0 (engine K-loop walks rows), col = cur_n*TILE_COL_WORDS
-    wire [PF_ROW_W-1:0] b_row_off_tile = {PF_ROW_W{1'b0}};
-    wire [PF_COL_W-1:0] b_col_off_tile = cur_n * TILE_COL_WORDS;
+    // B tile at (cur_n):
+    //   Standard (OP_MATMUL): B is (k,n), engine K-loop walks rows → row=0, col=cur_n*TILE_COL_WORDS
+    //   Transposed (OP_MATMUL_T): B is (n,k), engine K-loop walks cols → row=cur_n*TILE, col=0
+    wire [PF_ROW_W-1:0] b_row_off_tile = (op_r == OP_MATMUL_T) ? cur_n * TILE : {PF_ROW_W{1'b0}};
+    wire [PF_COL_W-1:0] b_col_off_tile = (op_r == OP_MATMUL_T) ? {PF_COL_W{1'b0}} : cur_n * TILE_COL_WORDS;
 
     // Per-tile URAM output coordinates (global, not chunk-relative)
     wire [URAM_ROW_W-1:0] out_row_tile      = cur_m * TILE;
@@ -241,12 +281,20 @@ module tiling_engine #(
             pf_wgt_launched  <= 1'b0;
             pf_act_done_r    <= 1'b0;
             pf_wgt_done_r    <= 1'b0;
+            bias_axi_arvalid <= 1'b0;
+            bias_axi_rready  <= 1'b0;
+            bias_loading     <= 1'b0;
+            bias_active      <= 1'b0;
+            has_bias_r       <= 1'b0;
+            bias_ar_sent     <= 1'b0;
+            bias_wr_idx      <= 8'd0;
         end else begin
             cmd_done         <= 1'b0;
             eng_cmd_valid    <= 0;
             just_dispatched  <= 0;
             pf_act_cmd_valid <= 1'b0;
             pf_wgt_cmd_valid <= 1'b0;
+            bias_axi_arvalid <= 1'b0;
 
             // Latch prefetch done pulses (may arrive on different cycles)
             if (pf_act_cmd_done) pf_act_done_r <= 1'b1;
@@ -272,6 +320,10 @@ module tiling_engine #(
                         a_stride_r       <= cmd_a_stride;
                         b_stride_r       <= cmd_b_stride;
                         out_col_offset_r <= cmd_out_col_offset;
+                        has_bias_r       <= cmd_has_bias;
+                        bias_base_r      <= cmd_bias_base;
+                        bias_words_r     <= cmd_bias_words;
+                        bias_active      <= cmd_has_bias;
                     end
                 end
 
@@ -281,14 +333,24 @@ module tiling_engine #(
                     num_k_chunks <= (k_r + PREFETCH_DIM - 1) / PREFETCH_DIM;
                     num_n_chunks <= (n_r + PREFETCH_DIM - 1) / PREFETCH_DIM;
                     k_chunk_idx  <= 0;
-                    state        <= ST_K_CHUNK_SETUP;
+                    if (has_bias_r) begin
+                        // synthesis translate_off
+                        $display("[TE %0t] BIAS_LOAD: base=%0d words=%0d", $time, bias_base_r, bias_words_r);
+                        // synthesis translate_on
+                        bias_loading  <= 1'b1;
+                        bias_ar_sent  <= 1'b0;
+                        bias_wr_idx   <= 8'd0;
+                        state         <= ST_BIAS_LOAD;
+                    end else begin
+                        state <= ST_K_CHUNK_SETUP;
+                    end
                 end
 
                 // ---------------------------------------------------------
                 ST_K_CHUNK_SETUP: begin
                     // Compute K-chunk parameters
                     k_chunk_size     <= min_dim(PREFETCH_DIM[DIM_W-1:0], k_r - k_chunk_idx * PREFETCH_DIM);
-                    k_chunk_col_words <= min_dim(PREFETCH_DIM[DIM_W-1:0], k_r - k_chunk_idx * PREFETCH_DIM) / BUS_EL;
+                    k_chunk_col_words <= (min_dim(PREFETCH_DIM[DIM_W-1:0], k_r - k_chunk_idx * PREFETCH_DIM) + BUS_EL - 1) / BUS_EL;
                     // A base for this K-chunk: advance cols by k_chunk_idx * (PREFETCH_DIM/BUS_EL)
                     act_chunk_base   <= a_base_r + k_chunk_idx * (PREFETCH_DIM / BUS_EL);
                     n_chunk_idx      <= 0;
@@ -299,14 +361,19 @@ module tiling_engine #(
                 ST_N_CHUNK_SETUP: begin
                     // Compute N-chunk parameters
                     n_chunk_size      <= min_dim(PREFETCH_DIM[DIM_W-1:0], n_r - n_chunk_idx * PREFETCH_DIM);
-                    n_chunk_col_words <= min_dim(PREFETCH_DIM[DIM_W-1:0], n_r - n_chunk_idx * PREFETCH_DIM) / BUS_EL;
+                    n_chunk_col_words <= (min_dim(PREFETCH_DIM[DIM_W-1:0], n_r - n_chunk_idx * PREFETCH_DIM) + BUS_EL - 1) / BUS_EL;
                     num_n_tiles_chunk <= (min_dim(PREFETCH_DIM[DIM_W-1:0], n_r - n_chunk_idx * PREFETCH_DIM) + TILE - 1) / TILE;
                     // B base for this (K,N)-chunk:
-                    // row offset = k_chunk_idx * PREFETCH_DIM rows
-                    // col offset = n_chunk_idx * (PREFETCH_DIM/BUS_EL) words
-                    wgt_chunk_base   <= b_base_r +
-                                        k_chunk_idx * PREFETCH_DIM * b_stride_r +
-                                        n_chunk_idx * (PREFETCH_DIM / BUS_EL);
+                    // Standard (B is k×n): K advances rows, N advances cols
+                    // Transposed (B is n×k): N advances rows, K advances cols
+                    if (op_r == OP_MATMUL_T)
+                        wgt_chunk_base <= b_base_r +
+                                          n_chunk_idx * PREFETCH_DIM * b_stride_r +
+                                          k_chunk_idx * (PREFETCH_DIM / BUS_EL);
+                    else
+                        wgt_chunk_base <= b_base_r +
+                                          k_chunk_idx * PREFETCH_DIM * b_stride_r +
+                                          n_chunk_idx * (PREFETCH_DIM / BUS_EL);
                     pf_act_launched  <= 1'b0;
                     pf_wgt_launched  <= 1'b0;
                     pf_act_done_r    <= 1'b0;
@@ -329,12 +396,14 @@ module tiling_engine #(
                             pf_act_launched <= 1'b1;
                     end
                     // Weight prefetch
+                    // Standard: B is (k,n), load k_chunk rows × n_chunk cols
+                    // Transposed: B is (n,k), load n_chunk rows × k_chunk cols
                     if (!pf_wgt_launched) begin
                         pf_wgt_cmd_valid   <= 1'b1;
                         pf_wgt_hbm_base    <= wgt_chunk_base;
                         pf_wgt_hbm_stride  <= b_stride_r;
-                        pf_wgt_num_rows    <= k_chunk_size;
-                        pf_wgt_num_col_words <= n_chunk_col_words;
+                        pf_wgt_num_rows    <= (op_r == OP_MATMUL_T) ? n_chunk_size : k_chunk_size;
+                        pf_wgt_num_col_words <= (op_r == OP_MATMUL_T) ? k_chunk_col_words : n_chunk_col_words;
                         if (pf_wgt_cmd_valid && pf_wgt_cmd_ready)
                             pf_wgt_launched <= 1'b1;
                     end
@@ -374,6 +443,7 @@ module tiling_engine #(
                         eng_cmd_out_row[idle_eng*URAM_ROW_W +: URAM_ROW_W] <= out_row_tile;
                         eng_cmd_out_col_word[idle_eng*URAM_COL_W +: URAM_COL_W] <= out_col_word_tile;
                         eng_cmd_first_k_chunk[idle_eng] <= (k_chunk_idx == 0);
+                        eng_cmd_last_k_chunk[idle_eng]  <= (k_chunk_idx == num_k_chunks - 1);
 
                         tiles_outstanding <= tiles_outstanding + 1 - done_count;
                         just_dispatched[idle_eng] <= 1'b1;
@@ -429,14 +499,56 @@ module tiling_engine #(
                 end
 
                 // ---------------------------------------------------------
+                // Load bias from HBM into local bias_buf via AXI burst
+                // ---------------------------------------------------------
+                ST_BIAS_LOAD: begin
+                    // Issue AR request (single burst, max 256 words)
+                    if (!bias_ar_sent) begin
+                        bias_axi_arvalid <= 1'b1;
+                        bias_axi_araddr  <= bias_base_r;
+                        bias_axi_arlen   <= bias_words_r[7:0] - 8'd1;
+                        bias_axi_rready  <= 1'b1;
+                        if (bias_axi_arvalid && bias_axi_arready) begin
+                            bias_ar_sent     <= 1'b1;
+                            bias_axi_arvalid <= 1'b0;
+                        end
+                    end
+                    // Accept read data, write to bias_buf
+                    if (bias_axi_rvalid && bias_axi_rready) begin
+                        bias_buf[bias_wr_idx] <= bias_axi_rdata;
+                        // synthesis translate_off
+                        $display("[TE %0t] BIAS_DATA[%0d]: %h", $time, bias_wr_idx, bias_axi_rdata);
+                        // synthesis translate_on
+                        bias_wr_idx <= bias_wr_idx + 8'd1;
+                        if (bias_axi_rlast) begin
+                            bias_axi_rready <= 1'b0;
+                            bias_loading    <= 1'b0;
+                            state           <= ST_K_CHUNK_SETUP;
+                        end
+                    end
+                end
+
+                // ---------------------------------------------------------
                 ST_DONE: begin
-                    cmd_done <= 1'b1;
-                    state    <= ST_IDLE;
+                    cmd_done    <= 1'b1;
+                    bias_active <= 1'b0;
+                    state       <= ST_IDLE;
                 end
 
                 default: state <= ST_IDLE;
             endcase
         end
+    end
+
+    // =========================================================================
+    // Simulation init — zero bias buffer
+    // =========================================================================
+    integer bias_init_i;
+    initial begin
+        for (bias_init_i = 0; bias_init_i < 256; bias_init_i = bias_init_i + 1)
+            bias_buf[bias_init_i] = {BUS_W{1'b0}};
+        bias_axi_araddr = {HBM_ADDR_W{1'b0}};
+        bias_axi_arlen  = 8'd0;
     end
 
 endmodule

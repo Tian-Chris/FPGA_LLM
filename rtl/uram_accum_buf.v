@@ -2,7 +2,7 @@
 // uram_accum_buf.v — URAM Output Accumulation Buffer
 // =============================================================================
 //
-// 1024×1024 × INT16 buffer for matmul output accumulation.
+// 1024×1024 × FP16 buffer for matmul output accumulation.
 // Column-sharded write ports: each engine writes to non-overlapping column
 // ranges, so no arbitration is needed on writes.
 // Single read port for flush/DMA readback.
@@ -187,9 +187,9 @@ module uram_accum_buf #(
     end
 
     // =====================================================================
-    // Port A: Single Write with optional accumulation
+    // Port A: Single Write with optional FP16 accumulation
     // =====================================================================
-    // When wr_accum_mux=1, perform element-wise INT16 addition with saturation
+    // When wr_accum_mux=1, perform element-wise FP16 addition
     // (read-modify-write). This implements k-chunk accumulation for matmuls
     // where K > PREFETCH_DIM.
     //
@@ -197,24 +197,122 @@ module uram_accum_buf #(
     // (read-before-write), which is correct for accumulation.
     // =====================================================================
     integer acc_i;
-    reg signed [DATA_W:0] acc_sum;  // DATA_W+1 bits for overflow detection
     reg [BUS_W-1:0] acc_result;
 
     always @(*) begin
         acc_result = {BUS_W{1'b0}};
-        acc_sum = 0;
         for (acc_i = 0; acc_i < BUS_EL; acc_i = acc_i + 1) begin
-            acc_sum = $signed(mem[wr_addr_mux][acc_i*DATA_W +: DATA_W]) +
-                      $signed(wr_data_mux[acc_i*DATA_W +: DATA_W]);
-            // Saturate to INT16
-            if (acc_sum > 32767)
-                acc_result[acc_i*DATA_W +: DATA_W] = 16'h7fff;
-            else if (acc_sum < -32768)
-                acc_result[acc_i*DATA_W +: DATA_W] = 16'h8000;
-            else
-                acc_result[acc_i*DATA_W +: DATA_W] = acc_sum[DATA_W-1:0];
+            acc_result[acc_i*DATA_W +: DATA_W] = fp16_add_comb(
+                mem[wr_addr_mux][acc_i*DATA_W +: DATA_W],
+                wr_data_mux[acc_i*DATA_W +: DATA_W]
+            );
         end
     end
+
+    // Combinational FP16 adder for k-chunk accumulation
+    function [15:0] fp16_add_comb;
+        input [15:0] a, b;
+        reg        a_s, b_s, lg_s, sm_s, res_s, eff_sub;
+        reg [4:0]  a_e, b_e, lg_e, sm_e;
+        reg [9:0]  a_m, b_m, lg_mr, sm_mr;
+        reg        a_z, b_z;
+        reg [4:0]  ediff;
+        reg [3:0]  shift;
+        reg [13:0] lg_ext, sm_ext, aligned, restored;
+        reg        sticky;
+        reg [14:0] sum_m;
+        reg [3:0]  lzc;
+        reg [14:0] norm_m;
+        reg [5:0]  norm_e;
+        reg        norm_sticky;
+        reg [9:0]  fmant;
+        reg        g, r, s_all, rup;
+        reg [10:0] rounded;
+        reg [9:0]  rmant;
+        reg [5:0]  rexp;
+        integer    k;
+        begin
+            a_s = a[15]; a_e = a[14:10]; a_m = a[9:0];
+            b_s = b[15]; b_e = b[14:10]; b_m = b[9:0];
+            a_z = (a_e == 5'd0); b_z = (b_e == 5'd0);
+
+            if ((a_e == 5'd31) || (b_e == 5'd31)) begin
+                // Inf/NaN passthrough
+                if (a_e == 5'd31 && a_m != 0)
+                    fp16_add_comb = a;
+                else if (b_e == 5'd31 && b_m != 0)
+                    fp16_add_comb = b;
+                else
+                    fp16_add_comb = (a_e == 5'd31) ? a : b;
+            end else if (a_z && b_z) begin
+                fp16_add_comb = {a_s & b_s, 15'd0};
+            end else if (a_z) begin
+                fp16_add_comb = b;
+            end else if (b_z) begin
+                fp16_add_comb = a;
+            end else begin
+                if (a_e > b_e || (a_e == b_e && a_m >= b_m)) begin
+                    lg_s = a_s; lg_e = a_e; lg_mr = a_m;
+                    sm_s = b_s; sm_e = b_e; sm_mr = b_m;
+                end else begin
+                    lg_s = b_s; lg_e = b_e; lg_mr = b_m;
+                    sm_s = a_s; sm_e = a_e; sm_mr = a_m;
+                end
+                res_s = lg_s;
+                eff_sub = lg_s ^ sm_s;
+                ediff = lg_e - sm_e;
+                shift = (ediff > 5'd14) ? 4'd14 : ediff[3:0];
+                lg_ext = {1'b1, lg_mr, 3'b000};
+                sm_ext = {1'b1, sm_mr, 3'b000};
+                aligned = sm_ext >> shift;
+                restored = aligned << shift;
+                sticky = (restored != sm_ext);
+
+                if (eff_sub)
+                    sum_m = {1'b0, lg_ext} - {1'b0, aligned} - {14'd0, sticky};
+                else
+                    sum_m = {1'b0, lg_ext} + {1'b0, aligned};
+
+                if (sum_m == 15'd0) begin
+                    fp16_add_comb = 16'd0;
+                end else begin
+                    lzc = 4'd15;
+                    for (k = 14; k >= 0; k = k - 1) begin
+                        if (sum_m[k] && lzc == 4'd15)
+                            lzc = 14 - k;
+                    end
+                    norm_sticky = sticky;
+                    if (lzc == 4'd0) begin
+                        norm_sticky = sticky | sum_m[0];
+                        norm_m = {1'b0, sum_m[14:1]};
+                        norm_e = {1'b0, lg_e} + 6'd1;
+                    end else if (lzc == 4'd1) begin
+                        norm_m = sum_m;
+                        norm_e = {1'b0, lg_e};
+                    end else begin
+                        norm_m = sum_m << (lzc - 4'd1);
+                        norm_e = {1'b0, lg_e} - {2'd0, lzc} + 6'd1;
+                    end
+                    fmant = norm_m[12:3];
+                    g = norm_m[2]; r = norm_m[1];
+                    s_all = norm_m[0] | norm_sticky;
+                    rup = g && (r || s_all || fmant[0]);
+                    rounded = {1'b0, fmant} + {10'd0, rup};
+                    if (rounded[10]) begin
+                        rmant = 10'd0; rexp = norm_e + 6'd1;
+                    end else begin
+                        rmant = rounded[9:0]; rexp = norm_e;
+                    end
+                    if (rexp >= 6'd31)
+                        fp16_add_comb = {res_s, 5'b11111, 10'd0};
+                    else if (rexp[5] || rexp == 6'd0)
+                        fp16_add_comb = {res_s, 15'd0};
+                    else
+                        fp16_add_comb = {res_s, rexp[4:0], rmant};
+                end
+            end
+        end
+    endfunction
 
     always @(posedge clk) begin
         if (wr_en_mux) begin
@@ -244,8 +342,9 @@ module uram_accum_buf #(
         end else begin
             // Stage 0: registered memory read
             rd_pipe_valid[0] <= rd_en;
-            if (rd_en)
+            if (rd_en) begin
                 rd_pipe_data[0] <= mem[rd_row * WORDS + rd_col_word];
+            end
             // Stages 1..RD_LATENCY-1: shift register (no iterations when RD_LATENCY=1)
             for (s = 1; s < RD_LATENCY; s = s + 1) begin
                 rd_pipe_data[s]  <= rd_pipe_data[s-1];

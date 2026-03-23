@@ -1,139 +1,176 @@
-"""Golden model for softmax.v — 3-pass fixed-point softmax.
+"""Golden model for softmax.v — FP16 softmax with LUT-based exp.
 
-Replicates:
-  - L96-103:  exp LUT initialization
-  - L111-117: reciprocal LUT initialization
-  - L122-139: compute_exp function
-  - L255-285: normalize function
+Pass 1: Scale scores by FP16 scale_factor, find FP16 max
+Pass 2: exp(scaled - max) via 256-entry LUT, FP32 sum
+Pass 3: Normalize by FP32 reciprocal (Newton-Raphson)
 """
 
-from .common import int16, uint32
+import numpy as np
+import struct
+import math
+import os
+
+
+def _fp16_to_fp32(bits):
+    """FP16 bit pattern → float32."""
+    return float(np.uint16(bits).view(np.float16).astype(np.float32))
+
+
+def _fp32_bits(f):
+    """Float → FP32 bit pattern."""
+    return struct.unpack('<I', struct.pack('<f', np.float32(f)))[0]
+
+
+def _bits_to_fp32(bits):
+    """FP32 bit pattern → float."""
+    return struct.unpack('<f', struct.pack('<I', bits & 0xFFFFFFFF))[0]
+
+
+def _fp16_bits(f):
+    """Float → FP16 bit pattern."""
+    return int(np.float32(f).astype(np.float16).view(np.uint16))
+
+
+def _fp16_mult(a_bits, b_bits):
+    """FP16 × FP16 → FP16 (bit patterns)."""
+    a = float(np.uint16(a_bits).view(np.float16))
+    b = float(np.uint16(b_bits).view(np.float16))
+    result = np.float16(np.float16(a) * np.float16(b))
+    return int(result.view(np.uint16))
+
+
+def _fp16_add(a_bits, b_bits):
+    """FP16 + FP16 → FP16 (bit patterns)."""
+    a = np.uint16(a_bits).view(np.float16)
+    b = np.uint16(b_bits).view(np.float16)
+    result = np.float16(a + b)
+    return int(result.view(np.uint16))
+
+
+def _fp16_max(a_bits, b_bits):
+    """FP16 max (bit patterns)."""
+    a = float(np.uint16(a_bits).view(np.float16))
+    b = float(np.uint16(b_bits).view(np.float16))
+    # Handle NaN
+    if np.isnan(a):
+        return a_bits
+    if np.isnan(b):
+        return b_bits
+    return a_bits if a >= b else b_bits
 
 
 def _build_exp_lut():
-    """Build the exact exp LUT from softmax.v L96-103."""
-    lut = [0] * 256
+    """Build exp LUT matching RTL: exp_lut[i] = FP16(exp(-i/16))."""
+    lut = []
     for i in range(256):
-        if i == 255:
-            lut[i] = 0x0100
-        else:
-            lut[i] = 0x0001 + (i & 0xFF)
-    return lut
-
-
-def _build_recip_lut():
-    """Build the exact reciprocal LUT from softmax.v L111-117."""
-    lut = [0] * 256
-    lut[0] = 0xFFFF
-    for i in range(1, 256):
-        lut[i] = 0xFFFF // i
+        x = i / 16.0
+        y = math.exp(-x)
+        fp16_val = np.float16(y)
+        lut.append(int(fp16_val.view(np.uint16)))
     return lut
 
 
 EXP_LUT = _build_exp_lut()
-RECIP_LUT = _build_recip_lut()
 
 
-def compute_exp(x, max_x):
-    """Replicate softmax.v compute_exp (L122-139).
+def _exp_lut_index(diff_bits):
+    """Compute exp LUT index from FP16 diff (always ≤ 0).
 
-    Args:
-        x: INT16 input value
-        max_x: INT16 maximum value in row
-    Returns:
-        16-bit unsigned exp value
+    Index = clamp(|diff| * 16, 0, 255).
+    Matches RTL exp_lut_index function exactly.
     """
-    diff = int16(x - max_x)  # Always <= 0
+    e = (diff_bits >> 10) & 0x1F
+    m = diff_bits & 0x3FF
 
-    if diff <= -2040:
-        lut_addr = 0
+    if diff_bits == 0x0000 or diff_bits == 0x8000 or e == 0:
+        return 0
+    elif e == 31:
+        return 255
+    elif e >= 19:
+        return 255
+    elif e < 11:
+        return 0
     else:
-        lut_addr = (diff + 2040) >> 3  # Scale to 8-bit address
+        # e ∈ [11, 18]: floor(|diff| * 16) = {1, mant} >> (21 - e)
+        full = (1 << 10) | m  # {1, mant} = 11 bits
+        shift_right = 21 - e
+        idx = full >> shift_right
+        return min(idx, 255)
 
-    lut_addr = lut_addr & 0xFF
-    return EXP_LUT[lut_addr]
 
+def _newton_raphson_recip(sum_bits):
+    """FP32 reciprocal via Newton-Raphson, matching RTL ST_COMP_RECIP.
 
-def normalize(exp_val, exp_sum):
-    """Replicate softmax.v normalize function (L255-285).
-
-    Args:
-        exp_val: 16-bit exp value for this element
-        exp_sum: 32-bit sum of all exp values
-    Returns:
-        16-bit unsigned normalized value
+    Step 0: y0 = 0x7EF311C7 - sum_bits
+    Step 1: tmp = sum * y0
+    Step 2: tmp = 2 - tmp
+    Step 3: recip = y0 * tmp
     """
-    exp_sum = uint32(exp_sum)
+    exp_sum = _bits_to_fp32(sum_bits)
 
-    # Adaptive addressing based on sum magnitude (L263-268)
-    byte2 = (exp_sum >> 16) & 0xFF
-    byte1 = (exp_sum >> 8) & 0xFF
-    byte0 = exp_sum & 0xFF
+    # Step 0: magic number initial estimate
+    y0_bits = (0x7EF311C7 - sum_bits) & 0xFFFFFFFF
+    y0 = _bits_to_fp32(y0_bits)
 
-    if byte2 != 0:
-        recip_addr = byte2
-    elif byte1 != 0:
-        recip_addr = byte1
-    else:
-        recip_addr = byte0 if byte0 != 0 else 1
+    # Step 1: tmp = sum * y0
+    tmp = np.float32(np.float32(exp_sum) * np.float32(y0))
 
-    recip_val = RECIP_LUT[recip_addr & 0xFF]
+    # Step 2: tmp = 2 - tmp
+    tmp = np.float32(np.float32(2.0) - tmp)
 
-    # Adjust scaling based on which byte was used (shifts reduced by 8 for 16-bit output)
-    product = (exp_val & 0xFFFF) * (recip_val & 0xFFFF)
-    if byte2 != 0:
-        scaled = product >> 16
-    elif byte1 != 0:
-        scaled = product >> 8
-    else:
-        scaled = product
+    # Step 3: recip = y0 * tmp
+    recip = np.float32(np.float32(y0) * tmp)
 
-    scaled = scaled & 0xFFFFFFFF
-
-    # Saturate to 16 bits
-    if scaled > 65535:
-        return 0xFFFF
-    return scaled & 0xFFFF
+    return recip
 
 
-def softmax_golden(input_vec, scale_shift=0, row_idx=None):
-    """Full 3-pass softmax computation.
+def softmax_golden(input_bits, scale_factor_bits, row_idx=None):
+    """Full 3-pass FP16 softmax.
 
     Args:
-        input_vec: list of INT16 values (one row of attention scores)
-        scale_shift: right-shift for attention scaling (÷√head_dim), default 0
+        input_bits: list of FP16 bit patterns (attention scores)
+        scale_factor_bits: FP16 bit pattern for scale (1/√head_dim)
         row_idx: if not None, enable causal masking (mask cols > row_idx)
     Returns:
-        list of UINT16 normalized probabilities
+        list of FP16 bit patterns (probabilities)
     """
-    seq_len = len(input_vec)
+    seq_len = len(input_bits)
+    FP16_NEG_INF = 0xFC00
 
-    # Apply attention scaling: arithmetic right-shift each input
-    # Python's >> on negative ints is already arithmetic (sign-extending)
-    scaled = [int16(int16(x) >> scale_shift) for x in input_vec]
-
-    # Pass 1: Find maximum (with causal masking)
-    max_val = -32768
-    for j, v in enumerate(scaled):
+    # Pass 1: Scale and find max
+    scaled = []
+    max_val = FP16_NEG_INF
+    for j, bits in enumerate(input_bits):
+        s = _fp16_mult(bits, scale_factor_bits)
+        scaled.append(s)
         if row_idx is not None and j > row_idx:
-            continue  # Masked — skip
-        if v > max_val:
-            max_val = v
+            continue
+        max_val = _fp16_max(s, max_val)
 
-    # Pass 2: Compute exp and sum (with causal masking)
+    # Pass 2: Compute exp and accumulate FP32 sum
     exp_buffer = []
-    exp_sum = 0
-    for j, v in enumerate(scaled):
+    exp_sum = np.float32(0.0)
+    neg_max = max_val ^ 0x8000  # Flip sign bit for negation
+    for j, s in enumerate(scaled):
         if row_idx is not None and j > row_idx:
-            exp_buffer.append(0)  # Masked position → exp = 0
+            exp_buffer.append(0x0000)
         else:
-            e = compute_exp(v, max_val)
-            exp_buffer.append(e)
-            exp_sum = uint32(exp_sum + e)
+            diff = _fp16_add(s, neg_max)
+            idx = _exp_lut_index(diff)
+            exp_val = EXP_LUT[idx]
+            exp_buffer.append(exp_val)
+            exp_sum = np.float32(exp_sum +
+                                 np.float32(_fp16_to_fp32(exp_val)))
+
+    # Reciprocal via Newton-Raphson
+    exp_sum_bits = _fp32_bits(exp_sum)
+    recip = _newton_raphson_recip(exp_sum_bits)
 
     # Pass 3: Normalize
     output = []
-    for e in exp_buffer:
-        output.append(normalize(e, exp_sum))
+    for exp_val in exp_buffer:
+        exp_fp32 = np.float32(_fp16_to_fp32(exp_val))
+        result_fp32 = np.float32(exp_fp32 * recip)
+        output.append(_fp16_bits(result_fp32))
 
     return output

@@ -9,7 +9,7 @@
 //   ./host <xclbin> <data_dir> ["prompt text"] [max_tokens]
 //
 // Data directory must contain:
-//   weights.bin  — FPGA weight buffer (~576 MB, from export_gpt2.py)
+//   weights.bin  — FPGA weight buffer (~604 MB, FP16 + inline biases, from export_gpt2.py)
 //   embed.bin    — wte + wpe + ln_f (from export_gpt2.py)
 //   vocab.json   — GPT-2 tokenizer vocabulary
 //   merges.txt   — GPT-2 BPE merges
@@ -42,7 +42,7 @@ static constexpr int NUM_HEADS     = 16;
 static constexpr int HEAD_DIM      = MODEL_DIM / NUM_HEADS;  // 64
 static constexpr int F_DIM         = 4096;
 static constexpr int MAX_SEQ_LEN   = 128;
-static constexpr int NUM_LAYERS    = 24;
+static int NUM_LAYERS              = 24;  // default; overridable via env NUM_LAYERS
 static constexpr int BUS_ELEMS     = 16;   // 256-bit / 16-bit
 
 // AXI-Lite debug register offsets (match vitis_control.v)
@@ -57,16 +57,15 @@ static const char* FSM_NAMES[] = {
 static constexpr int WORD_BYTES    = 32;   // 256 bits = 32 bytes
 static constexpr int MODEL_STRIDE  = MODEL_DIM / BUS_ELEMS;  // 64 words
 
-// Buffer sizes
-static constexpr size_t LAYER_SIZE       = 786688;  // words per layer
-static constexpr size_t TOTAL_WGT_WORDS  = LAYER_SIZE * NUM_LAYERS;
-static constexpr size_t WEIGHT_BUF_SIZE  = TOTAL_WGT_WORDS * WORD_BYTES;  // ~576 MB
-// Activation buffer: scratch (6 slabs) + per-layer KV cache
+// Buffer sizes (LAYER_SIZE, KV_LAYER_SIZE, ACT_SCRATCH are compile-time constants;
+// totals that depend on NUM_LAYERS are computed at runtime since NUM_LAYERS is configurable)
+static constexpr size_t LAYER_SIZE        = 787264;  // words per layer (incl. bias)
 static constexpr size_t ACT_SCRATCH_WORDS = 6 * MAX_SEQ_LEN * MODEL_DIM / BUS_ELEMS;  // 49152
 static constexpr int    KV_LAYER_SIZE     = 2 * MAX_SEQ_LEN * MODEL_DIM / BUS_ELEMS;  // 16384
-static constexpr size_t KV_REGION_WORDS   = NUM_LAYERS * KV_LAYER_SIZE;               // 393216
-static constexpr size_t ACT_BUF_SIZE      = (ACT_SCRATCH_WORDS + KV_REGION_WORDS) * WORD_BYTES;  // ~14 MB
 static constexpr size_t OUTPUT_BUF_SIZE   =  4 * 1024 * 1024;   //  4 MB
+// Computed at runtime (depend on NUM_LAYERS):
+static size_t WEIGHT_BUF_SIZE;
+static size_t ACT_BUF_SIZE;
 
 // Activation memory layout (word offsets, matching fsm_controller.v)
 // WE = BUS_ELEMS = 16
@@ -116,9 +115,58 @@ static bool load_embed(const std::string& path, EmbedData& ed) {
 }
 
 // =============================================================================
-// Embedding: wte[token_id] + wpe[position] → FP32 → INT16
+// FP16 ↔ FP32 Conversion Helpers
 // =============================================================================
-static float embed_scale_global = 1.0f;
+static uint16_t float_to_fp16(float val) {
+    uint32_t bits;
+    std::memcpy(&bits, &val, 4);
+    uint32_t sign = (bits >> 16) & 0x8000;
+    int32_t exp = static_cast<int32_t>((bits >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = bits & 0x7FFFFF;
+
+    // Handle special cases
+    if (((bits >> 23) & 0xFF) == 0xFF) {
+        // Inf or NaN
+        return static_cast<uint16_t>(sign | 0x7C00 | (mant ? 0x0200 : 0));
+    }
+    if (((bits >> 23) & 0xFF) == 0) {
+        // Zero or FP32 denorm → FP16 zero
+        return static_cast<uint16_t>(sign);
+    }
+    if (exp <= 0) return static_cast<uint16_t>(sign);        // underflow → ±0
+    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7C00); // overflow → ±Inf
+    return static_cast<uint16_t>(sign | (exp << 10) | (mant >> 13));
+}
+
+static float fp16_to_float(uint16_t h) {
+    uint32_t sign = static_cast<uint32_t>(h & 0x8000) << 16;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+
+    uint32_t result_bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            result_bits = sign;  // ±0
+        } else {
+            // Denorm → normalized FP32
+            int e = 0;
+            while (!(mant & 0x400)) { mant <<= 1; e++; }
+            mant &= 0x3FF;
+            result_bits = sign | (static_cast<uint32_t>(127 - 15 + 1 - e) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        result_bits = sign | 0x7F800000u | (mant << 13);  // Inf/NaN
+    } else {
+        result_bits = sign | (static_cast<uint32_t>(exp - 15 + 127) << 23) | (mant << 13);
+    }
+    float result;
+    std::memcpy(&result, &result_bits, 4);
+    return result;
+}
+
+// =============================================================================
+// Embedding: wte[token_id] + wpe[position] → FP32 → FP16
+// =============================================================================
 
 static void compute_embedding(const EmbedData& ed,
                                const std::vector<int>& token_ids,
@@ -143,25 +191,15 @@ static void compute_embedding(const EmbedData& ed,
     }
 }
 
-static void quantize_embed_to_int16(const std::vector<float>& embed_fp32,
-                                     int16_t* act_buf,
-                                     int seq_len) {
-    // Find max absolute value for symmetric quantization
-    float amax = 0.0f;
-    for (size_t i = 0; i < embed_fp32.size(); ++i) {
-        float v = std::fabs(embed_fp32[i]);
-        if (v > amax) amax = v;
-    }
-    embed_scale_global = (amax > 1e-10f) ? amax / 32767.0f : 1.0f;
-
-    // Pack into activation buffer with MODEL_STRIDE layout
+static void embed_to_fp16(const std::vector<float>& embed_fp32,
+                           uint16_t* act_buf,
+                           int seq_len) {
+    // Pack FP16 embeddings into activation buffer with MODEL_STRIDE layout
     // Row s at word offset ACT_EMBED_OFFSET + s * MODEL_STRIDE
     for (int s = 0; s < seq_len; ++s) {
         for (int d = 0; d < MODEL_DIM; ++d) {
             float v = embed_fp32[s * MODEL_DIM + d];
-            int32_t q = static_cast<int32_t>(std::round(v / embed_scale_global));
-            if (q > 32767) q = 32767;
-            if (q < -32768) q = -32768;
+            uint16_t fp16 = float_to_fp16(v);
 
             // Compute byte offset: word_addr * WORD_BYTES + element_in_word * 2
             int word_in_row = d / BUS_ELEMS;
@@ -170,8 +208,7 @@ static void quantize_embed_to_int16(const std::vector<float>& embed_fp32,
                 (ACT_EMBED_OFFSET + s * MODEL_STRIDE + word_in_row) * WORD_BYTES
                 + elem_in_word * 2);
 
-            // Write as little-endian INT16
-            act_buf[byte_offset / 2] = static_cast<int16_t>(q);
+            act_buf[byte_offset / 2] = fp16;
         }
     }
 }
@@ -256,12 +293,12 @@ static int unembed_sample(const float* hidden, const EmbedData& ed, float temper
 }
 
 // =============================================================================
-// Read FPGA output from activation buffer and convert to FP32
+// Read FPGA output from activation buffer (FP16) and convert to FP32
 // =============================================================================
 // After all layers, the final residual2 output is flushed to ACT_EMBED in
 // the activation buffer (step 14 of the step table). S_OUTPUT_COPY is skipped
 // because the flush port (hbm12) can only reach the activation bank (HBM[4]).
-static void read_output_fp32(const int16_t* act_buf, int seq_pos,
+static void read_output_fp32(const uint16_t* act_buf, int seq_pos,
                               float* hidden_fp32) {
     // Output is at ACT_EMBED_OFFSET + seq_pos * MODEL_STRIDE
     for (int d = 0; d < MODEL_DIM; ++d) {
@@ -271,8 +308,8 @@ static void read_output_fp32(const int16_t* act_buf, int seq_pos,
             (ACT_EMBED_OFFSET + seq_pos * MODEL_STRIDE + word_in_row) * WORD_BYTES
             + elem_in_word * 2);
 
-        int16_t raw = act_buf[byte_offset / 2];
-        hidden_fp32[d] = static_cast<float>(raw);
+        uint16_t raw = act_buf[byte_offset / 2];
+        hidden_fp32[d] = fp16_to_float(raw);
     }
 }
 
@@ -314,9 +351,9 @@ static const ActRegion ACT_REGIONS[] = {
 static constexpr int NUM_ACT_REGIONS = sizeof(ACT_REGIONS) / sizeof(ACT_REGIONS[0]);
 
 // Check if a region has non-zero data (sample first num_words 256-bit words)
-static bool region_has_data(const int16_t* act_buf, int word_offset, int num_words) {
+static bool region_has_data(const uint16_t* act_buf, int word_offset, int num_words) {
     for (int w = 0; w < num_words; ++w) {
-        // Each 256-bit word = 16 INT16 elements
+        // Each 256-bit word = 16 FP16 elements
         size_t base_idx = static_cast<size_t>((word_offset + w) * WORD_BYTES / 2);
         for (int e = 0; e < BUS_ELEMS; ++e) {
             if (act_buf[base_idx + e] != 0) return true;
@@ -325,19 +362,20 @@ static bool region_has_data(const int16_t* act_buf, int word_offset, int num_wor
     return false;
 }
 
-// Compute a simple fingerprint (sum of absolute values of first N elements)
-static int64_t region_fingerprint(const int16_t* act_buf, int word_offset, int num_words) {
+// Compute a simple fingerprint (sum of absolute values of first N elements as FP16)
+static int64_t region_fingerprint(const uint16_t* act_buf, int word_offset, int num_words) {
     int64_t sum = 0;
     for (int w = 0; w < num_words; ++w) {
         size_t base_idx = static_cast<size_t>((word_offset + w) * WORD_BYTES / 2);
         for (int e = 0; e < BUS_ELEMS; ++e) {
-            sum += std::abs(static_cast<int>(act_buf[base_idx + e]));
+            // Use magnitude of FP16 value (clear sign bit)
+            sum += static_cast<int64_t>(act_buf[base_idx + e] & 0x7FFF);
         }
     }
     return sum;
 }
 
-static void dump_activation_progress(xrt::bo& bo_act, const int16_t* act_buf) {
+static void dump_activation_progress(xrt::bo& bo_act, const uint16_t* act_buf) {
     // Sync activation buffer back from device
     bo_act.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
@@ -387,6 +425,18 @@ int main(int argc, char* argv[]) {
     std::string prompt = (argc > 3) ? argv[3] : "The meaning of life is";
     int max_tokens = (argc > 4) ? std::atoi(argv[4]) : 50;
     float temperature = (argc > 5) ? std::atof(argv[5]) : 0.0f;
+
+    // Override NUM_LAYERS from environment (e.g. NUM_LAYERS=2 ./host ...)
+    if (const char* nl_env = std::getenv("NUM_LAYERS")) {
+        NUM_LAYERS = std::atoi(nl_env);
+        if (NUM_LAYERS < 1 || NUM_LAYERS > 24) {
+            std::cerr << "ERROR: NUM_LAYERS must be 1..24, got " << NUM_LAYERS << "\n";
+            return 1;
+        }
+    }
+    std::cout << "NUM_LAYERS = " << NUM_LAYERS << "\n";
+    WEIGHT_BUF_SIZE = LAYER_SIZE * NUM_LAYERS * WORD_BYTES;
+    ACT_BUF_SIZE    = (ACT_SCRATCH_WORDS + NUM_LAYERS * KV_LAYER_SIZE) * WORD_BYTES;
 
     // Ensure data_dir ends with /
     if (!data_dir.empty() && data_dir.back() != '/') data_dir += '/';
@@ -455,7 +505,7 @@ int main(int argc, char* argv[]) {
     xrt::bo bo_output(device, OUTPUT_BUF_SIZE,  kernel.group_id(7));
 
     auto weight_map = bo_weight.map<char*>();
-    auto act_map    = bo_act.map<int16_t*>();
+    auto act_map    = bo_act.map<uint16_t*>();
     auto output_map = bo_output.map<int16_t*>();
 
     // -----------------------------------------------------------------
@@ -487,7 +537,7 @@ int main(int argc, char* argv[]) {
 
     // Clear and fill activation buffer
     std::memset(act_map, 0, ACT_BUF_SIZE);
-    quantize_embed_to_int16(embed_fp32, act_map, prompt_len);
+    embed_to_fp16(embed_fp32, act_map, prompt_len);
 
     bo_act.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
@@ -506,13 +556,25 @@ int main(int argc, char* argv[]) {
               << " act_addr=0x" << bo_act.address()
               << " out_addr=0x" << bo_output.address() << std::dec << "\n";
 
+    // Debug: verify kv_base address calculation
+    std::cout << "  bo_act.address() = 0x" << std::hex << bo_act.address()
+              << " (aligned=" << ((bo_act.address() & 0x1F) == 0 ? "yes" : "NO") << ")\n"
+              << "  bo_act.address()>>5 = 0x" << (bo_act.address() >> 5)
+              << " ACT_SCRATCH_WORDS=" << std::dec << ACT_SCRATCH_WORDS
+              << " kv_base=0x" << std::hex << kv_base << std::dec << "\n";
+
     auto t0 = std::chrono::high_resolution_clock::now();
+    uint32_t num_layers_arg = static_cast<uint32_t>(NUM_LAYERS);
+    // Debug trace: put it at the end of the output buffer (word-addressed)
+    uint32_t debug_base = static_cast<uint32_t>(bo_output.address() >> 5);
+    std::cout << "  debug_base=0x" << std::hex << debug_base << std::dec << "\n";
     auto run = kernel(batch_size, seq_len,
                       bo_weight, bo_weight,
                       bo_act, bo_act, bo_act,
                       bo_output,
                       decode_mode, cache_len,
-                      kv_base);
+                      kv_base, num_layers_arg,
+                      debug_base);
 
     // Poll forever (Ctrl+C to stop) — print status every 1s, dump HBM every 5s
     bool timed_out = true;
@@ -542,6 +604,34 @@ int main(int argc, char* argv[]) {
 
     // Read output from activation buffer (final res2 is at ACT_EMBED)
     bo_act.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+    // Read and print debug trace from output buffer
+    bo_output.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    {
+        std::cout << "\n=== Debug Trace ===\n";
+        // Each debug record is 256 bits = 16 x int16 = 32 bytes
+        // Read up to 512 records (covers 24 layers × 16 steps + DONE)
+        for (int rec = 0; rec < 512; ++rec) {
+            uint32_t cycle = static_cast<uint32_t>(output_map[rec * 16 + 0]) |
+                             (static_cast<uint32_t>(static_cast<uint16_t>(output_map[rec * 16 + 1])) << 16);
+            uint16_t layer = static_cast<uint16_t>(output_map[rec * 16 + 2]);
+            uint8_t  state = static_cast<uint8_t>(output_map[rec * 16 + 3] & 0xFF);
+            uint8_t  step  = static_cast<uint8_t>((output_map[rec * 16 + 3] >> 8) & 0xFF);
+            uint8_t  bt    = static_cast<uint8_t>(output_map[rec * 16 + 4] & 0xFF);
+            uint8_t  cfg   = static_cast<uint8_t>((output_map[rec * 16 + 4] >> 8) & 0xFF);
+            if (cycle == 0 && layer == 0 && state == 0 && step == 0)
+                break;  // empty record — end of trace
+            const char* sname = (state < 17) ? FSM_NAMES[state] : "???";
+            std::cout << "  [" << rec << "] cyc=" << cycle
+                      << " L" << layer << " " << sname
+                      << " step=" << (int)step
+                      << " bt=" << (int)bt << " cfg=" << (int)cfg;
+            if (step == 0xFF)
+                std::cout << " <<DONE>>";
+            std::cout << "\n";
+        }
+        std::cout << "===================\n\n";
+    }
 
     // Verify all layers completed by checking KV cache per layer
     // Each layer writes K/V to a unique address during QKV (step 2).
@@ -580,93 +670,36 @@ int main(int argc, char* argv[]) {
         ? unembed_sample(normed.data(), ed, temperature)
         : unembed_argmax(normed.data(), ed);
 
-    // Print prompt and first token
-    std::cout << "\n--- Generated Text ---\n";
+    // Dump raw FP16 values from last position for debugging
+    std::cout << "\n--- Raw FP16 output (last position, first 32 of " << MODEL_DIM << ") ---\n";
+    {
+        int last_pos = prompt_len - 1;
+        int base = last_pos * MODEL_STRIDE;
+        for (int i = 0; i < 32 && i < MODEL_DIM; ++i) {
+            uint16_t raw = act_map[base + i];
+            float val = fp16_to_float(raw);
+            std::cout << val;
+            if (i < 31) std::cout << ", ";
+        }
+        std::cout << "\n";
+
+        // Check for all-zeros / Inf/NaN
+        int zeros = 0, inf_nan = 0;
+        for (int i = 0; i < MODEL_DIM; ++i) {
+            uint16_t raw = act_map[base + i];
+            if (raw == 0 || raw == 0x8000) zeros++;
+            if ((raw & 0x7C00) == 0x7C00) inf_nan++;
+        }
+        std::cout << "  zeros=" << zeros << "/" << MODEL_DIM
+                  << " inf_nan=" << inf_nan << "/" << MODEL_DIM << "\n";
+    }
+
+    // Print prompt and first predicted token (prefill only, no decode)
+    std::cout << "\n--- Generated Text (prefill only) ---\n";
     std::cout << prompt;
     std::string tok_text = tokenizer.decode({next_token});
     std::cout << tok_text;
-    std::cout.flush();
-
-    // Track all generated tokens
-    std::vector<int> generated_ids;
-    generated_ids.push_back(next_token);
-
-    // -----------------------------------------------------------------
-    // Decode loop: generate tokens one at a time
-    // -----------------------------------------------------------------
-    int total_pos = prompt_len; // next position to write
-
-    for (int step = 1; step < max_tokens && total_pos < MAX_SEQ_LEN - 1; ++step) {
-        if (next_token == eot) break;
-
-        // Embed the new token at position total_pos
-        std::vector<int> single_tok = {next_token};
-        std::vector<float> single_embed;
-        compute_embedding(ed, single_tok, total_pos, single_embed);
-
-        // Sync act buffer FROM device first to get latest KV cache state,
-        // then write new embedding at position 0 and sync back.
-        // (XRT partial sync broken on U280 — must do full sync)
-        bo_act.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-
-        // Write single embedding into activation buffer
-        // For decode mode, we write at position 0 (seq_len=1)
-        std::memset(reinterpret_cast<char*>(act_map), 0, MODEL_STRIDE * WORD_BYTES);
-        quantize_embed_to_int16(single_embed, act_map, 1);
-        bo_act.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-        // Run kernel: decode mode
-        decode_mode = 1;
-        cache_len   = static_cast<uint32_t>(total_pos);
-
-        auto td0 = std::chrono::high_resolution_clock::now();
-        auto drun = kernel(batch_size, 1u,
-                           bo_weight, bo_weight,
-                           bo_act, bo_act, bo_act,
-                           bo_output,
-                           decode_mode, cache_len,
-                           kv_base);
-        for (int p = 0; ; ++p) {
-            auto st = drun.wait(std::chrono::milliseconds(1000));
-            auto elapsed = std::chrono::duration<double>(
-                std::chrono::high_resolution_clock::now() - td0).count();
-            std::cout << "  Decode Poll[" << p << "] " << elapsed
-                      << "s: ert=" << static_cast<int>(st) << "\n";
-            std::cout.flush();
-            if (st == ERT_CMD_STATE_COMPLETED) break;
-            if (st == ERT_CMD_STATE_ERROR || st == ERT_CMD_STATE_ABORT) {
-                std::cerr << "ERROR: Decode kernel error: " << static_cast<int>(st) << "\n";
-                return 1;
-            }
-        }
-        auto td1 = std::chrono::high_resolution_clock::now();
-        double decode_ms = std::chrono::duration<double, std::milli>(td1 - td0).count();
-
-        // Read output from act buffer (position 0, since seq_len=1 in decode)
-        bo_act.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        read_output_fp32(act_map, 0, hidden.data());
-
-        // ln_f + unembed
-        layer_norm(hidden.data(), normed.data(), MODEL_DIM,
-                   ed.ln_f_g.data(), ed.ln_f_b.data());
-
-        next_token = (temperature > 0.0f)
-            ? unembed_sample(normed.data(), ed, temperature)
-            : unembed_argmax(normed.data(), ed);
-
-        generated_ids.push_back(next_token);
-
-        // Print decoded token
-        tok_text = tokenizer.decode({next_token});
-        std::cout << tok_text;
-        std::cout.flush();
-
-        total_pos++;
-    }
-
-    std::cout << "\n--- End ---\n";
-    std::cout << "\nGenerated " << generated_ids.size() << " tokens"
-              << " (total sequence: " << total_pos << " positions)\n";
+    std::cout << "\n--- End (prefill only, decode disabled for ILA debugging) ---\n";
 
     return 0;
 }

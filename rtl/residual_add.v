@@ -42,7 +42,7 @@ module residual_add #(
 
     // Async response latching — adapter and DMA have different latencies
     reg got_res, got_sub;
-    reg signed [DATA_WIDTH-1:0] res_latched, sub_latched;
+    reg [DATA_WIDTH-1:0] res_latched, sub_latched;
     reg reads_issued;
 
     // Both responses available (either latched or arriving this cycle)
@@ -50,9 +50,9 @@ module residual_add #(
     wire sub_ready = got_sub || sub_rd_valid;
     wire both_ready = res_ready && sub_ready && reads_issued;
 
-    // Select latched data or live wire data
-    wire signed [DATA_WIDTH-1:0] res_use = got_res ? res_latched : $signed(res_rd_data);
-    wire signed [DATA_WIDTH-1:0] sub_use = got_sub ? sub_latched : $signed(sub_rd_data);
+    // Select latched data or live wire data (FP16 bit patterns, no sign cast)
+    wire [DATA_WIDTH-1:0] res_use = got_res ? res_latched : res_rd_data;
+    wire [DATA_WIDTH-1:0] sub_use = got_sub ? sub_latched : sub_rd_data;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -98,19 +98,19 @@ module residual_add #(
 
                     // Latch responses as they arrive (only if not consuming this cycle)
                     if (res_rd_valid && !both_ready) begin
-                        res_latched <= $signed(res_rd_data);
+                        res_latched <= res_rd_data;
                         got_res     <= 1'b1;
                     end
                     if (sub_rd_valid && !both_ready) begin
-                        sub_latched <= $signed(sub_rd_data);
+                        sub_latched <= sub_rd_data;
                         got_sub     <= 1'b1;
                     end
 
-                    // Both responses received: compute saturating add and write
+                    // Both responses received: FP16 add and write
                     if (both_ready) begin
                         out_wr_en    <= 1'b1;
                         out_wr_addr  <= idx;
-                        out_wr_data  <= saturating_add(res_use, sub_use);
+                        out_wr_data  <= fp16_add_comb(res_use, sub_use);
                         idx          <= idx + 1;
                         got_res      <= 1'b0;
                         got_sub      <= 1'b0;
@@ -134,21 +134,101 @@ module residual_add #(
         end
     end
 
-    // Saturating addition
-    function [DATA_WIDTH-1:0] saturating_add;
-        input signed [DATA_WIDTH-1:0] a;
-        input signed [DATA_WIDTH-1:0] b;
-        reg signed [DATA_WIDTH:0] sum;
+    // Combinational FP16 adder (replaces saturating INT16 add)
+    function [15:0] fp16_add_comb;
+        input [15:0] a, b;
+        reg        a_s, b_s, lg_s, sm_s, res_s, eff_sub;
+        reg [4:0]  a_e, b_e, lg_e, sm_e;
+        reg [9:0]  a_m, b_m, lg_mr, sm_mr;
+        reg        a_z, b_z;
+        reg [4:0]  ediff;
+        reg [3:0]  shift;
+        reg [13:0] lg_ext, sm_ext, aligned, restored;
+        reg        sticky;
+        reg [14:0] sum_m;
+        reg [3:0]  lzc;
+        reg [14:0] norm_m;
+        reg [5:0]  norm_e;
+        reg        norm_sticky;
+        reg [9:0]  fmant;
+        reg        g, r, s_all, rup;
+        reg [10:0] rounded;
+        reg [9:0]  rmant;
+        reg [5:0]  rexp;
+        integer    k;
         begin
-            sum = a + b;
+            a_s = a[15]; a_e = a[14:10]; a_m = a[9:0];
+            b_s = b[15]; b_e = b[14:10]; b_m = b[9:0];
+            a_z = (a_e == 5'd0); b_z = (b_e == 5'd0);
 
-            // Check for overflow
-            if (sum > $signed({1'b0, {(DATA_WIDTH-1){1'b1}}}))  // Max positive
-                saturating_add = {1'b0, {(DATA_WIDTH-1){1'b1}}};
-            else if (sum < $signed({1'b1, {(DATA_WIDTH-1){1'b0}}}))  // Min negative
-                saturating_add = {1'b1, {(DATA_WIDTH-1){1'b0}}};
-            else
-                saturating_add = sum[DATA_WIDTH-1:0];
+            if ((a_e == 5'd31) || (b_e == 5'd31)) begin
+                if (a_e == 5'd31 && a_m != 0)      fp16_add_comb = a;
+                else if (b_e == 5'd31 && b_m != 0)  fp16_add_comb = b;
+                else fp16_add_comb = (a_e == 5'd31) ? a : b;
+            end else if (a_z && b_z) begin
+                fp16_add_comb = {a_s & b_s, 15'd0};
+            end else if (a_z) begin
+                fp16_add_comb = b;
+            end else if (b_z) begin
+                fp16_add_comb = a;
+            end else begin
+                if (a_e > b_e || (a_e == b_e && a_m >= b_m)) begin
+                    lg_s = a_s; lg_e = a_e; lg_mr = a_m;
+                    sm_s = b_s; sm_e = b_e; sm_mr = b_m;
+                end else begin
+                    lg_s = b_s; lg_e = b_e; lg_mr = b_m;
+                    sm_s = a_s; sm_e = a_e; sm_mr = a_m;
+                end
+                res_s = lg_s;
+                eff_sub = lg_s ^ sm_s;
+                ediff = lg_e - sm_e;
+                shift = (ediff > 5'd14) ? 4'd14 : ediff[3:0];
+                lg_ext = {1'b1, lg_mr, 3'b000};
+                sm_ext = {1'b1, sm_mr, 3'b000};
+                aligned = sm_ext >> shift;
+                restored = aligned << shift;
+                sticky = (restored != sm_ext);
+                if (eff_sub)
+                    sum_m = {1'b0, lg_ext} - {1'b0, aligned} - {14'd0, sticky};
+                else
+                    sum_m = {1'b0, lg_ext} + {1'b0, aligned};
+
+                if (sum_m == 15'd0) begin
+                    fp16_add_comb = 16'd0;
+                end else begin
+                    lzc = 4'd15;
+                    for (k = 14; k >= 0; k = k - 1)
+                        if (sum_m[k] && lzc == 4'd15) lzc = 14 - k;
+                    norm_sticky = sticky;
+                    if (lzc == 4'd0) begin
+                        norm_sticky = sticky | sum_m[0];
+                        norm_m = {1'b0, sum_m[14:1]};
+                        norm_e = {1'b0, lg_e} + 6'd1;
+                    end else if (lzc == 4'd1) begin
+                        norm_m = sum_m;
+                        norm_e = {1'b0, lg_e};
+                    end else begin
+                        norm_m = sum_m << (lzc - 4'd1);
+                        norm_e = {1'b0, lg_e} - {2'd0, lzc} + 6'd1;
+                    end
+                    fmant = norm_m[12:3];
+                    g = norm_m[2]; r = norm_m[1];
+                    s_all = norm_m[0] | norm_sticky;
+                    rup = g && (r || s_all || fmant[0]);
+                    rounded = {1'b0, fmant} + {10'd0, rup};
+                    if (rounded[10]) begin
+                        rmant = 10'd0; rexp = norm_e + 6'd1;
+                    end else begin
+                        rmant = rounded[9:0]; rexp = norm_e;
+                    end
+                    if (rexp >= 6'd31)
+                        fp16_add_comb = {res_s, 5'b11111, 10'd0};
+                    else if (rexp[5] || rexp == 6'd0)
+                        fp16_add_comb = {res_s, 15'd0};
+                    else
+                        fp16_add_comb = {res_s, rexp[4:0], rmant};
+                end
+            end
         end
     endfunction
 

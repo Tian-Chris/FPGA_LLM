@@ -21,8 +21,8 @@ module tb_cosim_activation;
     wire [DATA_WIDTH-1:0] mem_wr_data;
 
     // Memory model
-    reg signed [DATA_WIDTH-1:0] input_mem [0:255];
-    reg signed [DATA_WIDTH-1:0] output_mem [0:255];
+    reg [DATA_WIDTH-1:0] input_mem [0:255];
+    reg [DATA_WIDTH-1:0] output_mem [0:255];
 
     integer i, fd;
 
@@ -50,9 +50,18 @@ module tb_cosim_activation;
     end
 
     // Capture writes
+    integer cycle_cnt;
+    initial cycle_cnt = 0;
     always @(posedge clk) begin
-        if (mem_wr_en)
+        cycle_cnt = cycle_cnt + 1;
+        if (mem_wr_en) begin
             output_mem[mem_wr_addr] <= mem_wr_data;
+            $display("T=%0d WRITE: addr=%0d data=%04x", cycle_cnt, mem_wr_addr, mem_wr_data);
+        end
+        if (mem_rd_en)
+            $display("T=%0d READ:  addr=%0d", cycle_cnt, mem_rd_addr);
+        if (mem_rd_valid)
+            $display("T=%0d RDATA: data=%04x", cycle_cnt, mem_rd_data);
     end
 
     initial begin

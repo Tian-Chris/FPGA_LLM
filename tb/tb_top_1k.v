@@ -17,7 +17,7 @@
 //   1. Backdoor preloading of shared prefetch HBM memories via $readmemh
 //   2. URAM preloading of initial embeddings
 //   3. AXI-Lite configuration (batch=1, seq_len=32)
-//   4. Flush-to-load memory mirroring (u_hbm_flush -> shared prefetch act/wgt HBMs)
+//   4. Single shared u_hbm instance (no flush-to-load mirroring needed)
 //   5. FSM state transition monitor with step_idx/head_cnt
 //   6. Post-simulation URAM + HBM dumps for Python golden comparison
 //
@@ -54,9 +54,10 @@ module tb_top_1k;
 
     // Weight/act base addresses
     localparam WEIGHT_BASE = 0;
-    localparam ACT_BASE    = 786688;       // LAYER_SIZE (production)
+    localparam ACT_BASE    = 787264;       // LAYER_SIZE (production, with biases)
     localparam KV_BASE     = ACT_BASE + 6 * 128 * 1024 / 16;  // after activation scratch
     localparam OUTPUT_BASE = 32'h8000;
+    localparam DEBUG_BASE  = TB_HBM_DEPTH - 512;  // Last 512 words for debug trace
 
     // =========================================================================
     // Signals
@@ -88,7 +89,6 @@ module tb_top_1k;
     integer dump_row, dump_col;
     integer dump_addr;
     integer dump_fd;
-    integer mirror_r, mirror_c, mirror_addr;
 
     // =========================================================================
     // Clock Generation
@@ -162,19 +162,16 @@ module tb_top_1k;
         // Wait for sim_hbm_port zero-init to complete, then overwrite
         #1;
 
-        // Load weight + activation data into shared prefetch HBM ports.
+        // Load weight + activation + DMA data into shared HBM.
         // Weight data at addresses 0..786687, activation data at 786688+.
         // Load wgt first, then act on top (non-overlapping regions).
 
-        // Shared weight prefetch HBM
-        $readmemh("verify/test_data/hbm_wgt_1k_full.hex", dut.u_hbm_pf_wgt.mem);
-        $readmemh("verify/test_data/hbm_act_1k_full.hex", dut.u_hbm_pf_wgt.mem);
-        // Shared activation prefetch HBM
-        $readmemh("verify/test_data/hbm_wgt_1k_full.hex", dut.u_hbm_pf_act.mem);
-        $readmemh("verify/test_data/hbm_act_1k_full.hex", dut.u_hbm_pf_act.mem);
+        // Shared HBM: weights + activations
+        $readmemh("verify/test_data/hbm_wgt_1k_full.hex", dut.u_hbm.mem);
+        $readmemh("verify/test_data/hbm_act_1k_full.hex", dut.u_hbm.mem);
 
-        // Load DMA HBM data (LN params + embeddings for residual add)
-        $readmemh("verify/test_data/hbm_dma_1k_full.hex", dut.u_hbm_dma.mem);
+        // DMA data (LN params + embeddings for residual add) — same shared HBM
+        $readmemh("verify/test_data/hbm_dma_1k_full.hex", dut.u_hbm.mem);
 
         // GPT-2 pre-norm: backdoor-preload URAM with initial embeddings.
         // LN1 is the FIRST step and reads data from URAM. The URAM must already
@@ -185,7 +182,7 @@ module tb_top_1k;
             for (uram_c = 0; uram_c < MODEL_STRIDE_L; uram_c = uram_c + 1) begin
                 uram_src = URAM_EMBED_SRC + uram_r * MODEL_STRIDE_L + uram_c;
                 dut.u_uram.mem[uram_r * URAM_COL_WORDS_HW + uram_c] =
-                    dut.u_hbm_pf_act.mem[uram_src];
+                    dut.u_hbm.mem[uram_src];
             end
         end
 
@@ -226,6 +223,8 @@ module tb_top_1k;
         axi_write(32'h14, ACT_BASE);
         axi_write(32'h24, KV_BASE);
         axi_write(32'h18, OUTPUT_BASE);
+        axi_write(32'h28, NUM_ENC_LAYERS);  // num_layers
+        axi_write(32'h2C, DEBUG_BASE);  // debug trace base
 
         // Start inference
         $display("[%0t] tb_top_1k: AXI config done, starting inference", $time);
@@ -269,11 +268,24 @@ module tb_top_1k;
             $fflush();
         end else begin
             for (dump_addr = 0; dump_addr < TB_HBM_DEPTH; dump_addr = dump_addr + 1) begin
-                $fwrite(dump_fd, "%064h\n", dut.u_hbm_flush.mem[dump_addr]);
+                $fwrite(dump_fd, "%064h\n", dut.u_hbm.mem[dump_addr]);
             end
             $fclose(dump_fd);
             $display("[%0t] Dumped flush HBM to verify/test_data/hbm_flush_1k_full_dump.hex (%0d words)",
                      $time, TB_HBM_DEPTH);
+            $fflush();
+        end
+
+        // --- Debug trace dump ---
+        dump_fd = $fopen("verify/test_data/debug_trace_1k.hex", "w");
+        if (dump_fd != 0) begin
+            for (dump_addr = DEBUG_BASE; dump_addr < DEBUG_BASE + 512; dump_addr = dump_addr + 1) begin
+                if (dut.u_hbm.mem[dump_addr] != 256'd0) begin
+                    $fwrite(dump_fd, "%064h\n", dut.u_hbm.mem[dump_addr]);
+                end
+            end
+            $fclose(dump_fd);
+            $display("[%0t] Dumped debug trace to verify/test_data/debug_trace_1k.hex", $time);
             $fflush();
         end
 
@@ -293,60 +305,44 @@ module tb_top_1k;
                      $time, prev_state, dut.u_fsm.state,
                      dut.u_fsm.layer_cnt, dut.u_fsm.step_idx,
                      dut.u_fsm.qkv_phase, dut.u_fsm.head_cnt);
+            // Dump URAM rows 0+1 at ALL step transitions (NEXT_STEP→DECODE)
+            if (prev_state == 5'd14 && dut.u_fsm.state == 5'd1) begin
+                // Row 0 first word (always)
+                $display("[URAM step=%0d] row0 cw0[0:3]=%04h %04h %04h %04h",
+                         dut.u_fsm.step_idx,
+                         dut.u_uram.mem[0][15:0], dut.u_uram.mem[0][31:16],
+                         dut.u_uram.mem[0][47:32], dut.u_uram.mem[0][63:48]);
+                // Row 1 first word (always) — mem[256] = row 1, col_word 0
+                $display("[URAM step=%0d] row1 cw0[0:3]=%04h %04h %04h %04h",
+                         dut.u_fsm.step_idx,
+                         dut.u_uram.mem[256][15:0], dut.u_uram.mem[256][31:16],
+                         dut.u_uram.mem[256][47:32], dut.u_uram.mem[256][63:48]);
+                // For FFN1/GELU/FFN2 steps: dump deeper columns
+                if (dut.u_fsm.step_idx >= 4'd10 && dut.u_fsm.step_idx <= 4'd13) begin
+                    $display("[URAM step=%0d] row0 cw2[32:35]=%04h %04h %04h %04h",
+                             dut.u_fsm.step_idx,
+                             dut.u_uram.mem[2][15:0], dut.u_uram.mem[2][31:16],
+                             dut.u_uram.mem[2][47:32], dut.u_uram.mem[2][63:48]);
+                    $display("[URAM step=%0d] row0 cw100[1600:1603]=%04h %04h %04h %04h",
+                             dut.u_fsm.step_idx,
+                             dut.u_uram.mem[100][15:0], dut.u_uram.mem[100][31:16],
+                             dut.u_uram.mem[100][47:32], dut.u_uram.mem[100][63:48]);
+                    $display("[URAM step=%0d] row1 cw2[32:35]=%04h %04h %04h %04h",
+                             dut.u_fsm.step_idx,
+                             dut.u_uram.mem[258][15:0], dut.u_uram.mem[258][31:16],
+                             dut.u_uram.mem[258][47:32], dut.u_uram.mem[258][63:48]);
+                end
+            end
             $fflush();
             prev_state <= dut.u_fsm.state;
         end
     end
 
     // =========================================================================
-    // Flush-to-Load Memory Mirroring (Region-Tracked, Shared Prefetch Ports)
+    // Flush-to-Load Memory Mirroring — NOT NEEDED with shared u_hbm
     // =========================================================================
-    reg uf_done_prev;
-    reg [27:0] saved_flush_base;
-    reg [27:0] saved_flush_stride;
-    reg [9:0]  saved_flush_rows;
-    reg [7:0]  saved_flush_cols;
-    reg        flush_params_valid;
-
-    initial begin
-        uf_done_prev = 0;
-        saved_flush_base = 0;
-        saved_flush_stride = 0;
-        saved_flush_rows = 0;
-        saved_flush_cols = 0;
-        flush_params_valid = 0;
-    end
-
-    always @(posedge clk) begin
-        if (rst_n) begin
-            // Capture flush parameters when flush starts
-            if (dut.u_fsm.uram_flush_start) begin
-                saved_flush_base   <= dut.u_fsm.uram_flush_hbm_base;
-                saved_flush_stride <= dut.u_fsm.uram_flush_hbm_stride;
-                saved_flush_rows   <= dut.u_fsm.uram_flush_num_rows;
-                saved_flush_cols   <= dut.u_fsm.uram_flush_num_col_words;
-                flush_params_valid <= 1'b1;
-            end
-
-            // Mirror on flush done — iterate exact flush region
-            uf_done_prev <= dut.uf_done;
-            if (dut.uf_done && !uf_done_prev && flush_params_valid) begin
-                for (mirror_r = 0; mirror_r <= saved_flush_rows; mirror_r = mirror_r + 1) begin
-                    for (mirror_c = 0; mirror_c <= saved_flush_cols; mirror_c = mirror_c + 1) begin
-                        mirror_addr = saved_flush_base + mirror_r * saved_flush_stride + mirror_c;
-                        // Mirror to shared prefetch HBM ports
-                        dut.u_hbm_pf_act.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.u_hbm_pf_wgt.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                    end
-                end
-                flush_params_valid <= 1'b0;
-                $display("[%0t] FLUSH MIRROR: base=%0d stride=%0d rows=%0d cols=%0d (state=%0d)",
-                         $time, saved_flush_base, saved_flush_stride,
-                         saved_flush_rows + 1, saved_flush_cols + 1, dut.u_fsm.state);
-                $fflush();
-            end
-        end
-    end
+    // With a single shared HBM instance, flush writes are immediately visible
+    // to all readers. No mirroring required.
 
     // =========================================================================
     // Timeout Watchdog (600s = 600,000,000,000 time units at 10ns)

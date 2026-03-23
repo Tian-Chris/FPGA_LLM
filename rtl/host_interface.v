@@ -22,6 +22,8 @@
 //   0x18: Output HBM Base [27:0]
 //   0x1C: Decode Mode [0] (0=prefill, 1=decode)
 //   0x20: Cache Length [15:0] (valid K/V rows already in cache)
+//   0x28: Number of Layers [15:0] (default = NUM_ENC_LAYERS)
+//   0x2C: Debug HBM Base [27:0] (word address for debug trace writes)
 //
 // Compatible with Verilator: no X/Z, no SystemVerilog.
 // =============================================================================
@@ -70,6 +72,12 @@ module host_interface #(
     output reg                          decode_mode,
     output reg  [DIM_WIDTH-1:0]         cache_len,
 
+    // Layer count (runtime-configurable, default = compile-time NUM_ENC_LAYERS)
+    output reg  [DIM_WIDTH-1:0]         num_layers,
+
+    // Debug trace base address
+    output reg  [HBM_ADDR_W-1:0]       debug_base,
+
     // Status inputs from FSM
     input  wire                         done,
     input  wire                         busy,
@@ -90,6 +98,8 @@ module host_interface #(
     localparam ADDR_DECODE_MODE = 8'h1C;
     localparam ADDR_CACHE_LEN   = 8'h20;
     localparam ADDR_KV_BASE     = 8'h24;
+    localparam ADDR_NUM_LAYERS  = 8'h28;
+    localparam ADDR_DEBUG_BASE  = 8'h2C;
 
     // -------------------------------------------------------------------------
     // Internal Registers
@@ -129,6 +139,8 @@ module host_interface #(
             output_base   <= {HBM_ADDR_W{1'b0}};
             decode_mode   <= 1'b0;
             cache_len     <= {DIM_WIDTH{1'b0}};
+            num_layers    <= 16'd2;  // safe default for FPGA debug (host overrides)
+            debug_base    <= {HBM_ADDR_W{1'b0}};
         end else begin
             start_pulse <= 1'b0;
 
@@ -176,6 +188,12 @@ module host_interface #(
                         end
                         ADDR_CACHE_LEN: begin
                             cache_len <= s_axi_wdata[DIM_WIDTH-1:0];
+                        end
+                        ADDR_NUM_LAYERS: begin
+                            num_layers <= s_axi_wdata[DIM_WIDTH-1:0];
+                        end
+                        ADDR_DEBUG_BASE: begin
+                            debug_base <= s_axi_wdata[HBM_ADDR_W-1:0];
                         end
                     endcase
 
@@ -257,6 +275,12 @@ module host_interface #(
                             end
                             ADDR_CACHE_LEN: begin
                                 s_axi_rdata <= {16'd0, cache_len};
+                            end
+                            ADDR_NUM_LAYERS: begin
+                                s_axi_rdata <= {16'd0, num_layers};
+                            end
+                            ADDR_DEBUG_BASE: begin
+                                s_axi_rdata <= {{(32-HBM_ADDR_W){1'b0}}, debug_base};
                             end
                             default: begin
                                 s_axi_rdata <= 32'hDEADBEEF;

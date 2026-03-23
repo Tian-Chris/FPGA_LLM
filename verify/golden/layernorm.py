@@ -1,125 +1,133 @@
-"""Golden model for layernorm.v — 3-pass layer normalization.
+"""Golden model for layernorm.v — FP16/FP32 layer normalization.
 
-Replicates:
-  - L111-118: rsqrt LUT initialization
-  - L265-283: divide_by_dim (arithmetic right shift for power-of-2 dims)
-  - L286-294: compute_sq_diff
-  - L297-326: normalize_elem
+Pass 1: FP32 sum of FP16 inputs, mean = sum * (1/dim)
+Pass 2: FP32 variance = sum((x - mean)^2) * (1/dim)
+Rsqrt:  Quake fast inverse sqrt + 1 Newton-Raphson iteration
+Pass 3: out = FP16((x_fp32 - mean) * inv_std * gamma_fp32 + beta_fp32)
 """
 
-from .common import int16, int32, saturate_int8
+import numpy as np
+import struct
 
 
-def _build_rsqrt_lut():
-    """Build the exact rsqrt LUT from layernorm.v L111-118."""
-    lut = [0] * 256
-    lut[0] = 0xFFFF
-    for i in range(1, 256):
-        lut[i] = (256 * 16) // i
-    return lut
+def _fp16_to_fp32(bits):
+    """Convert FP16 bit pattern to numpy float32."""
+    return float(np.uint16(bits).view(np.float16).astype(np.float32))
 
 
-RSQRT_LUT = _build_rsqrt_lut()
+def _fp32_bits(f):
+    """Get FP32 bit pattern from float."""
+    return struct.unpack('<I', struct.pack('<f', np.float32(f)))[0]
 
-# Power-of-2 dimension -> shift amount (matches RTL L271-281)
-_DIM_SHIFT = {
-    4: 2, 8: 3, 16: 4, 32: 5, 64: 6, 128: 7, 256: 8, 512: 9, 1024: 10,
+
+def _bits_to_fp32(bits):
+    """Convert FP32 bit pattern to float."""
+    return struct.unpack('<f', struct.pack('<I', bits & 0xFFFFFFFF))[0]
+
+
+def _fp32_to_fp16_bits(f):
+    """Convert float to FP16 bit pattern (round-to-nearest-even, subnormal flush)."""
+    fp16 = np.float32(f).astype(np.float16)
+    return int(fp16.view(np.uint16))
+
+
+# Power-of-2 reciprocals matching fp32_recip_dim in fp_funcs.vh
+_RECIP_DIM = {
+    4: 0.25, 8: 0.125, 16: 0.0625, 32: 1/32, 64: 1/64,
+    128: 1/128, 256: 1/256, 512: 1/512, 1024: 1/1024,
 }
 
 
-def divide_by_dim(val, dim):
-    """Replicate layernorm.v divide_by_dim (L265-283).
+def _quake_rsqrt(var_eps_bits):
+    """Quake fast inverse sqrt + 1 Newton-Raphson iteration.
 
-    Arithmetic right shift for power-of-2 dims, default shift=8.
+    Replicates ST_COMP_RSQRT in layernorm.v exactly:
+    Step 0: y0 = 0x5F3759DF - (bits >> 1), half_v = 0.5 * var_eps
+    Step 1: y_sq = y0 * y0
+    Step 2: half_v_y_sq = half_v * y_sq
+    Step 3: factor = 1.5 - half_v_y_sq
+    Step 4: inv_std = y0 * factor
     """
-    shift = _DIM_SHIFT.get(dim, 8)
-    val = int32(val)
-    return val >> shift  # Python >> on negative ints is arithmetic
+    var_eps = _bits_to_fp32(var_eps_bits)
+
+    # Step 0: initial estimate (integer trick on FP32 bit pattern)
+    y0_bits = (0x5F3759DF - (var_eps_bits >> 1)) & 0xFFFFFFFF
+    y0 = _bits_to_fp32(y0_bits)
+    half_v = np.float32(np.float32(0.5) * np.float32(var_eps))
+
+    # Step 1: y_sq = y0 * y0
+    y_sq = np.float32(np.float32(y0) * np.float32(y0))
+
+    # Step 2: half_v_y_sq = half_v * y_sq
+    half_v_y_sq = np.float32(half_v * y_sq)
+
+    # Step 3: factor = 1.5 - half_v_y_sq
+    factor = np.float32(np.float32(1.5) - half_v_y_sq)
+
+    # Step 4: inv_std = y0 * factor
+    inv_std = np.float32(np.float32(y0) * factor)
+
+    return inv_std
 
 
-def compute_rsqrt(var_in):
-    """Replicate layernorm.v compute_rsqrt (L123-137)."""
-    var_in = var_in & 0xFFFFFFFF
-    if var_in < 8:
-        lut_addr = 1
-    elif var_in > 0x00FFFF:
-        lut_addr = 0xFF
-    else:
-        lut_addr = (var_in >> 8) & 0xFF
-    return RSQRT_LUT[lut_addr]
-
-
-def normalize_elem(x, mean, inv_std, gamma, beta):
-    # 1. Cast inputs to proper signed integers first
-    x_s = int16(x)
-    m_s = int32(mean)
-    
-    # 2. Centered must be SIGNED. x - mean
-    centered_s = int32(x_s - m_s) 
-
-    # 3. Multiply by inv_std (which is effectively a fractional scale)
-    # If your RTL uses a logical shift, it implies the hardware is 
-    # treating the product as a large signed block.
-    normalized_product = int32(centered_s * (inv_std & 0xFFFF))
-    normalized_s = normalized_product >> 8 
-
-    # 4. Handle Gamma and Beta (Sign-extend from 8-bit)
-    gamma_s = gamma if gamma < 128 else gamma - 256
-    beta_s = beta if beta < 128 else beta - 256
-
-    # 5. Apply Scaling (Matches RTL: scaled_product >> 7)
-    scaled_product = int32(normalized_s * gamma_s)
-    scaled = scaled_product >> 7
-
-    # 6. Add Beta (RTL: result = scaled + beta, no shift on beta)
-    result = int32(scaled + beta_s)
-
-    # 7. Saturate to INT16 and return as unsigned 16-bit
-    val = max(-32768, min(32767, result))
-    return val & 0xFFFF
-
-def compute_sq_diff(x, mean):
-    # This must be signed to be mathematically correct
-    x_s = int16(x)
-    m_s = int32(mean)
-    diff = int32(x_s - m_s)
-    return (diff * diff) & 0xFFFFFFFF
-
-def layernorm_golden(input_vec, gamma_vec, beta_vec, dim):
-    """Full 3-pass layernorm computation.
+def layernorm_golden(input_bits, gamma_bits, beta_bits, dim):
+    """Full 3-pass FP16/FP32 layernorm.
 
     Args:
-        input_vec: list of INT16 values
-        gamma_vec: list of INT8 gamma values
-        beta_vec:  list of INT8 beta values
-        dim:       vector dimension (must be power of 2)
+        input_bits: list of FP16 bit patterns (uint16)
+        gamma_bits: list of FP16 bit patterns (uint16)
+        beta_bits:  list of FP16 bit patterns (uint16)
+        dim:        vector dimension (must be power of 2)
     Returns:
-        list of INT16 normalized values (unsigned 16-bit representation)
+        list of FP16 bit patterns (uint16)
     """
-    assert len(input_vec) == dim
-    assert len(gamma_vec) == dim
-    assert len(beta_vec) == dim
+    assert len(input_bits) == dim
+    assert len(gamma_bits) == dim
+    assert len(beta_bits) == dim
 
-    # Pass 1: Compute mean (L179-198)
-    total = 0
-    for x in input_vec:
-        total = int32(total + int16(x))
-    mean = divide_by_dim(total, dim)
+    recip = np.float32(_RECIP_DIM.get(dim, 1/256))
 
-    # Pass 2: Compute variance (L203-219)
-    var_sum = 0
-    for x in input_vec:
-        var_sum = (var_sum + compute_sq_diff(x, mean)) & 0xFFFFFFFF
+    # Pass 1: Mean (FP32 accumulation)
+    fp32_sum = np.float32(0.0)
+    for bits in input_bits:
+        x_fp32 = np.float32(_fp16_to_fp32(bits))
+        fp32_sum = np.float32(fp32_sum + x_fp32)
+    mean = np.float32(fp32_sum * recip)
+    neg_mean_f = np.float32(-mean)
 
-    EPS = 1
-    variance = divide_by_dim(int32(var_sum), dim)
-    inv_std = compute_rsqrt((variance + EPS) & 0xFFFFFFFF)
+    # Pass 2: Variance (FP32 accumulation)
+    var_sum = np.float32(0.0)
+    for bits in input_bits:
+        x_fp32 = np.float32(_fp16_to_fp32(bits))
+        centered = np.float32(x_fp32 + neg_mean_f)
+        sq = np.float32(centered * centered)
+        var_sum = np.float32(var_sum + sq)
+    variance = np.float32(var_sum * recip)
 
-    # Pass 3: Normalize (L225-247)
+    # Add epsilon (1e-5 = 0x3727C5AC)
+    eps = _bits_to_fp32(0x3727C5AC)
+    var_eps = np.float32(variance + np.float32(eps))
+    var_eps_bits = _fp32_bits(var_eps)
+
+    # Rsqrt via Quake trick
+    inv_std = _quake_rsqrt(var_eps_bits)
+
+    # Pass 3: Normalize
     output = []
     for i in range(dim):
-        out = normalize_elem(input_vec[i], mean, inv_std,
-                             gamma_vec[i] & 0xFF, beta_vec[i] & 0xFF)
-        output.append(out)
+        x_fp32 = np.float32(_fp16_to_fp32(input_bits[i]))
+        gamma_fp32 = np.float32(_fp16_to_fp32(gamma_bits[i]))
+        beta_fp32 = np.float32(_fp16_to_fp32(beta_bits[i]))
+
+        # centered = x - mean
+        centered = np.float32(x_fp32 + neg_mean_f)
+        # normed = centered * inv_std
+        normed = np.float32(centered * inv_std)
+        # scaled = normed * gamma
+        scaled = np.float32(normed * gamma_fp32)
+        # result = scaled + beta
+        result = np.float32(scaled + beta_fp32)
+        # Convert to FP16
+        output.append(_fp32_to_fp16_bits(result))
 
     return output

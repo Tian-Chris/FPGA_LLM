@@ -2,7 +2,7 @@
 `include "defines.vh"
 
 // =============================================================================
-// tb_cosim_matmul.v — 32x32 INT16 Matmul Engine Co-Simulation Testbench
+// tb_cosim_matmul.v — 32x32 FP16 Matmul Engine Co-Simulation Testbench
 // =============================================================================
 // Protocol:
 //   1. Assert start for 1 cycle
@@ -43,12 +43,11 @@ module tb_cosim_matmul;
     wire [4:0] out_row, out_col;
     wire compute_done;
 
-    // Test data: flat arrays
-    // A is TILE*K_DIM = 1024 elements, B is K_DIM*TILE = 1024 elements
-    reg signed [DATA_W-1:0] mat_a [0:TILE*K_DIM-1];
-    reg signed [DATA_W-1:0] mat_b [0:K_DIM*TILE-1];
-    // Output: TILE*TILE = 1024 elements
-    reg signed [OUT_W-1:0]  result [0:TILE*TILE-1];
+    // Test data: flat arrays (FP16 bit patterns, unsigned)
+    reg [DATA_W-1:0] mat_a [0:TILE*K_DIM-1];
+    reg [DATA_W-1:0] mat_b [0:K_DIM*TILE-1];
+    // Output: TILE*TILE = 1024 elements (FP16 bit patterns)
+    reg [OUT_W-1:0]  result [0:TILE*TILE-1];
 
     integer i, j, k, fd, out_cnt;
 
@@ -71,6 +70,7 @@ module tb_cosim_matmul;
         .tile_start(tile_start), .tile_done(tile_done),
         .tile_row(tile_row), .tile_col(tile_col),
         .first_tile(first_tile),
+        .tile_k_limit(TILE - 1),  // Full TILE for cosim (k=TILE=32)
         .out_valid(out_valid), .out_data(out_data),
         .out_row(out_row), .out_col(out_col),
         .out_stall(1'b0),
@@ -78,7 +78,7 @@ module tb_cosim_matmul;
     );
 
     initial begin
-        // Load input matrices from hex files
+        // Load input matrices from hex files (FP16 bit patterns)
         $readmemh("verify/test_data/matmul_a.hex", mat_a);
         $readmemh("verify/test_data/matmul_b.hex", mat_b);
 
@@ -152,21 +152,18 @@ module tb_cosim_matmul;
         for (i = 0; i < 200; i = i + 1) begin
             @(posedge clk); #1;
             if (out_valid) begin
-                // Determine output position: out_row gives row, sub-col alternates 0/1
-                // Each out_valid writes BUS_EL (16) elements
                 for (j = 0; j < BUS_EL; j = j + 1) begin
                     result[out_row * TILE + (out_cnt & 1) * BUS_EL + j] =
-                        $signed(out_data[j*OUT_W +: OUT_W]);
+                        out_data[j*OUT_W +: OUT_W];
                 end
                 out_cnt = out_cnt + 1;
             end
             if (done) begin
-                // Capture final valid if present
                 i = 200;
             end
         end
 
-        // ---- Write output ----
+        // ---- Write output (FP16 bit patterns) ----
         fd = $fopen("verify/test_data/matmul_out.hex", "w");
         for (i = 0; i < TILE * TILE; i = i + 1)
             $fwrite(fd, "%04x\n", result[i][15:0]);

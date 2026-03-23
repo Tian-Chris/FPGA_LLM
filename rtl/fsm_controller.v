@@ -36,6 +36,7 @@ module fsm_controller #(
     input  wire [DIM_W-1:0]         seq_len,
     input  wire                     decode_mode,
     input  wire [DIM_W-1:0]         cache_len,
+    input  wire [DIM_W-1:0]         num_layers,
     (* mark_debug = "true" *) output reg                      done,
     (* mark_debug = "true" *) output reg                      busy,
 
@@ -56,6 +57,9 @@ module fsm_controller #(
     output reg  [HBM_ADDR_W-1:0]   mm_cmd_a_stride,
     output reg  [HBM_ADDR_W-1:0]   mm_cmd_b_stride,
     output reg  [7:0]               mm_cmd_out_col_offset,
+    output reg                      mm_cmd_has_bias,
+    output reg  [HBM_ADDR_W-1:0]   mm_cmd_bias_base,
+    output reg  [DIM_W-1:0]         mm_cmd_bias_words,
     (* mark_debug = "true" *) input  wire                     mm_cmd_ready,
     (* mark_debug = "true" *) input  wire                     mm_cmd_done,
 
@@ -72,7 +76,7 @@ module fsm_controller #(
     output reg  [3:0]               nm_cfg_col_bits,
     output reg                      nm_adapter_flush,
     (* mark_debug = "true" *) input  wire                     nm_adapter_flush_done,
-    output reg  [DIM_W-1:0]         nm_addr_offset,
+    output reg  [NM_ADDR_W-1:0]     nm_addr_offset,
 
     // act_dma base address control
     output reg  [HBM_ADDR_W-1:0]   act_dma_rd_base,
@@ -84,23 +88,27 @@ module fsm_controller #(
     output reg                      sm_start,
     output reg  [DIM_W-1:0]         sm_seq_len,
     output reg  [DIM_W-1:0]         sm_row_idx,
-    output reg  [3:0]               sm_scale_shift,
+    output reg  [15:0]              sm_scale_factor,
     (* mark_debug = "true" *) input  wire                     sm_done,
+    input  wire                     sm_busy,
 
     // LayerNorm controller interface
     output reg                      ln_start,
     output reg  [DIM_W-1:0]         ln_dim,
     (* mark_debug = "true" *) input  wire                     ln_done,
+    input  wire                     ln_busy,
 
     // Activation unit interface
     output reg                      act_start,
     output reg  [DIM_W-1:0]         act_dim,
     (* mark_debug = "true" *) input  wire                     act_done,
+    input  wire                     act_busy,
 
     // Residual add interface
     output reg                      res_start,
     output reg  [DIM_W-1:0]         res_dim,
     (* mark_debug = "true" *) input  wire                     res_done,
+    input  wire                     res_busy,
 
     // Quantization layer interface
     output reg                      quant_start,
@@ -111,7 +119,22 @@ module fsm_controller #(
 
     // Debug/status outputs
     output reg  [5:0]               current_state,
-    output reg  [DIM_W-1:0]         current_layer
+    output reg  [DIM_W-1:0]         current_layer,
+
+    // Debug trace to HBM
+    input  wire [HBM_ADDR_W-1:0]   debug_base,
+    output reg                      dbg_wr_valid,
+    output reg  [HBM_ADDR_W-1:0]   dbg_wr_addr,
+    output reg  [255:0]             dbg_wr_data,
+    input  wire                     dbg_wr_done,
+    input  wire                     dbg_wr_busy,
+
+    // URAM checkpoint read (post-layer activation dump to debug trace)
+    output reg                      chk_uram_rd_en,
+    output reg  [9:0]               chk_uram_rd_row,
+    output reg  [7:0]               chk_uram_rd_col,
+    input  wire [255:0]             chk_uram_rd_data,
+    input  wire                     chk_uram_rd_valid
 );
 
     // =====================================================================
@@ -128,7 +151,13 @@ module fsm_controller #(
     localparam LAYER_FFN2_OFFSET = LAYER_FFN1_OFFSET + MODEL_DIM * F_DIM / WE;
     localparam LAYER_LN1_OFFSET  = LAYER_FFN2_OFFSET + F_DIM * MODEL_DIM / WE;
     localparam LAYER_LN2_OFFSET  = LAYER_LN1_OFFSET + 2 * MODEL_DIM / WE;
-    localparam LAYER_SIZE        = LAYER_LN2_OFFSET + 2 * MODEL_DIM / WE;
+
+    // Per-layer bias offsets (appended after LN2 params)
+    localparam LAYER_BIAS_QKV_OFFSET  = LAYER_LN2_OFFSET + 2 * MODEL_DIM / WE;
+    localparam LAYER_BIAS_PROJ_OFFSET = LAYER_BIAS_QKV_OFFSET + 3 * MODEL_DIM / WE;
+    localparam LAYER_BIAS_FFN1_OFFSET = LAYER_BIAS_PROJ_OFFSET + MODEL_DIM / WE;
+    localparam LAYER_BIAS_FFN2_OFFSET = LAYER_BIAS_FFN1_OFFSET + F_DIM / WE;
+    localparam LAYER_SIZE             = LAYER_BIAS_FFN2_OFFSET + MODEL_DIM / WE;
 
     // Row strides
     localparam MODEL_STRIDE = MODEL_DIM / WE;
@@ -216,7 +245,20 @@ module fsm_controller #(
     reg [DIM_W-1:0] batch_r, seq_r;
     (* mark_debug = "true" *) reg              decode_r;
     reg [DIM_W-1:0]  cache_len_r;
+    reg [DIM_W-1:0]  num_layers_r;
     (* mark_debug = "true" *) reg [DIM_W-1:0] layer_cnt;
+
+    // Debug trace registers
+    reg [31:0]       dbg_cycle_cnt;
+    reg [DIM_W-1:0]  dbg_write_idx;
+    reg [HBM_ADDR_W-1:0] dbg_base_r;
+    reg              dbg_pending;   // 1 = waiting for debug write to complete
+
+    // Checkpoint dump registers
+    reg [2:0]        chk_col_idx;   // 0-3: which URAM col word to read
+    reg              chk_rd_issued; // 1 = waiting for URAM rd_valid
+    reg              chk_data_valid;// 1 = URAM data captured, ready to write
+    reg [255:0]      chk_data_r;   // captured URAM read data
     (* mark_debug = "true" *) reg [3:0]       step_idx;
     (* mark_debug = "true" *) reg [3:0]       step_bt;      // block type from decoded step
     reg [3:0]       step_cfg;     // config id from decoded step
@@ -271,6 +313,9 @@ module fsm_controller #(
             mm_cmd_a_stride  <= {HBM_ADDR_W{1'b0}};
             mm_cmd_b_stride  <= {HBM_ADDR_W{1'b0}};
             mm_cmd_out_col_offset <= 8'd0;
+            mm_cmd_has_bias  <= 1'b0;
+            mm_cmd_bias_base <= {HBM_ADDR_W{1'b0}};
+            mm_cmd_bias_words <= {DIM_W{1'b0}};
             uram_flush_start <= 1'b0;
             uram_flush_num_rows      <= 10'd0;
             uram_flush_num_col_words <= 8'd0;
@@ -279,14 +324,14 @@ module fsm_controller #(
             uram_flush_hbm_stride    <= {HBM_ADDR_W{1'b0}};
             nm_cfg_col_bits  <= 4'd10;
             nm_adapter_flush <= 1'b0;
-            nm_addr_offset   <= {DIM_W{1'b0}};
+            nm_addr_offset   <= {NM_ADDR_W{1'b0}};
             nm_row_cnt       <= {DIM_W{1'b0}};
             act_dma_rd_base  <= {HBM_ADDR_W{1'b0}};
             act_dma_wr_base  <= {HBM_ADDR_W{1'b0}};
             act_dma_flush    <= 1'b0;
             sm_start         <= 1'b0;
             sm_row_idx       <= {DIM_W{1'b0}};
-            sm_scale_shift   <= 4'd0;
+            sm_scale_factor  <= 16'd0;
             ln_start         <= 1'b0;
             act_start        <= 1'b0;
             res_start        <= 1'b0;
@@ -305,6 +350,21 @@ module fsm_controller #(
             qkv_phase        <= 2'd0;
             decode_r         <= 1'b0;
             cache_len_r      <= {DIM_W{1'b0}};
+            num_layers_r     <= {DIM_W{1'b0}};
+            dbg_cycle_cnt    <= 32'd0;
+            dbg_write_idx    <= {DIM_W{1'b0}};
+            dbg_base_r       <= {HBM_ADDR_W{1'b0}};
+            dbg_wr_valid     <= 1'b0;
+            dbg_wr_addr      <= {HBM_ADDR_W{1'b0}};
+            dbg_wr_data      <= 256'd0;
+            dbg_pending      <= 1'b0;
+            chk_uram_rd_en   <= 1'b0;
+            chk_uram_rd_row  <= 10'd0;
+            chk_uram_rd_col  <= 8'd0;
+            chk_col_idx      <= 3'd0;
+            chk_rd_issued    <= 1'b0;
+            chk_data_valid   <= 1'b0;
+            chk_data_r       <= 256'd0;
             waiting_mm       <= 1'b0;
             nm_flush_phase   <= 1'b0;
             head_cnt         <= {DIM_W{1'b0}};
@@ -317,9 +377,13 @@ module fsm_controller #(
             current_state    <= 6'd0;
             current_layer    <= {DIM_W{1'b0}};
         end else begin
+            // Cycle counter (runs while busy)
+            if (busy) dbg_cycle_cnt <= dbg_cycle_cnt + 32'd1;
+
             // Default: clear one-shot signals
             done             <= 1'b0;
             mm_cmd_valid     <= 1'b0;
+            dbg_wr_valid     <= 1'b0;
             sm_start         <= 1'b0;
             ln_start         <= 1'b0;
             act_start        <= 1'b0;
@@ -328,6 +392,7 @@ module fsm_controller #(
             uram_flush_start <= 1'b0;
             nm_adapter_flush <= 1'b0;
             act_dma_flush    <= 1'b0;
+            chk_uram_rd_en   <= 1'b0;
 
             // Debug
             current_state <= {1'b0, state};
@@ -343,12 +408,16 @@ module fsm_controller #(
                         seq_r       <= seq_len;
                         decode_r    <= decode_mode;
                         cache_len_r <= cache_len;
+                        num_layers_r <= num_layers;
+                        dbg_base_r   <= debug_base;
+                        dbg_cycle_cnt <= 32'd0;
+                        dbg_write_idx <= {DIM_W{1'b0}};
                         layer_cnt   <= {DIM_W{1'b0}};
                         step_idx  <= 4'd0;
                         qkv_phase <= 2'd0;
                         head_cnt       <= {DIM_W{1'b0}};
                         nm_row_cnt     <= {DIM_W{1'b0}};
-                        nm_addr_offset <= {DIM_W{1'b0}};
+                        nm_addr_offset <= {NM_ADDR_W{1'b0}};
                         state     <= S_DECODE;
                         // synthesis translate_off
                         $display("[FSM %0t] START: batch=%0d seq=%0d decode=%0d cache_len=%0d",
@@ -386,7 +455,7 @@ module fsm_controller #(
                 // ---------------------------------------------------------
                 S_LN_RUN: begin
                     if (!nm_flush_phase) begin
-                        if (!ln_start && !ln_done) begin
+                        if (!ln_start && !ln_done && !ln_busy) begin
                             nm_cfg_col_bits <= CFG_COL_MOD;
                             nm_addr_offset  <= nm_row_cnt * MODEL_DIM;
                             case (step_cfg)
@@ -405,7 +474,7 @@ module fsm_controller #(
                             // synthesis translate_on
                             if (nm_row_cnt == bt - 1) begin
                                 nm_row_cnt     <= {DIM_W{1'b0}};
-                                nm_addr_offset <= {DIM_W{1'b0}};
+                                nm_addr_offset <= {NM_ADDR_W{1'b0}};
                                 nm_flush_phase <= 1'b1;
                             end else begin
                                 nm_row_cnt <= nm_row_cnt + 1;
@@ -449,6 +518,14 @@ module fsm_controller #(
                             2'd0: mm_cmd_b_base <= layer_wgt_base + LAYER_WQ_OFFSET;
                             2'd1: mm_cmd_b_base <= layer_wgt_base + LAYER_WK_OFFSET;
                             default: mm_cmd_b_base <= layer_wgt_base + LAYER_WV_OFFSET;
+                        endcase
+                        // Bias: QKV bias split per phase (Q=0..1023, K=1024..2047, V=2048..3071)
+                        mm_cmd_has_bias   <= 1'b1;
+                        mm_cmd_bias_words <= MODEL_DIM / WE;
+                        case (qkv_phase)
+                            2'd0: mm_cmd_bias_base <= layer_wgt_base + LAYER_BIAS_QKV_OFFSET;
+                            2'd1: mm_cmd_bias_base <= layer_wgt_base + LAYER_BIAS_QKV_OFFSET + MODEL_DIM / WE;
+                            default: mm_cmd_bias_base <= layer_wgt_base + LAYER_BIAS_QKV_OFFSET + 2 * MODEL_DIM / WE;
                         endcase
                         case (qkv_phase)
                             2'd0: flush_hbm_base <= act_base + ACT_Q_OFFSET;
@@ -512,6 +589,7 @@ module fsm_controller #(
                         mm_cmd_a_stride <= MODEL_STRIDE;
                         mm_cmd_b_stride <= MODEL_STRIDE;
                         mm_cmd_out_col_offset <= 8'd0;
+                        mm_cmd_has_bias <= 1'b0;
                         flush_hbm_base      <= act_base + ACT_ATTN_OFFSET;
                         flush_hbm_stride    <= decode_r ? cache_total_words : seq_words;
                         flush_num_rows      <= decode_r ? 10'd0 : (seq_r - 1);
@@ -530,18 +608,23 @@ module fsm_controller #(
                 // ---------------------------------------------------------
                 S_ATT_SM: begin
                     if (!nm_flush_phase) begin
-                        if (!sm_start && !sm_done) begin
+                        if (!sm_start && !sm_done && !sm_busy) begin
                             nm_cfg_col_bits <= CFG_COL_SEQ;
-                            nm_addr_offset  <= nm_row_cnt * (decode_r ? cache_total : seq_r);
+                            // Offset must align with 2^cfg_col_bits (URAM row boundary),
+                            // not the logical seq_r. The matmul stores each score row in
+                            // its own URAM row, so the adapter stride must match col_bits.
+                            // Decode mode has only 1 row (nm_row_cnt=0), so offset=0.
+                            nm_addr_offset  <= decode_r ? {NM_ADDR_W{1'b0}}
+                                             : (nm_row_cnt << CFG_COL_SEQ);
                             sm_start       <= 1'b1;
                             sm_seq_len     <= decode_r ? cache_total : seq_r;
                             sm_row_idx     <= decode_r ? cache_len_r : nm_row_cnt;
-                            sm_scale_shift <= SCALE_SHIFT;
+                            sm_scale_factor <= SCALE_FACTOR;
                         end
                         if (sm_done) begin
                             if (nm_row_cnt == bt - 1) begin
                                 nm_row_cnt     <= {DIM_W{1'b0}};
-                                nm_addr_offset <= {DIM_W{1'b0}};
+                                nm_addr_offset <= {NM_ADDR_W{1'b0}};
                                 nm_flush_phase <= 1'b1;
                             end else begin
                                 nm_row_cnt <= nm_row_cnt + 1;
@@ -590,6 +673,7 @@ module fsm_controller #(
                         mm_cmd_a_stride <= decode_r ? cache_total_words : seq_words;
                         mm_cmd_b_stride <= MODEL_STRIDE;
                         mm_cmd_out_col_offset <= head_cnt * HEAD_WORDS;
+                        mm_cmd_has_bias <= 1'b0;
                         flush_hbm_base      <= act_base + ACT_Q_OFFSET + head_cnt * HEAD_WORDS;
                         flush_hbm_stride    <= MODEL_STRIDE;
                         flush_num_rows      <= decode_r ? 10'd0 : (seq_r - 1);
@@ -635,6 +719,7 @@ module fsm_controller #(
                         mm_cmd_valid <= 1'b1;
                         mm_cmd_op    <= OP_MATMUL;
                         mm_cmd_out_col_offset <= 8'd0;
+                        mm_cmd_has_bias <= 1'b1;
                         case (step_cfg)
                             4'd0: begin  // PROJ: (BT, MODEL_DIM) x (MODEL_DIM, MODEL_DIM)
                                 mm_cmd_m       <= bt;
@@ -644,6 +729,8 @@ module fsm_controller #(
                                 mm_cmd_b_base  <= layer_wgt_base + LAYER_WO_OFFSET;
                                 mm_cmd_a_stride <= MODEL_STRIDE;
                                 mm_cmd_b_stride <= MODEL_STRIDE;
+                                mm_cmd_bias_base  <= layer_wgt_base + LAYER_BIAS_PROJ_OFFSET;
+                                mm_cmd_bias_words <= MODEL_DIM / WE;
                             end
                             4'd1: begin  // FFN1 from EMBED: (BT, MODEL_DIM) x (MODEL_DIM, F_DIM)
                                 mm_cmd_m       <= bt;
@@ -653,6 +740,8 @@ module fsm_controller #(
                                 mm_cmd_b_base  <= layer_wgt_base + LAYER_FFN1_OFFSET;
                                 mm_cmd_a_stride <= MODEL_STRIDE;
                                 mm_cmd_b_stride <= F_STRIDE;
+                                mm_cmd_bias_base  <= layer_wgt_base + LAYER_BIAS_FFN1_OFFSET;
+                                mm_cmd_bias_words <= F_DIM / WE;
                             end
                             4'd2: begin  // FFN1 from TEMP: (BT, MODEL_DIM) x (MODEL_DIM, F_DIM)
                                 mm_cmd_m       <= bt;
@@ -662,6 +751,8 @@ module fsm_controller #(
                                 mm_cmd_b_base  <= layer_wgt_base + LAYER_FFN1_OFFSET;
                                 mm_cmd_a_stride <= MODEL_STRIDE;
                                 mm_cmd_b_stride <= F_STRIDE;
+                                mm_cmd_bias_base  <= layer_wgt_base + LAYER_BIAS_FFN1_OFFSET;
+                                mm_cmd_bias_words <= F_DIM / WE;
                             end
                             default: begin  // FFN2: (BT, F_DIM) x (F_DIM, MODEL_DIM)
                                 mm_cmd_m       <= bt;
@@ -671,6 +762,8 @@ module fsm_controller #(
                                 mm_cmd_b_base  <= layer_wgt_base + LAYER_FFN2_OFFSET;
                                 mm_cmd_a_stride <= F_STRIDE;
                                 mm_cmd_b_stride <= MODEL_STRIDE;
+                                mm_cmd_bias_base  <= layer_wgt_base + LAYER_BIAS_FFN2_OFFSET;
+                                mm_cmd_bias_words <= MODEL_DIM / WE;
                             end
                         endcase
                         waiting_mm <= 1'b1;
@@ -686,13 +779,20 @@ module fsm_controller #(
                 // ---------------------------------------------------------
                 S_ACT_RUN: begin
                     if (!nm_flush_phase) begin
-                        if (!act_start && !act_done) begin
+                        if (!act_start && !act_done && !act_busy) begin
                             nm_cfg_col_bits <= CFG_COL_FFN;
+                            nm_addr_offset  <= nm_row_cnt * F_DIM;
                             act_start <= 1'b1;
-                            act_dim   <= bt * F_DIM;
+                            act_dim   <= F_DIM;
                         end
                         if (act_done) begin
-                            nm_flush_phase <= 1'b1;
+                            if (nm_row_cnt == bt - 1) begin
+                                nm_row_cnt     <= {DIM_W{1'b0}};
+                                nm_addr_offset <= {NM_ADDR_W{1'b0}};
+                                nm_flush_phase <= 1'b1;
+                            end else begin
+                                nm_row_cnt <= nm_row_cnt + 1;
+                            end
                         end
                     end else begin
                         if (!nm_adapter_flush && !nm_adapter_flush_done) begin
@@ -711,7 +811,7 @@ module fsm_controller #(
                 // ---------------------------------------------------------
                 S_RES_RUN: begin
                     if (!nm_flush_phase) begin
-                        if (!res_start && !res_done) begin
+                        if (!res_start && !res_done && !res_busy) begin
                             nm_cfg_col_bits <= CFG_COL_MOD;
                             act_dma_rd_base <= act_base + ACT_EMBED_OFFSET;
                             res_start <= 1'b1;
@@ -777,18 +877,123 @@ module fsm_controller #(
                     $display("[FSM %0t] NEXT_STEP: step_idx=%0d step_bt=%0d layer=%0d",
                              $time, step_idx, step_bt, layer_cnt);
                     // synthesis translate_on
-                    if (step_bt == BT_END) begin
-                        // Layer complete
-                        if (layer_cnt < NUM_ENC_LAYERS - 1) begin
-                            layer_cnt <= layer_cnt + 1;
-                            step_idx  <= 4'd0;
-                            state     <= S_DECODE;
+
+                    // Debug trace: fire write if enabled and not yet pending
+                    if (dbg_base_r != {HBM_ADDR_W{1'b0}} && !dbg_pending && !dbg_wr_busy) begin
+                        dbg_wr_valid <= 1'b1;
+                        dbg_wr_addr  <= dbg_base_r + dbg_write_idx;
+                        // Debug record: 256 bits total
+                        //   [31:0]    cycle_counter (32)
+                        //   [47:32]   layer_cnt (16)
+                        //   [55:48]   state (8)
+                        //   [63:56]   step_idx (8)
+                        //   [79:64]   step_bt:step_cfg (16)
+                        //   [95:80]   debug_write_idx (16)
+                        //   [123:96]  layer_wgt_base (28)
+                        //   [127:124] reserved (4)
+                        //   [143:128] mm_cmd_m (16)
+                        //   [159:144] mm_cmd_n (16)
+                        //   [175:160] mm_cmd_k (16)
+                        //   [191:176] head_cnt (16)
+                        //   [207:192] nm_row_cnt (16)
+                        //   [223:208] cache_len_r (16)
+                        //   [231:224] decode_r (8)
+                        //   [255:232] reserved (24)
+                        dbg_wr_data[31:0]    <= dbg_cycle_cnt;
+                        dbg_wr_data[47:32]   <= layer_cnt;
+                        dbg_wr_data[55:48]   <= {3'b0, state};
+                        dbg_wr_data[63:56]   <= {4'b0, step_idx};
+                        dbg_wr_data[79:64]   <= {step_bt, step_cfg, 8'd0};
+                        dbg_wr_data[95:80]   <= dbg_write_idx;
+                        dbg_wr_data[123:96]  <= layer_wgt_base;
+                        dbg_wr_data[127:124] <= 4'd0;
+                        dbg_wr_data[143:128] <= mm_cmd_m;
+                        dbg_wr_data[159:144] <= mm_cmd_n;
+                        dbg_wr_data[175:160] <= mm_cmd_k;
+                        dbg_wr_data[191:176] <= head_cnt;
+                        dbg_wr_data[207:192] <= nm_row_cnt;
+                        dbg_wr_data[223:208] <= cache_len_r;
+                        dbg_wr_data[231:224] <= {7'b0, decode_r};
+                        dbg_wr_data[255:232] <= 24'd0;
+                        dbg_pending  <= 1'b1;
+                    end
+
+                    // Wait for debug write to complete (or skip if debug disabled)
+                    if (dbg_base_r == {HBM_ADDR_W{1'b0}} || (dbg_pending && dbg_wr_done)) begin
+                        dbg_pending   <= 1'b0;
+                        dbg_write_idx <= dbg_write_idx + 1;
+                        if (step_bt == BT_END) begin
+                            // Checkpoint dump: read first 4 URAM words after layer
+                            if (dbg_base_r != {HBM_ADDR_W{1'b0}}) begin
+                                chk_col_idx   <= 3'd0;
+                                chk_rd_issued <= 1'b0;
+                                chk_data_valid <= 1'b0;
+                                state         <= S_CHECKPOINT;
+                            end else if (layer_cnt < num_layers_r - 1) begin
+                                layer_cnt <= layer_cnt + 1;
+                                step_idx  <= 4'd0;
+                                state     <= S_DECODE;
+                            end else begin
+                                state <= S_DONE;
+                            end
                         end else begin
-                            state <= S_DONE;
+                            step_idx <= step_idx + 1;
+                            state    <= S_DECODE;
                         end
-                    end else begin
-                        step_idx <= step_idx + 1;
-                        state    <= S_DECODE;
+                    end
+                end
+
+                // ---------------------------------------------------------
+                // S_CHECKPOINT: read 4 URAM words (row 0, cols 0-3) and
+                // write them as debug trace records after each layer
+                // ---------------------------------------------------------
+                S_CHECKPOINT: begin
+                    // Phase 1: Issue URAM read
+                    if (!chk_rd_issued && !chk_data_valid && !dbg_pending) begin
+                        chk_uram_rd_en  <= 1'b1;
+                        chk_uram_rd_row <= 10'd0;
+                        chk_uram_rd_col <= {5'd0, chk_col_idx};
+                        chk_rd_issued   <= 1'b1;
+                    end
+
+                    // Phase 2: Capture URAM data
+                    if (chk_rd_issued && chk_uram_rd_valid) begin
+                        chk_data_r     <= chk_uram_rd_data;
+                        chk_data_valid <= 1'b1;
+                        chk_rd_issued  <= 1'b0;
+                    end
+
+                    // Phase 3: Write debug record
+                    if (chk_data_valid && !dbg_pending && !dbg_wr_busy) begin
+                        dbg_wr_valid         <= 1'b1;
+                        dbg_wr_addr          <= dbg_base_r + dbg_write_idx;
+                        // Header: [31:0] = {0xCC, col_idx, layer_cnt}
+                        dbg_wr_data[15:0]    <= layer_cnt;
+                        dbg_wr_data[23:16]   <= {5'd0, chk_col_idx};
+                        dbg_wr_data[31:24]   <= 8'hCC;
+                        // Payload: [255:32] = URAM data[223:0] (14 FP16 values)
+                        dbg_wr_data[255:32]  <= chk_data_r[223:0];
+                        dbg_pending          <= 1'b1;
+                        chk_data_valid       <= 1'b0;
+                    end
+
+                    // Phase 4: Wait for debug write done, advance
+                    if (dbg_pending && dbg_wr_done) begin
+                        dbg_pending   <= 1'b0;
+                        dbg_write_idx <= dbg_write_idx + 1;
+
+                        if (chk_col_idx == 3'd3) begin
+                            // Checkpoint done — advance layer
+                            if (layer_cnt < num_layers_r - 1) begin
+                                layer_cnt <= layer_cnt + 1;
+                                step_idx  <= 4'd0;
+                                state     <= S_DECODE;
+                            end else begin
+                                state <= S_DONE;
+                            end
+                        end else begin
+                            chk_col_idx <= chk_col_idx + 1;
+                        end
                     end
                 end
 
@@ -814,9 +1019,25 @@ module fsm_controller #(
                     // synthesis translate_off
                     $display("[FSM %0t] DONE — kernel complete", $time);
                     // synthesis translate_on
-                    done <= 1'b1;
-                    busy <= 1'b0;
-                    state <= S_IDLE;
+                    // Fire final debug record if enabled
+                    if (dbg_base_r != {HBM_ADDR_W{1'b0}} && !dbg_pending && !dbg_wr_busy) begin
+                        dbg_wr_valid         <= 1'b1;
+                        dbg_wr_addr          <= dbg_base_r + dbg_write_idx;
+                        dbg_wr_data[31:0]    <= dbg_cycle_cnt;
+                        dbg_wr_data[47:32]   <= layer_cnt;
+                        dbg_wr_data[55:48]   <= {3'b0, state};
+                        dbg_wr_data[63:56]   <= 8'hFF;  // marker: DONE
+                        dbg_wr_data[95:64]   <= 32'd0;
+                        dbg_wr_data[127:96]  <= 32'd0;
+                        dbg_wr_data[255:128] <= 128'd0;
+                        dbg_pending          <= 1'b1;
+                    end
+                    if (dbg_base_r == {HBM_ADDR_W{1'b0}} || (dbg_pending && dbg_wr_done)) begin
+                        dbg_pending <= 1'b0;
+                        done <= 1'b1;
+                        busy <= 1'b0;
+                        state <= S_IDLE;
+                    end
                 end
 
                 default: state <= S_IDLE;

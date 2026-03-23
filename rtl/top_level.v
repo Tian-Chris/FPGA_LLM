@@ -177,6 +177,24 @@ module diffusion_transformer_top #(
     wire [HBM_ADDR_W-1:0]      host_output_base;
     wire                        host_decode_mode;
     wire [DIM_W-1:0]            host_cache_len;
+    wire [DIM_W-1:0]            host_num_layers;
+    wire [HBM_ADDR_W-1:0]      host_debug_base;
+
+    // =========================================================================
+    // FSM ↔ Debug Writer
+    // =========================================================================
+    wire                        fsm_dbg_wr_valid;
+    wire [HBM_ADDR_W-1:0]      fsm_dbg_wr_addr;
+    wire [255:0]                fsm_dbg_wr_data;
+    wire                        dbg_wr_done;
+    wire                        dbg_wr_busy;
+
+    // FSM ↔ URAM Checkpoint Read
+    wire                        fsm_chk_uram_rd_en;
+    wire [9:0]                  fsm_chk_uram_rd_row;
+    wire [7:0]                  fsm_chk_uram_rd_col;
+    wire [255:0]                fsm_chk_uram_rd_data;
+    wire                        fsm_chk_uram_rd_valid;
 
     // =========================================================================
     // FSM ↔ Tiling Engine (Matmul Command)
@@ -187,6 +205,9 @@ module diffusion_transformer_top #(
     wire [HBM_ADDR_W-1:0]      fsm_mm_cmd_a_base, fsm_mm_cmd_b_base;
     wire [HBM_ADDR_W-1:0]      fsm_mm_cmd_a_stride, fsm_mm_cmd_b_stride;
     wire [7:0]                  fsm_mm_cmd_out_col_offset;
+    wire                        fsm_mm_cmd_has_bias;
+    wire [HBM_ADDR_W-1:0]      fsm_mm_cmd_bias_base;
+    wire [DIM_W-1:0]            fsm_mm_cmd_bias_words;
     wire                        mm_cmd_ready, mm_cmd_done;
 
     // =========================================================================
@@ -212,7 +233,7 @@ module diffusion_transformer_top #(
     wire [3:0]                  fsm_nm_cfg_col_bits;
     wire                        fsm_nm_adapter_flush;
     wire                        nm_adapter_flush_done;
-    wire [DIM_W-1:0]            fsm_nm_addr_offset;
+    wire [NM_ADDR_W-1:0]        fsm_nm_addr_offset;
 
     // =========================================================================
     // URAM NM Adapter ↔ URAM
@@ -227,11 +248,11 @@ module diffusion_transformer_top #(
 
     // Adapter scalar port wires
     wire                        adp_rd_en;
-    wire [15:0]                adp_rd_addr;
+    wire [NM_ADDR_W-1:0]      adp_rd_addr;
     wire [DATA_WIDTH-1:0]      adp_rd_data;
     wire                        adp_rd_valid;
     wire                        adp_wr_en;
-    wire [15:0]                adp_wr_addr;
+    wire [NM_ADDR_W-1:0]      adp_wr_addr;
     wire [DATA_WIDTH-1:0]      adp_wr_data;
 
     // =========================================================================
@@ -240,20 +261,21 @@ module diffusion_transformer_top #(
     wire                        fsm_sm_start;
     wire [DIM_W-1:0]            fsm_sm_seq_len;
     wire [DIM_W-1:0]            fsm_sm_row_idx;
-    wire [3:0]                  fsm_sm_scale_shift;
-    wire                        sm_done;
+    wire [15:0]                 fsm_sm_scale_factor;
+    wire                        sm_done, sm_busy;
 
     wire                        fsm_ln_start;
     wire [DIM_W-1:0]            fsm_ln_dim;
-    wire                        ln_done;
+    wire                        ln_done, ln_busy;
 
     wire                        fsm_act_start;
     wire [DIM_W-1:0]            fsm_act_dim;
     wire                        act_unit_done;
+    wire                        act_unit_busy;
 
     wire                        fsm_res_start;
     wire [DIM_W-1:0]            fsm_res_dim;
-    wire                        res_done;
+    wire                        res_done, res_busy;
 
     wire                        fsm_qu_start;
     wire [DIM_W-1:0]            fsm_qu_dim;
@@ -277,7 +299,22 @@ module diffusion_transformer_top #(
     wire [URAM_ROW_W*N_ENG-1:0]   te_eng_cmd_out_row;
     wire [URAM_COL_W*N_ENG-1:0]   te_eng_cmd_out_col_word;
     wire [N_ENG-1:0]                te_eng_cmd_first_k_chunk;
+    wire [N_ENG-1:0]                te_eng_cmd_last_k_chunk;
     wire [N_ENG-1:0]                eng_cmd_ready, eng_cmd_done;
+
+    // Bias: tiling_engine ↔ matmul_controller
+    wire [HBM_ADDR_W-1:0]          te_bias_axi_araddr;
+    wire [7:0]                      te_bias_axi_arlen;
+    wire                            te_bias_axi_arvalid;
+    wire                            te_bias_axi_arready;
+    wire [BUS_WIDTH-1:0]           te_bias_axi_rdata;
+    wire                            te_bias_axi_rvalid;
+    wire                            te_bias_axi_rlast;
+    wire                            te_bias_axi_rready;
+    wire                            te_bias_loading;
+    wire [7:0]                      eng_bias_rd_addr;
+    wire [BUS_WIDTH-1:0]           te_bias_rd_data;
+    wire                            te_bias_active;
 
     // =========================================================================
     // Prefetch Command Buses (tiling_engine ↔ hbm_prefetch)
@@ -350,7 +387,7 @@ module diffusion_transformer_top #(
     wire        ln_rd_en, ln_wr_en, ln_param_rd_en;
     wire [15:0] ln_rd_addr, ln_wr_addr, ln_param_addr;
     wire [DATA_WIDTH-1:0] ln_rd_data;
-    wire [7:0]  ln_gamma, ln_beta;
+    wire [15:0] ln_gamma, ln_beta;
     wire [DATA_WIDTH-1:0] ln_wr_data;
 
     wire        au_rd_en, au_wr_en;
@@ -410,6 +447,8 @@ module diffusion_transformer_top #(
         .busy(host_busy),
         .current_state(current_state[4:0]),
         .current_layer(current_layer),
+        .num_layers(host_num_layers),
+        .debug_base(host_debug_base),
         .interrupt(interrupt)
     );
 `else
@@ -437,6 +476,8 @@ module diffusion_transformer_top #(
         .output_base(host_output_base),
         .decode_mode(host_decode_mode),
         .cache_len(host_cache_len),
+        .num_layers(host_num_layers),
+        .debug_base(host_debug_base),
         .done(host_done),
         .busy(host_busy),
         .current_state(current_state[4:0]),
@@ -465,6 +506,7 @@ module diffusion_transformer_top #(
         .seq_len(host_seq_len),
         .decode_mode(host_decode_mode),
         .cache_len(host_cache_len),
+        .num_layers(host_num_layers),
         .done(host_done),
         .busy(host_busy),
         .weight_base(host_weight_base),
@@ -481,6 +523,9 @@ module diffusion_transformer_top #(
         .mm_cmd_a_stride(fsm_mm_cmd_a_stride),
         .mm_cmd_b_stride(fsm_mm_cmd_b_stride),
         .mm_cmd_out_col_offset(fsm_mm_cmd_out_col_offset),
+        .mm_cmd_has_bias(fsm_mm_cmd_has_bias),
+        .mm_cmd_bias_base(fsm_mm_cmd_bias_base),
+        .mm_cmd_bias_words(fsm_mm_cmd_bias_words),
         .mm_cmd_ready(mm_cmd_ready),
         .mm_cmd_done(mm_cmd_done),
         .uram_flush_start(fsm_uf_start),
@@ -501,24 +546,36 @@ module diffusion_transformer_top #(
         .sm_start(fsm_sm_start),
         .sm_seq_len(fsm_sm_seq_len),
         .sm_row_idx(fsm_sm_row_idx),
-        .sm_scale_shift(fsm_sm_scale_shift),
-        .sm_done(sm_done),
+        .sm_scale_factor(fsm_sm_scale_factor),
+        .sm_done(sm_done), .sm_busy(sm_busy),
         .ln_start(fsm_ln_start),
         .ln_dim(fsm_ln_dim),
-        .ln_done(ln_done),
+        .ln_done(ln_done), .ln_busy(ln_busy),
         .act_start(fsm_act_start),
         .act_dim(fsm_act_dim),
         .act_done(act_unit_done),
+        .act_busy(act_unit_busy),
         .res_start(fsm_res_start),
         .res_dim(fsm_res_dim),
-        .res_done(res_done),
+        .res_done(res_done), .res_busy(res_busy),
         .quant_start(fsm_qu_start),
         .quant_dim(fsm_qu_dim),
         .quant_src_base(fsm_qu_src_base),
         .quant_dst_base(fsm_qu_dst_base),
         .quant_done(qu_done),
         .current_state(current_state),
-        .current_layer(current_layer)
+        .current_layer(current_layer),
+        .debug_base(host_debug_base),
+        .dbg_wr_valid(fsm_dbg_wr_valid),
+        .dbg_wr_addr(fsm_dbg_wr_addr),
+        .dbg_wr_data(fsm_dbg_wr_data),
+        .dbg_wr_done(dbg_wr_done),
+        .dbg_wr_busy(dbg_wr_busy),
+        .chk_uram_rd_en(fsm_chk_uram_rd_en),
+        .chk_uram_rd_row(fsm_chk_uram_rd_row),
+        .chk_uram_rd_col(fsm_chk_uram_rd_col),
+        .chk_uram_rd_data(fsm_chk_uram_rd_data),
+        .chk_uram_rd_valid(fsm_chk_uram_rd_valid)
     );
 
     // =========================================================================
@@ -541,6 +598,9 @@ module diffusion_transformer_top #(
         .cmd_a_stride(fsm_mm_cmd_a_stride),
         .cmd_b_stride(fsm_mm_cmd_b_stride),
         .cmd_out_col_offset(fsm_mm_cmd_out_col_offset[URAM_COL_W-1:0]),
+        .cmd_has_bias(fsm_mm_cmd_has_bias),
+        .cmd_bias_base(fsm_mm_cmd_bias_base),
+        .cmd_bias_words(fsm_mm_cmd_bias_words),
         .cmd_ready(mm_cmd_ready),
         .cmd_done(mm_cmd_done),
         // Prefetch commands
@@ -571,8 +631,23 @@ module diffusion_transformer_top #(
         .eng_cmd_out_row(te_eng_cmd_out_row),
         .eng_cmd_out_col_word(te_eng_cmd_out_col_word),
         .eng_cmd_first_k_chunk(te_eng_cmd_first_k_chunk),
+        .eng_cmd_last_k_chunk(te_eng_cmd_last_k_chunk),
         .eng_cmd_ready(eng_cmd_ready),
-        .eng_cmd_done(eng_cmd_done)
+        .eng_cmd_done(eng_cmd_done),
+        // Bias AXI read (time-shared with weight prefetch port)
+        .bias_axi_araddr(te_bias_axi_araddr),
+        .bias_axi_arlen(te_bias_axi_arlen),
+        .bias_axi_arvalid(te_bias_axi_arvalid),
+        .bias_axi_arready(te_bias_axi_arready),
+        .bias_axi_rdata(te_bias_axi_rdata),
+        .bias_axi_rvalid(te_bias_axi_rvalid),
+        .bias_axi_rlast(te_bias_axi_rlast),
+        .bias_axi_rready(te_bias_axi_rready),
+        .bias_loading(te_bias_loading),
+        // Bias read port (matmul controller reads)
+        .bias_rd_addr(eng_bias_rd_addr),
+        .bias_rd_data(te_bias_rd_data),
+        .bias_active(te_bias_active)
     );
 
     // =========================================================================
@@ -598,6 +673,8 @@ module diffusion_transformer_top #(
                 .cmd_out_row(te_eng_cmd_out_row[e*URAM_ROW_W +: URAM_ROW_W]),
                 .cmd_out_col_word(te_eng_cmd_out_col_word[e*URAM_COL_W +: URAM_COL_W]),
                 .cmd_first_k_chunk(te_eng_cmd_first_k_chunk[e]),
+                .cmd_last_k_chunk(te_eng_cmd_last_k_chunk[e]),
+                .cmd_has_bias(te_bias_active),
                 .cmd_ready(eng_cmd_ready[e]),
                 .cmd_done(eng_cmd_done[e]),
                 // Weight URAM prefetch read
@@ -618,7 +695,10 @@ module diffusion_transformer_top #(
                 .uram_wr_col_word(eng_uram_wr_col_word[e*URAM_COL_W +: URAM_COL_W]),
                 .uram_wr_data(eng_uram_wr_data[e*BUS_WIDTH +: BUS_WIDTH]),
                 .uram_wr_accum(eng_uram_wr_accum[e]),
-                .uram_wr_accept(eng_uram_wr_accept[e])
+                .uram_wr_accept(eng_uram_wr_accept[e]),
+                // Bias read
+                .bias_rd_addr(eng_bias_rd_addr),
+                .bias_rd_data(te_bias_rd_data)
             );
         end
     endgenerate
@@ -759,12 +839,16 @@ module diffusion_transformer_top #(
     assign pf_act_rlast       = m_axi_act0_rlast;
     assign pf_act_rvalid      = m_axi_act0_rvalid;
 
-    // wgt1 → tied off (kept for Vitis port layout)
+    // wgt1 → bias loader
     assign m_axi_wgt1_arid    = {ID_W_PARAM{1'b0}};
-    assign m_axi_wgt1_araddr  = {HBM_ADDR_W{1'b0}};
-    assign m_axi_wgt1_arlen   = 8'd0;
-    assign m_axi_wgt1_arvalid = 1'b0;
-    assign m_axi_wgt1_rready  = 1'b0;
+    assign m_axi_wgt1_araddr  = te_bias_axi_araddr;
+    assign m_axi_wgt1_arlen   = te_bias_axi_arlen;
+    assign m_axi_wgt1_arvalid = te_bias_axi_arvalid;
+    assign m_axi_wgt1_rready  = te_bias_axi_rready;
+    assign te_bias_axi_arready = m_axi_wgt1_arready;
+    assign te_bias_axi_rdata   = m_axi_wgt1_rdata;
+    assign te_bias_axi_rvalid  = m_axi_wgt1_rvalid;
+    assign te_bias_axi_rlast   = m_axi_wgt1_rlast;
 
     // act1 → tied off (kept for Vitis port layout)
     assign m_axi_act1_arid    = {ID_W_PARAM{1'b0}};
@@ -774,47 +858,79 @@ module diffusion_transformer_top #(
     assign m_axi_act1_rready  = 1'b0;
 
 `else
-    // Simulation: Weight prefetch HBM port
-    sim_hbm_port #(.DEPTH(SIM_HBM_DEPTH), .RD_LATENCY_CYCLES(HBM_RD_LATENCY)) u_hbm_pf_wgt (
-        .clk(clk), .rst_n(rst_n),
-        .s_axi_arid(pf_wgt_arid), .s_axi_araddr(pf_wgt_araddr),
-        .s_axi_arlen(pf_wgt_arlen), .s_axi_arvalid(pf_wgt_arvalid),
-        .s_axi_arready(pf_wgt_arready),
-        .s_axi_rid(pf_wgt_rid), .s_axi_rdata(pf_wgt_rdata),
-        .s_axi_rresp(pf_wgt_rresp), .s_axi_rlast(pf_wgt_rlast),
-        .s_axi_rvalid(pf_wgt_rvalid), .s_axi_rready(pf_wgt_rready),
-        // Write channels tied off
-        .s_axi_awid({ID_W{1'b0}}), .s_axi_awaddr({HBM_ADDR_W{1'b0}}),
-        .s_axi_awlen({LEN_W{1'b0}}), .s_axi_awvalid(1'b0),
-        .s_axi_awready(),
-        .s_axi_wdata({BUS_WIDTH{1'b0}}), .s_axi_wlast(1'b0),
-        .s_axi_wvalid(1'b0), .s_axi_wready(),
-        .s_axi_bid(), .s_axi_bresp(), .s_axi_bvalid(),
-        .s_axi_bready(1'b0)
-    );
+    // Simulation: shared HBM — ports 0/1 read-only, port 2 write-only, port 3 read+write
+    // Declared here; flush and DMA ports connected below via assign
+    wire [ID_W-1:0]        hbm_p2_bid;
+    wire [1:0]             hbm_p2_bresp;
+    wire                   hbm_p2_bvalid;
+    wire                   hbm_p2_awready;
+    wire                   hbm_p2_wready;
 
-    // Simulation: Activation prefetch HBM port
-    sim_hbm_port #(.DEPTH(SIM_HBM_DEPTH), .RD_LATENCY_CYCLES(HBM_RD_LATENCY)) u_hbm_pf_act (
+    wire [ID_W-1:0]        hbm_p3_rid;
+    wire [BUS_WIDTH-1:0]   hbm_p3_rdata;
+    wire [1:0]             hbm_p3_rresp;
+    wire                   hbm_p3_rlast;
+    wire                   hbm_p3_rvalid;
+    wire                   hbm_p3_arready;
+    wire [ID_W-1:0]        hbm_p3_bid;
+    wire [1:0]             hbm_p3_bresp;
+    wire                   hbm_p3_bvalid;
+    wire                   hbm_p3_awready;
+    wire                   hbm_p3_wready;
+
+    sim_hbm #(
+        .DEPTH(SIM_HBM_DEPTH),
+        .RD_LATENCY_CYCLES(HBM_RD_LATENCY)
+    ) u_hbm (
         .clk(clk), .rst_n(rst_n),
-        .s_axi_arid(pf_act_arid), .s_axi_araddr(pf_act_araddr),
-        .s_axi_arlen(pf_act_arlen), .s_axi_arvalid(pf_act_arvalid),
-        .s_axi_arready(pf_act_arready),
-        .s_axi_rid(pf_act_rid), .s_axi_rdata(pf_act_rdata),
-        .s_axi_rresp(pf_act_rresp), .s_axi_rlast(pf_act_rlast),
-        .s_axi_rvalid(pf_act_rvalid), .s_axi_rready(pf_act_rready),
-        // Write channels tied off
-        .s_axi_awid({ID_W{1'b0}}), .s_axi_awaddr({HBM_ADDR_W{1'b0}}),
-        .s_axi_awlen({LEN_W{1'b0}}), .s_axi_awvalid(1'b0),
-        .s_axi_awready(),
-        .s_axi_wdata({BUS_WIDTH{1'b0}}), .s_axi_wlast(1'b0),
-        .s_axi_wvalid(1'b0), .s_axi_wready(),
-        .s_axi_bid(), .s_axi_bresp(), .s_axi_bvalid(),
-        .s_axi_bready(1'b0)
+        // Port 0: weight prefetch (read-only) — unchanged
+        .p0_arid(pf_wgt_arid), .p0_araddr(pf_wgt_araddr),
+        .p0_arlen(pf_wgt_arlen), .p0_arvalid(pf_wgt_arvalid),
+        .p0_arready(pf_wgt_arready),
+        .p0_rid(pf_wgt_rid), .p0_rdata(pf_wgt_rdata),
+        .p0_rresp(pf_wgt_rresp), .p0_rlast(pf_wgt_rlast),
+        .p0_rvalid(pf_wgt_rvalid), .p0_rready(pf_wgt_rready),
+        // Port 1: activation prefetch (read-only)
+        .p1_arid(pf_act_arid), .p1_araddr(pf_act_araddr),
+        .p1_arlen(pf_act_arlen), .p1_arvalid(pf_act_arvalid),
+        .p1_arready(pf_act_arready),
+        .p1_rid(pf_act_rid), .p1_rdata(pf_act_rdata),
+        .p1_rresp(pf_act_rresp), .p1_rlast(pf_act_rlast),
+        .p1_rvalid(pf_act_rvalid), .p1_rready(pf_act_rready),
+        // Port 2: flush (write-only)
+        .p2_awid(fl_awid), .p2_awaddr(fl_awaddr),
+        .p2_awlen(fl_awlen), .p2_awvalid(fl_awvalid),
+        .p2_awready(hbm_p2_awready),
+        .p2_wdata(fl_wdata), .p2_wlast(fl_wlast),
+        .p2_wvalid(fl_wvalid), .p2_wready(hbm_p2_wready),
+        .p2_bid(hbm_p2_bid), .p2_bresp(hbm_p2_bresp),
+        .p2_bvalid(hbm_p2_bvalid), .p2_bready(fl_bready),
+        // Port 3: DMA (read+write)
+        .p3_arid(dma_axi_arid), .p3_araddr(dma_axi_araddr),
+        .p3_arlen(dma_axi_arlen), .p3_arvalid(dma_axi_arvalid),
+        .p3_arready(hbm_p3_arready),
+        .p3_rid(hbm_p3_rid), .p3_rdata(hbm_p3_rdata),
+        .p3_rresp(hbm_p3_rresp), .p3_rlast(hbm_p3_rlast),
+        .p3_rvalid(hbm_p3_rvalid), .p3_rready(dma_axi_rready),
+        .p3_awid(dma_axi_awid), .p3_awaddr(dma_axi_awaddr),
+        .p3_awlen(dma_axi_awlen), .p3_awvalid(dma_axi_awvalid),
+        .p3_awready(hbm_p3_awready),
+        .p3_wdata(dma_axi_wdata), .p3_wlast(dma_axi_wlast),
+        .p3_wvalid(dma_axi_wvalid), .p3_wready(hbm_p3_wready),
+        .p3_bid(hbm_p3_bid), .p3_bresp(hbm_p3_bresp),
+        .p3_bvalid(hbm_p3_bvalid), .p3_bready(dma_axi_bready),
+        // Port 4: bias loader (read-only)
+        .p4_arid({ID_W{1'b0}}), .p4_araddr(te_bias_axi_araddr),
+        .p4_arlen(te_bias_axi_arlen), .p4_arvalid(te_bias_axi_arvalid),
+        .p4_arready(te_bias_axi_arready),
+        .p4_rid(), .p4_rdata(te_bias_axi_rdata),
+        .p4_rresp(), .p4_rlast(te_bias_axi_rlast),
+        .p4_rvalid(te_bias_axi_rvalid), .p4_rready(te_bias_axi_rready)
     );
 `endif
 
     // =========================================================================
-    // URAM Read Port Mux (flush vs adapter — FSM mutual exclusion)
+    // URAM Read Port Mux (flush vs adapter vs checkpoint — FSM mutual exclusion)
     // =========================================================================
     wire                   uram_rd_en_mux;
     wire [URAM_ROW_W-1:0] uram_rd_row_mux;
@@ -822,28 +938,42 @@ module diffusion_transformer_top #(
     wire [BUS_WIDTH-1:0]  uram_rd_data_mux;
     wire                   uram_rd_valid_mux;
 
-    assign uram_rd_en_mux  = uf_uram_rd_en | adp_uram_rd_en;
-    assign uram_rd_row_mux = uf_uram_rd_en ? uf_uram_rd_row : adp_uram_rd_row;
-    assign uram_rd_col_mux = uf_uram_rd_en ? uf_uram_rd_col_word : adp_uram_rd_col_word;
+    assign uram_rd_en_mux  = uf_uram_rd_en | adp_uram_rd_en | fsm_chk_uram_rd_en;
+    assign uram_rd_row_mux = uf_uram_rd_en   ? uf_uram_rd_row :
+                             adp_uram_rd_en  ? adp_uram_rd_row :
+                                               fsm_chk_uram_rd_row[URAM_ROW_W-1:0];
+    assign uram_rd_col_mux = uf_uram_rd_en   ? uf_uram_rd_col_word :
+                             adp_uram_rd_en  ? adp_uram_rd_col_word :
+                                               fsm_chk_uram_rd_col[URAM_COL_W-1:0];
 
     // URAM read ownership tracking — gate rd_valid per consumer
     // Shift register matches URAM_RD_LATENCY to align valid with the issuer
     reg [URAM_RD_LATENCY-1:0] uram_rd_owner_is_flush;
+    reg [URAM_RD_LATENCY-1:0] uram_rd_owner_is_chk;
     integer sr_i;
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
+        if (!rst_n) begin
             uram_rd_owner_is_flush <= {URAM_RD_LATENCY{1'b0}};
-        else begin
+            uram_rd_owner_is_chk   <= {URAM_RD_LATENCY{1'b0}};
+        end else begin
             uram_rd_owner_is_flush[0] <= uf_uram_rd_en;
-            for (sr_i = 1; sr_i < URAM_RD_LATENCY; sr_i = sr_i + 1)
+            uram_rd_owner_is_chk[0]   <= fsm_chk_uram_rd_en;
+            for (sr_i = 1; sr_i < URAM_RD_LATENCY; sr_i = sr_i + 1) begin
                 uram_rd_owner_is_flush[sr_i] <= uram_rd_owner_is_flush[sr_i-1];
+                uram_rd_owner_is_chk[sr_i]   <= uram_rd_owner_is_chk[sr_i-1];
+            end
         end
     end
     wire uram_rd_for_flush = uram_rd_owner_is_flush[URAM_RD_LATENCY-1];
-    wire adp_uram_rd_valid = uram_rd_valid_mux & ~uram_rd_for_flush;
+    wire uram_rd_for_chk   = uram_rd_owner_is_chk[URAM_RD_LATENCY-1];
+    wire adp_uram_rd_valid = uram_rd_valid_mux & ~uram_rd_for_flush & ~uram_rd_for_chk;
 
     assign uf_uram_rd_data  = uram_rd_data_mux;
     assign uf_uram_rd_valid = uram_rd_valid_mux & uram_rd_for_flush;
+
+    // Checkpoint URAM read data/valid back to FSM
+    assign fsm_chk_uram_rd_data  = uram_rd_data_mux;
+    assign fsm_chk_uram_rd_valid = uram_rd_valid_mux & uram_rd_for_chk;
 
     // =========================================================================
     // URAM Accumulation Buffer
@@ -872,8 +1002,10 @@ module diffusion_transformer_top #(
     );
 
     // =========================================================================
-    // URAM Flush + Flush HBM Port (write-only)
+    // URAM Flush + Debug Writer + Flush HBM Port (write-only, muxed)
     // =========================================================================
+
+    // Flush port signals (to HBM — muxed between uram_flush and debug_writer)
     wire [ID_W-1:0]        fl_awid;
     wire [HBM_ADDR_W-1:0] fl_awaddr;
     wire [LEN_W-1:0]      fl_awlen;
@@ -883,6 +1015,69 @@ module diffusion_transformer_top #(
     wire [ID_W-1:0]        fl_bid;
     wire [1:0]            fl_bresp;
     wire                   fl_bvalid, fl_bready;
+
+    // uram_flush AXI signals (before mux)
+    wire [ID_W-1:0]        uf_awid;
+    wire [HBM_ADDR_W-1:0] uf_awaddr;
+    wire [LEN_W-1:0]      uf_awlen;
+    wire                   uf_awvalid;
+    wire                   uf_awready_from_mux;
+    wire [BUS_WIDTH-1:0]  uf_wdata;
+    wire                   uf_wlast, uf_wvalid;
+    wire                   uf_wready_from_mux;
+    wire [ID_W-1:0]        uf_bid_from_mux;
+    wire [1:0]            uf_bresp_from_mux;
+    wire                   uf_bvalid_from_mux;
+    wire                   uf_bready;
+
+    // debug_writer AXI signals (before mux)
+    wire [ID_W-1:0]        dbg_awid;
+    wire [HBM_ADDR_W-1:0] dbg_awaddr;
+    wire [LEN_W-1:0]      dbg_awlen;
+    wire                   dbg_awvalid;
+    wire [BUS_WIDTH-1:0]  dbg_wdata;
+    wire                   dbg_wlast, dbg_wvalid;
+    wire [ID_W-1:0]        dbg_bid;
+    wire [1:0]            dbg_bresp;
+    wire                   dbg_bvalid;
+    wire                   dbg_bready;
+    wire                   dbg_awready_from_mux;
+    wire                   dbg_wready_from_mux;
+
+    // Mux select: debug_writer active when it's busy or has a valid write
+    wire dbg_active = dbg_wr_busy | fsm_dbg_wr_valid;
+
+    // synthesis translate_off
+    // Mutual exclusion assertion
+    always @(posedge clk) begin
+        if (rst_n && dbg_active && (uf_awvalid || uf_wvalid))
+            $display("[ASSERT FAIL %0t] flush port contention: dbg_active=%b uf_awvalid=%b uf_wvalid=%b",
+                     $time, dbg_active, uf_awvalid, uf_wvalid);
+    end
+    // synthesis translate_on
+
+    // AXI write channel mux
+    assign fl_awid    = dbg_active ? dbg_awid    : uf_awid;
+    assign fl_awaddr  = dbg_active ? dbg_awaddr  : uf_awaddr;
+    assign fl_awlen   = dbg_active ? dbg_awlen   : uf_awlen;
+    assign fl_awvalid = dbg_active ? dbg_awvalid : uf_awvalid;
+    assign fl_wdata   = dbg_active ? dbg_wdata   : uf_wdata;
+    assign fl_wlast   = dbg_active ? dbg_wlast   : uf_wlast;
+    assign fl_wvalid  = dbg_active ? dbg_wvalid  : uf_wvalid;
+    assign fl_bready  = dbg_active ? dbg_bready  : uf_bready;
+
+    // Route AXI responses back to the active master
+    assign uf_awready_from_mux  = dbg_active ? 1'b0 : fl_awready;
+    assign uf_wready_from_mux   = dbg_active ? 1'b0 : fl_wready;
+    assign uf_bid_from_mux      = fl_bid;
+    assign uf_bresp_from_mux    = fl_bresp;
+    assign uf_bvalid_from_mux   = dbg_active ? 1'b0 : fl_bvalid;
+
+    assign dbg_awready_from_mux = dbg_active ? fl_awready : 1'b0;
+    assign dbg_wready_from_mux  = dbg_active ? fl_wready  : 1'b0;
+    assign dbg_bid              = fl_bid;
+    assign dbg_bresp            = fl_bresp;
+    assign dbg_bvalid           = dbg_active ? fl_bvalid  : 1'b0;
 
     uram_flush #(
         .ROW_W(URAM_ROW_W), .COL_W(URAM_COL_W)
@@ -900,13 +1095,30 @@ module diffusion_transformer_top #(
         .uram_rd_col_word(uf_uram_rd_col_word),
         .uram_rd_data(uf_uram_rd_data),
         .uram_rd_valid(uf_uram_rd_valid),
-        .m_axi_awid(fl_awid), .m_axi_awaddr(fl_awaddr),
-        .m_axi_awlen(fl_awlen), .m_axi_awvalid(fl_awvalid),
-        .m_axi_awready(fl_awready),
-        .m_axi_wdata(fl_wdata), .m_axi_wlast(fl_wlast),
-        .m_axi_wvalid(fl_wvalid), .m_axi_wready(fl_wready),
-        .m_axi_bid(fl_bid), .m_axi_bresp(fl_bresp),
-        .m_axi_bvalid(fl_bvalid), .m_axi_bready(fl_bready)
+        .m_axi_awid(uf_awid), .m_axi_awaddr(uf_awaddr),
+        .m_axi_awlen(uf_awlen), .m_axi_awvalid(uf_awvalid),
+        .m_axi_awready(uf_awready_from_mux),
+        .m_axi_wdata(uf_wdata), .m_axi_wlast(uf_wlast),
+        .m_axi_wvalid(uf_wvalid), .m_axi_wready(uf_wready_from_mux),
+        .m_axi_bid(uf_bid_from_mux), .m_axi_bresp(uf_bresp_from_mux),
+        .m_axi_bvalid(uf_bvalid_from_mux), .m_axi_bready(uf_bready)
+    );
+
+    // Debug Writer — single-beat AXI4 write master
+    debug_writer u_debug_writer (
+        .clk(clk), .rst_n(rst_n),
+        .write_valid(fsm_dbg_wr_valid),
+        .write_addr(fsm_dbg_wr_addr),
+        .write_data(fsm_dbg_wr_data),
+        .write_done(dbg_wr_done),
+        .write_busy(dbg_wr_busy),
+        .m_axi_awid(dbg_awid), .m_axi_awaddr(dbg_awaddr),
+        .m_axi_awlen(dbg_awlen), .m_axi_awvalid(dbg_awvalid),
+        .m_axi_awready(dbg_awready_from_mux),
+        .m_axi_wdata(dbg_wdata), .m_axi_wlast(dbg_wlast),
+        .m_axi_wvalid(dbg_wvalid), .m_axi_wready(dbg_wready_from_mux),
+        .m_axi_bid(dbg_bid), .m_axi_bresp(dbg_bresp),
+        .m_axi_bvalid(dbg_bvalid), .m_axi_bready(dbg_bready)
     );
 
 `ifdef FPGA_TARGET
@@ -925,30 +1137,19 @@ module diffusion_transformer_top #(
     assign fl_bvalid        = m_axi_fl_bvalid;
     assign m_axi_fl_bready  = fl_bready;
 `else
-    sim_hbm_port #(.DEPTH(SIM_HBM_DEPTH), .RD_LATENCY_CYCLES(HBM_RD_LATENCY)) u_hbm_flush (
-        .clk(clk), .rst_n(rst_n),
-        // Read channels tied off
-        .s_axi_arid({ID_W{1'b0}}), .s_axi_araddr({HBM_ADDR_W{1'b0}}),
-        .s_axi_arlen({LEN_W{1'b0}}), .s_axi_arvalid(1'b0),
-        .s_axi_arready(),
-        .s_axi_rid(), .s_axi_rdata(), .s_axi_rresp(),
-        .s_axi_rlast(), .s_axi_rvalid(), .s_axi_rready(1'b0),
-        // Write channels from uram_flush
-        .s_axi_awid(fl_awid), .s_axi_awaddr(fl_awaddr),
-        .s_axi_awlen(fl_awlen), .s_axi_awvalid(fl_awvalid),
-        .s_axi_awready(fl_awready),
-        .s_axi_wdata(fl_wdata), .s_axi_wlast(fl_wlast),
-        .s_axi_wvalid(fl_wvalid), .s_axi_wready(fl_wready),
-        .s_axi_bid(fl_bid), .s_axi_bresp(fl_bresp),
-        .s_axi_bvalid(fl_bvalid), .s_axi_bready(fl_bready)
-    );
+    // Flush port connected to sim_hbm port 2 (shared memory)
+    assign fl_awready = hbm_p2_awready;
+    assign fl_wready  = hbm_p2_wready;
+    assign fl_bid     = hbm_p2_bid;
+    assign fl_bresp   = hbm_p2_bresp;
+    assign fl_bvalid  = hbm_p2_bvalid;
 `endif
 
     // =========================================================================
     // URAM NM Adapter (scalar 16-bit ↔ URAM 256-bit bridge)
     // =========================================================================
     uram_nm_adapter #(
-        .ROW_W(URAM_ROW_W), .COL_W(URAM_COL_W)
+        .ROW_W(URAM_ROW_W), .COL_W(URAM_COL_W), .SCALAR_AW(NM_ADDR_W)
     ) u_nm_adapter (
         .clk(clk), .rst_n(rst_n),
         .cfg_col_bits(fsm_nm_cfg_col_bits),
@@ -1049,22 +1250,18 @@ module diffusion_transformer_top #(
     assign dma_axi_bvalid    = m_axi_dma_bvalid;
     assign m_axi_dma_bready  = dma_axi_bready;
 `else
-    sim_hbm_port #(.DEPTH(SIM_HBM_DEPTH), .RD_LATENCY_CYCLES(HBM_RD_LATENCY)) u_hbm_dma (
-        .clk(clk), .rst_n(rst_n),
-        .s_axi_arid(dma_axi_arid), .s_axi_araddr(dma_axi_araddr),
-        .s_axi_arlen(dma_axi_arlen), .s_axi_arvalid(dma_axi_arvalid),
-        .s_axi_arready(dma_axi_arready),
-        .s_axi_rid(dma_axi_rid), .s_axi_rdata(dma_axi_rdata),
-        .s_axi_rresp(dma_axi_rresp), .s_axi_rlast(dma_axi_rlast),
-        .s_axi_rvalid(dma_axi_rvalid), .s_axi_rready(dma_axi_rready),
-        .s_axi_awid(dma_axi_awid), .s_axi_awaddr(dma_axi_awaddr),
-        .s_axi_awlen(dma_axi_awlen), .s_axi_awvalid(dma_axi_awvalid),
-        .s_axi_awready(dma_axi_awready),
-        .s_axi_wdata(dma_axi_wdata), .s_axi_wlast(dma_axi_wlast),
-        .s_axi_wvalid(dma_axi_wvalid), .s_axi_wready(dma_axi_wready),
-        .s_axi_bid(dma_axi_bid), .s_axi_bresp(dma_axi_bresp),
-        .s_axi_bvalid(dma_axi_bvalid), .s_axi_bready(dma_axi_bready)
-    );
+    // DMA port connected to sim_hbm port 3 (shared memory)
+    assign dma_axi_arready = hbm_p3_arready;
+    assign dma_axi_rid     = hbm_p3_rid;
+    assign dma_axi_rdata   = hbm_p3_rdata;
+    assign dma_axi_rresp   = hbm_p3_rresp;
+    assign dma_axi_rlast   = hbm_p3_rlast;
+    assign dma_axi_rvalid  = hbm_p3_rvalid;
+    assign dma_axi_awready = hbm_p3_awready;
+    assign dma_axi_wready  = hbm_p3_wready;
+    assign dma_axi_bid     = hbm_p3_bid;
+    assign dma_axi_bresp   = hbm_p3_bresp;
+    assign dma_axi_bvalid  = hbm_p3_bvalid;
 `endif
 
     // =========================================================================
@@ -1079,9 +1276,8 @@ module diffusion_transformer_top #(
     assign adp_rd_en = sm_rd_en | ln_rd_en | au_rd_en | res_rd_en;
     assign adp_rd_addr = sm_rd_en  ? (sm_rd_addr + fsm_nm_addr_offset) :
                          ln_rd_en  ? (ln_rd_addr + fsm_nm_addr_offset) :
-                         au_rd_en  ? au_rd_addr :
+                         au_rd_en  ? (au_rd_addr + fsm_nm_addr_offset) :
                                      res_rd_addr;
-
     // Read data from adapter → units
     assign sm_rd_data  = adp_rd_data;
     assign ln_rd_data  = adp_rd_data;
@@ -1092,7 +1288,7 @@ module diffusion_transformer_top #(
     assign adp_wr_en = sm_wr_en | ln_wr_en | au_wr_en | res_wr_en;
     assign adp_wr_addr = sm_wr_en  ? (sm_wr_addr + fsm_nm_addr_offset) :
                          ln_wr_en  ? (ln_wr_addr + fsm_nm_addr_offset) :
-                         au_wr_en  ? au_wr_addr :
+                         au_wr_en  ? (au_wr_addr + fsm_nm_addr_offset) :
                                      res_wr_addr;
     assign adp_wr_data = sm_wr_en  ? sm_wr_data :
                          ln_wr_en  ? ln_wr_data :
@@ -1104,8 +1300,10 @@ module diffusion_transformer_top #(
     assign dma_rd_addr = ln_param_rd_en ? ln_param_addr : res_sub_addr;
 
     // LN params from act_dma (HBM weight space)
-    assign ln_gamma = dma_rd_data[7:0];
-    assign ln_beta  = dma_rd_data[15:8];
+    // Interleaved FP16: gamma[i] at addr 2*i, beta[i] at addr 2*i+1
+    // Both ports see the same 16-bit DMA word; layernorm reads alternately
+    assign ln_gamma = dma_rd_data;
+    assign ln_beta  = dma_rd_data;
 
     // Residual sub data from act_dma (HBM activation space)
     assign res_sub_data  = dma_rd_data;
@@ -1130,8 +1328,8 @@ module diffusion_transformer_top #(
         .clk(clk), .rst_n(rst_n),
         .start(fsm_sm_start), .seq_len(fsm_sm_seq_len),
         .row_idx(fsm_sm_row_idx),
-        .scale_shift(fsm_sm_scale_shift),
-        .busy(), .done(sm_done),
+        .scale_factor(fsm_sm_scale_factor),
+        .busy(sm_busy), .done(sm_done),
         .in_rd_en(sm_rd_en), .in_rd_addr(sm_rd_addr),
         .in_rd_data(sm_rd_data),
         .in_rd_valid(adp_rd_valid),
@@ -1143,12 +1341,12 @@ module diffusion_transformer_top #(
     // LayerNorm
     // =========================================================================
     layernorm #(
-        .DATA_W(DATA_WIDTH), .OUT_W(DATA_WIDTH), .PARAM_W(8),
+        .DATA_W(DATA_WIDTH), .OUT_W(DATA_WIDTH), .PARAM_W(16),
         .DIM_W(DIM_W), .MAX_DIM(MODEL_DIM)
     ) u_layernorm (
         .clk(clk), .rst_n(rst_n),
         .start(fsm_ln_start), .dim(fsm_ln_dim),
-        .busy(), .done(ln_done),
+        .busy(ln_busy), .done(ln_done),
         .in_rd_en(ln_rd_en), .in_rd_addr(ln_rd_addr),
         .in_rd_data(ln_rd_data),
         .in_rd_valid(adp_rd_valid),       // Data from URAM adapter
@@ -1160,14 +1358,14 @@ module diffusion_transformer_top #(
     );
 
     // =========================================================================
-    // Activation Unit (ReLU)
+    // Activation Unit (GELU)
     // =========================================================================
     activation_unit #(
         .DATA_WIDTH(DATA_WIDTH), .MAX_DIM(MODEL_DIM)
     ) u_activation (
         .clk(clk), .rst_n(rst_n),
         .start(fsm_act_start), .dim(fsm_act_dim),
-        .done(act_unit_done), .busy(),
+        .done(act_unit_done), .busy(act_unit_busy),
         .mem_rd_en(au_rd_en), .mem_rd_addr(au_rd_addr),
         .mem_rd_data(au_rd_data), .mem_rd_valid(au_rd_valid),
         .mem_wr_en(au_wr_en), .mem_wr_addr(au_wr_addr),
@@ -1182,7 +1380,7 @@ module diffusion_transformer_top #(
     ) u_residual_add (
         .clk(clk), .rst_n(rst_n),
         .start(fsm_res_start), .dim(fsm_res_dim),
-        .done(res_done), .busy(),
+        .done(res_done), .busy(res_busy),
         .res_rd_en(res_rd_en), .res_rd_addr(res_rd_addr),
         .res_rd_data(res_rd_data), .res_rd_valid(res_rd_valid),
         .sub_rd_en(res_sub_rd_en), .sub_rd_addr(res_sub_addr),
@@ -1191,28 +1389,7 @@ module diffusion_transformer_top #(
         .out_wr_data(res_wr_data)
     );
 
-    // =========================================================================
-    // Quant Layer (INT16 → INT8)
-    // =========================================================================
-    // TODO: quant_layer needs proper HBM adapter for 256-bit bus interface.
-    // For now, memory ports are tied off. Functional integration in Phase 6.
-    quant_layer #(
-        .IN_W(DATA_WIDTH), .OUT_W(8), .BURST(BUS_ELEMS),
-        .FRAC(15), .ADDR_W(ADDR_WIDTH), .DIM_W(DIM_W)
-    ) u_quant_layer (
-        .clk(clk), .rst_n(rst_n),
-        .start(fsm_qu_start), .dim(fsm_qu_dim),
-        .src_base(fsm_qu_src_base[ADDR_WIDTH-1:0]),
-        .dst_base(fsm_qu_dst_base[ADDR_WIDTH-1:0]),
-        .done(qu_done), .busy(),
-        .mem_rd_en(qu_rd_en), .mem_rd_addr(qu_rd_addr),
-        .mem_rd_data(qu_rd_data), .mem_rd_valid(qu_rd_valid),
-        .mem_wr_en(qu_wr_en), .mem_wr_addr(qu_wr_addr),
-        .mem_wr_data(qu_wr_data)
-    );
-
-    // Quant layer memory: tied off for now (no HBM adapter yet)
-    assign qu_rd_data  = {BUS_WIDTH{1'b0}};
-    assign qu_rd_valid = 1'b0;
+    // Quant layer removed (FP16 pipeline — no INT8 quantization needed)
+    assign qu_done = 1'b1;
 
 endmodule

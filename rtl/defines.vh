@@ -3,9 +3,9 @@
 // =============================================================================
 //
 // Bitwidths:
-//   Input/Weight: INT16
-//   Accumulation: INT32
-//   Output:       INT16
+//   Input/Weight: FP16
+//   Accumulation: FP32
+//   Output:       FP16
 
 `ifndef DEFINES_VH
 `define DEFINES_VH
@@ -59,14 +59,14 @@ parameter NUM_DEN_LAYERS = 0;
 parameter NUM_DIFFUSION_STEPS = 1;
 `endif
 
-// Attention scale: divide scores by sqrt(HEAD_DIM) via right-shift
-// Production: $clog2(64)>>1 = 3 (÷8 = ÷√64, exact for GPT-2)
-// SIM_SMALL:  $clog2(32)>>1 = 2 (÷4, approximation of ÷√32 ≈ 5.66)
-parameter SCALE_SHIFT   = $clog2(HEAD_DIM) >> 1;
+// Attention scale: multiply scores by 1/√HEAD_DIM (FP16)
+// Production (HEAD_DIM=64): 1/√64 = 0.125 = FP16 0x3000
+// SIM_SMALL  (HEAD_DIM=32): 1/√32 ≈ 0.1768 = FP16 0x31A8
+parameter SCALE_FACTOR  = (HEAD_DIM == 64) ? 16'h3000 : 16'h31A8;
 
 // Hardware Configuration
-parameter DATA_WIDTH    = 16;           // INT16 inputs/weights
-parameter ACC_WIDTH     = 32;           // INT32 accumulation
+parameter DATA_WIDTH    = 16;           // FP16 inputs/weights
+parameter ACC_WIDTH     = 32;           // FP32 accumulation
 parameter ADDR_WIDTH    = 20;           // Legacy — local BRAM address width
 parameter TILE_SIZE     = 32;
 
@@ -92,8 +92,12 @@ parameter URAM_COLS     = 128;          // F_DIM
 parameter URAM_ROWS     = 1024;         // MODEL_DIM
 parameter URAM_COLS     = 4096;         // F_DIM (widened for non-matmul URAM staging)
 `endif
-parameter URAM_DATA_W   = 16;           // INT16 output elements
+parameter URAM_DATA_W   = 16;           // FP16 output elements
 parameter URAM_COL_WORDS = URAM_COLS / BUS_ELEMS;  // SIM_SMALL: 8, Production: 256
+
+// Non-Matmul Address Width (scalar addressing through uram_nm_adapter)
+// Must accommodate bt * F_DIM (e.g. 32 * 4096 = 131072 → 17 bits min)
+parameter NM_ADDR_W = 20;
 
 // Prefetch Buffer Configuration
 `ifdef SIM_SMALL
@@ -148,6 +152,7 @@ localparam S_UF_RUN     = 5'd13;  // standalone URAM->HBM flush
 localparam S_NEXT_STEP  = 5'd14;  // advance step_idx, handle layer loop
 localparam S_DONE        = 5'd15;
 localparam S_OUTPUT_COPY = 5'd16;
+localparam S_CHECKPOINT  = 5'd17;  // post-layer URAM checkpoint dump to debug trace
 
 // Legacy aliases (kept for host_interface status register compatibility)
 localparam FSM_IDLE = 6'd0;

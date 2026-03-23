@@ -6,6 +6,8 @@
 //   Phase 1: Prefill (BT=32, decode_mode=0)
 //   Phase 2: Decode token 1 (BT=1, decode_mode=1, cache_len=32)
 //   Phase 3: Decode token 2 (BT=1, decode_mode=1, cache_len=33)
+//
+// Uses shared sim_hbm — single memory backing all 4 AXI ports.
 
 module tb_top_multi;
 
@@ -28,9 +30,10 @@ module tb_top_multi;
     localparam TOTAL_KV_ROWS  = 34;
 
     localparam WEIGHT_BASE = 0;
-    localparam ACT_BASE    = 1573376;
-    localparam KV_BASE     = 1622528;
+    localparam ACT_BASE    = 1574528;
+    localparam KV_BASE     = 1623680;
     localparam OUTPUT_BASE = 32'h8000;
+    localparam DEBUG_BASE  = TB_HBM_DEPTH - 512;  // Last 512 words for debug trace
 
     reg clk, rst_n;
 
@@ -57,7 +60,6 @@ module tb_top_multi;
     integer dump_row, dump_col;
     integer dump_addr;
     integer dump_fd;
-    integer mirror_r, mirror_c, mirror_addr;
 
     // Decode embed temp arrays
     reg [255:0] decode_embed_1 [0:MODEL_STRIDE_L-1];
@@ -121,25 +123,22 @@ module tb_top_multi;
     localparam URAM_EMBED_SRC = ACT_BASE;
 
     // =========================================================================
-    // HBM + URAM Preloading
+    // HBM + URAM Preloading (single shared memory)
     // =========================================================================
     initial begin
         #1;
-        $readmemh("verify/test_data/hbm_wgt_multi.hex", dut.u_hbm_pf_wgt.mem);
-        $readmemh("verify/test_data/hbm_act_multi.hex", dut.u_hbm_pf_wgt.mem);
-        $readmemh("verify/test_data/hbm_wgt_multi.hex", dut.u_hbm_pf_act.mem);
-        $readmemh("verify/test_data/hbm_act_multi.hex", dut.u_hbm_pf_act.mem);
-        $readmemh("verify/test_data/hbm_dma_multi.hex", dut.u_hbm_dma.mem);
+        $readmemh("verify/test_data/hbm_multi.hex", dut.u_hbm.mem);
 
         // Load decode embed arrays
         $readmemh("verify/test_data/decode_embed_1.hex", decode_embed_1);
         $readmemh("verify/test_data/decode_embed_2.hex", decode_embed_2);
 
+        // Copy embeddings from shared HBM into URAM
         for (uram_r = 0; uram_r < SEQ_LEN; uram_r = uram_r + 1) begin
             for (uram_c = 0; uram_c < MODEL_STRIDE_L; uram_c = uram_c + 1) begin
                 uram_src = URAM_EMBED_SRC + uram_r * MODEL_STRIDE_L + uram_c;
                 dut.u_uram.mem[uram_r * URAM_COL_WORDS_HW + uram_c] =
-                    dut.u_hbm_pf_act.mem[uram_src];
+                    dut.u_hbm.mem[uram_src];
             end
         end
 
@@ -175,6 +174,8 @@ module tb_top_multi;
         axi_write(32'h24, KV_BASE);
         axi_write(32'h1C, 32'd0);       // decode_mode = 0
         axi_write(32'h20, 32'd0);       // cache_len = 0
+        axi_write(32'h28, 2); // num_layers
+        axi_write(32'h2C, DEBUG_BASE);  // debug trace base
 
         axi_write(32'h00, 32'h1);       // START
 
@@ -185,10 +186,7 @@ module tb_top_multi;
 
         // ============ INJECT DECODE EMBED 1 ============
         for (de_i = 0; de_i < MODEL_STRIDE_L; de_i = de_i + 1) begin
-            dut.u_hbm_pf_act.mem[ACT_BASE + de_i]  = decode_embed_1[de_i];
-            dut.u_hbm_pf_wgt.mem[ACT_BASE + de_i]  = decode_embed_1[de_i];
-            dut.u_hbm_dma.mem[ACT_BASE + de_i]      = decode_embed_1[de_i];
-            dut.u_hbm_flush.mem[ACT_BASE + de_i]    = decode_embed_1[de_i];
+            dut.u_hbm.mem[ACT_BASE + de_i] = decode_embed_1[de_i];
             dut.u_uram.mem[0 * URAM_COL_WORDS_HW + de_i] = decode_embed_1[de_i];
         end
         $display("[%0t] Injected decode_embed_1", $time);
@@ -208,7 +206,7 @@ module tb_top_multi;
         $fflush();
         @(posedge clk); @(posedge clk);
 
-        // Debug: dump decode 1 output (URAM row 0) and ACT_BASE row 0 from flush HBM
+        // Debug: dump decode 1 output
         dump_fd = $fopen("verify/test_data/dec1_output_dump.hex", "w");
         if (dump_fd != 0) begin
             $fwrite(dump_fd, "URAM_ROW0:\n");
@@ -216,17 +214,16 @@ module tb_top_multi;
                 $fwrite(dump_fd, "%064h\n",
                         dut.u_uram.mem[0 * URAM_COL_WORDS_HW + dump_col]);
             end
-            $fwrite(dump_fd, "FLUSH_ACT_BASE_ROW0:\n");
+            $fwrite(dump_fd, "HBM_ACT_BASE_ROW0:\n");
             for (dump_col = 0; dump_col < MODEL_STRIDE_L; dump_col = dump_col + 1) begin
                 dump_addr = ACT_BASE + dump_col;
                 $fwrite(dump_fd, "%064h\n",
-                        dut.u_hbm_flush.mem[dump_addr]);
+                        dut.u_hbm.mem[dump_addr]);
             end
-            // Also dump L1 K cache row 32 (first 2 words)
             $fwrite(dump_fd, "L1_K_ROW32:\n");
             for (dump_col = 0; dump_col < MODEL_STRIDE_L; dump_col = dump_col + 1) begin
                 dump_addr = KV_BASE + 1 * 16384 + 32 * MODEL_STRIDE_L + dump_col;
-                $fwrite(dump_fd, "%064h\n", dut.u_hbm_flush.mem[dump_addr]);
+                $fwrite(dump_fd, "%064h\n", dut.u_hbm.mem[dump_addr]);
             end
             $fclose(dump_fd);
             $display("[%0t] Dumped decode 1 intermediate output", $time);
@@ -235,10 +232,7 @@ module tb_top_multi;
 
         // ============ INJECT DECODE EMBED 2 ============
         for (de_i = 0; de_i < MODEL_STRIDE_L; de_i = de_i + 1) begin
-            dut.u_hbm_pf_act.mem[ACT_BASE + de_i]  = decode_embed_2[de_i];
-            dut.u_hbm_pf_wgt.mem[ACT_BASE + de_i]  = decode_embed_2[de_i];
-            dut.u_hbm_dma.mem[ACT_BASE + de_i]      = decode_embed_2[de_i];
-            dut.u_hbm_flush.mem[ACT_BASE + de_i]    = decode_embed_2[de_i];
+            dut.u_hbm.mem[ACT_BASE + de_i] = decode_embed_2[de_i];
             dut.u_uram.mem[0 * URAM_COL_WORDS_HW + de_i] = decode_embed_2[de_i];
         end
         $display("[%0t] Injected decode_embed_2", $time);
@@ -272,39 +266,50 @@ module tb_top_multi;
             $fflush();
         end
 
-        // Sparse flush HBM dump:
-        //   - Final decode output: ACT_BASE row 0 (1 row)
-        //   - Per-layer KV caches: TOTAL_KV_ROWS rows (prefill + 2 decode)
+        // Sparse HBM dump (shared memory — flush writes are already visible):
+        //   - ACT_BASE: all BT rows
+        //   - Per-layer KV caches: TOTAL_KV_ROWS rows
         dump_fd = $fopen("verify/test_data/hbm_flush_multi_dump.hex", "w");
         if (dump_fd != 0) begin
-            // Final output: ACT_BASE row 0 only (decode token 2 output)
-            for (dump_col = 0; dump_col < MODEL_STRIDE_L; dump_col = dump_col + 1) begin
-                dump_addr = ACT_BASE + dump_col;
-                $fwrite(dump_fd, "@%08h %064h\n", dump_addr,
-                        dut.u_hbm_flush.mem[dump_addr]);
+            for (dump_row = 0; dump_row < 32; dump_row = dump_row + 1) begin
+                for (dump_col = 0; dump_col < MODEL_STRIDE_L; dump_col = dump_col + 1) begin
+                    dump_addr = ACT_BASE + dump_row * MODEL_STRIDE_L + dump_col;
+                    $fwrite(dump_fd, "@%08h %064h\n", dump_addr,
+                            dut.u_hbm.mem[dump_addr]);
+                end
             end
 
-            // Per-layer KV caches: all rows including decode rows
             for (fi = 0; fi < 2; fi = fi + 1) begin
-                // K cache (TOTAL_KV_ROWS rows)
                 for (dump_row = 0; dump_row < TOTAL_KV_ROWS; dump_row = dump_row + 1) begin
                     for (dump_col = 0; dump_col < MODEL_STRIDE_L; dump_col = dump_col + 1) begin
                         dump_addr = KV_BASE + fi * 16384 + dump_row * MODEL_STRIDE_L + dump_col;
                         $fwrite(dump_fd, "@%08h %064h\n", dump_addr,
-                                dut.u_hbm_flush.mem[dump_addr]);
+                                dut.u_hbm.mem[dump_addr]);
                     end
                 end
-                // V cache (TOTAL_KV_ROWS rows)
                 for (dump_row = 0; dump_row < TOTAL_KV_ROWS; dump_row = dump_row + 1) begin
                     for (dump_col = 0; dump_col < MODEL_STRIDE_L; dump_col = dump_col + 1) begin
                         dump_addr = KV_BASE + fi * 16384 + 8192 + dump_row * MODEL_STRIDE_L + dump_col;
                         $fwrite(dump_fd, "@%08h %064h\n", dump_addr,
-                                dut.u_hbm_flush.mem[dump_addr]);
+                                dut.u_hbm.mem[dump_addr]);
                     end
                 end
             end
             $fclose(dump_fd);
-            $display("[%0t] Dumped sparse flush HBM (KV %0d rows/layer + decode output)", $time, TOTAL_KV_ROWS);
+            $display("[%0t] Dumped sparse HBM (KV %0d rows/layer + decode output)", $time, TOTAL_KV_ROWS);
+            $fflush();
+        end
+
+        // --- Debug trace dump ---
+        dump_fd = $fopen("verify/test_data/debug_trace_multi.hex", "w");
+        if (dump_fd != 0) begin
+            for (dump_addr = DEBUG_BASE; dump_addr < DEBUG_BASE + 512; dump_addr = dump_addr + 1) begin
+                if (dut.u_hbm.mem[dump_addr] != 256'd0) begin
+                    $fwrite(dump_fd, "%064h\n", dut.u_hbm.mem[dump_addr]);
+                end
+            end
+            $fclose(dump_fd);
+            $display("[%0t] Dumped debug trace to verify/test_data/debug_trace_multi.hex", $time);
             $fflush();
         end
 
@@ -325,48 +330,6 @@ module tb_top_multi;
                 prev_layer <= dut.u_fsm.layer_cnt;
             end
             prev_state <= dut.u_fsm.state;
-        end
-    end
-
-    // Flush-to-Load Memory Mirroring
-    reg uf_done_prev;
-    reg [27:0] saved_flush_base;
-    reg [27:0] saved_flush_stride;
-    reg [9:0]  saved_flush_rows;
-    reg [7:0]  saved_flush_cols;
-    reg        flush_params_valid;
-
-    initial begin
-        uf_done_prev = 0;
-        saved_flush_base = 0;
-        saved_flush_stride = 0;
-        saved_flush_rows = 0;
-        saved_flush_cols = 0;
-        flush_params_valid = 0;
-    end
-
-    always @(posedge clk) begin
-        if (rst_n) begin
-            if (dut.u_fsm.uram_flush_start) begin
-                saved_flush_base   <= dut.u_fsm.uram_flush_hbm_base;
-                saved_flush_stride <= dut.u_fsm.uram_flush_hbm_stride;
-                saved_flush_rows   <= dut.u_fsm.uram_flush_num_rows;
-                saved_flush_cols   <= dut.u_fsm.uram_flush_num_col_words;
-                flush_params_valid <= 1'b1;
-            end
-
-            uf_done_prev <= dut.uf_done;
-            if (dut.uf_done && !uf_done_prev && flush_params_valid) begin
-                for (mirror_r = 0; mirror_r <= saved_flush_rows; mirror_r = mirror_r + 1) begin
-                    for (mirror_c = 0; mirror_c <= saved_flush_cols; mirror_c = mirror_c + 1) begin
-                        mirror_addr = saved_flush_base + mirror_r * saved_flush_stride + mirror_c;
-                        dut.u_hbm_pf_act.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.u_hbm_pf_wgt.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.u_hbm_dma.mem[mirror_addr]    = dut.u_hbm_flush.mem[mirror_addr];
-                    end
-                end
-                flush_params_valid <= 1'b0;
-            end
         end
     end
 

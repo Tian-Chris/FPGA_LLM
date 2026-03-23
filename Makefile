@@ -1,4 +1,4 @@
-.PHONY: all lint lint-all sim wave synth show sta clean help cosim cosim-matmul cosim-softmax cosim-layernorm cosim-activation cosim-residual_add cosim-clean sim-small test-small test-top test-matmul1k test-1k test-decode test-multi test-token
+.PHONY: all lint lint-all sim wave synth show sta clean help cosim cosim-matmul cosim-softmax cosim-layernorm cosim-activation cosim-residual_add cosim-fp-primitives cosim-fp16-mult cosim-fp32-add cosim-fp32-to-fp16 cosim-fp16-add cosim-fp16-compare cosim-clean sim-small test-small test-top test-matmul1k test-1k test-decode test-multi test-token
 
 STA_TIME ?= 10.0
 
@@ -17,6 +17,12 @@ TB_DIR  = tb
 RTL_ALL = \
     $(RTL_DIR)/bram_controller.v \
     $(RTL_DIR)/mac_unit.v \
+    $(RTL_DIR)/fp16_mult.v \
+    $(RTL_DIR)/fp32_add.v \
+    $(RTL_DIR)/fp32_to_fp16.v \
+    $(RTL_DIR)/fp16_add.v \
+    $(RTL_DIR)/fp16_compare.v \
+    $(RTL_DIR)/fp_mac_unit.v \
     $(RTL_DIR)/agu.v \
     $(RTL_DIR)/matmul_engine.v \
     $(RTL_DIR)/mem_arbiter.v \
@@ -29,7 +35,8 @@ RTL_ALL = \
     $(RTL_DIR)/host_interface.v \
     $(RTL_DIR)/positional_embedding.v \
     $(RTL_DIR)/fsm_controller.v \
-    $(RTL_DIR)/sim_hbm_port.v \
+    $(RTL_DIR)/sim_hbm.v \
+    $(RTL_DIR)/debug_writer.v \
     $(RTL_DIR)/uram_accum_buf.v \
     $(RTL_DIR)/tile_loader.v \
     $(RTL_DIR)/uram_flush.v \
@@ -245,6 +252,24 @@ cosim-activation:
 
 cosim-residual_add:
 	python3 verify/run_cosim.py residual_add
+
+cosim-fp-primitives:
+	python3 verify/run_cosim.py fp-primitives
+
+cosim-fp16-mult:
+	python3 verify/run_cosim.py fp16_mult
+
+cosim-fp32-add:
+	python3 verify/run_cosim.py fp32_add
+
+cosim-fp32-to-fp16:
+	python3 verify/run_cosim.py fp32_to_fp16
+
+cosim-fp16-add:
+	python3 verify/run_cosim.py fp16_add
+
+cosim-fp16-compare:
+	python3 verify/run_cosim.py fp16_compare
 
 cosim-clean:
 	rm -rf verify/test_data/*.hex

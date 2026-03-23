@@ -28,9 +28,9 @@ module tb_cosim_residual_add;
     wire [DATA_WIDTH-1:0] out_wr_data;
 
     // Memory models
-    reg signed [DATA_WIDTH-1:0] res_mem [0:MAX_DIM-1];
-    reg signed [DATA_WIDTH-1:0] sub_mem [0:MAX_DIM-1];
-    reg signed [DATA_WIDTH-1:0] output_mem [0:MAX_DIM-1];
+    reg [DATA_WIDTH-1:0] res_mem [0:MAX_DIM-1];
+    reg [DATA_WIDTH-1:0] sub_mem [0:MAX_DIM-1];
+    reg [DATA_WIDTH-1:0] output_mem [0:MAX_DIM-1];
 
     integer i, fd;
 

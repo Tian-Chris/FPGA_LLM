@@ -22,6 +22,8 @@
 //   0x38: decode_mode[31:0]
 //   0x40: cache_len  [31:0]
 //   0x58: kv_base    [27:0] (word address, scalar — KV cache region start)
+//   0x60: num_layers [15:0] (number of transformer layers, default=NUM_ENC_LAYERS)
+//   0x68: debug_base [27:0] (word address for debug trace writes, 0=disabled)
 //
 // Compatible with Verilator: no X/Z, no SystemVerilog.
 // =============================================================================
@@ -66,6 +68,10 @@ module vitis_control #(
     output reg                          decode_mode,
     output reg  [DIM_WIDTH-1:0]         cache_len,
 
+    // Layer count and debug trace base
+    output reg  [DIM_WIDTH-1:0]         num_layers,
+    output reg  [HBM_ADDR_W-1:0]       debug_base,
+
     // Status inputs from FSM
     input  wire                         done,
     input  wire                         busy,
@@ -101,6 +107,8 @@ module vitis_control #(
     localparam ADDR_DBG_LAYER   = 7'h50;
     localparam ADDR_KV_LO       = 7'h58;
     localparam ADDR_KV_HI       = 7'h5C;
+    localparam ADDR_NUM_LAYERS  = 7'h60;
+    localparam ADDR_DEBUG_BASE  = 7'h68;
 
     // -------------------------------------------------------------------------
     // Internal registers
@@ -250,6 +258,8 @@ module vitis_control #(
                             ADDR_CACHE_LEN:   s_axi_rdata <= {16'd0, cache_len};
                             ADDR_DBG_STATE:   s_axi_rdata <= {26'd0, current_state};
                             ADDR_DBG_LAYER:   s_axi_rdata <= {16'd0, current_layer};
+                            ADDR_NUM_LAYERS:  s_axi_rdata <= {16'd0, num_layers};
+                            ADDR_DEBUG_BASE:  s_axi_rdata <= {{(32-HBM_ADDR_W){1'b0}}, debug_base};
                             default:          s_axi_rdata <= 32'd0;
                         endcase
                         rd_state <= RD_DATA;
@@ -291,6 +301,8 @@ module vitis_control #(
             kv_base       <= {HBM_ADDR_W{1'b0}};
             decode_mode   <= 1'b0;
             cache_len     <= {DIM_WIDTH{1'b0}};
+            num_layers    <= 16'd2;  // safe default for FPGA debug (host overrides)
+            debug_base    <= {HBM_ADDR_W{1'b0}};
         end else begin
             start <= 1'b0;  // default: single-cycle pulse
 
@@ -317,6 +329,8 @@ module vitis_control #(
                     ADDR_KV_LO:       kv_base       <= wr_data_latch[HBM_ADDR_W-1:0];
                     ADDR_DECODE_MODE: decode_mode   <= wr_data_latch[0];
                     ADDR_CACHE_LEN:   cache_len     <= wr_data_latch[DIM_WIDTH-1:0];
+                    ADDR_NUM_LAYERS:  num_layers    <= wr_data_latch[DIM_WIDTH-1:0];
+                    ADDR_DEBUG_BASE:  debug_base    <= wr_data_latch[HBM_ADDR_W-1:0];
                     default: ;
                 endcase
             end

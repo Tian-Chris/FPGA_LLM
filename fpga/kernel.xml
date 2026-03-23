@@ -32,6 +32,8 @@
       <arg name="decode_mode"  addressQualifier="0" id="8" port="s_axi_control" size="0x4" offset="0x38" type="uint" hostOffset="0x0" hostSize="0x4"/>
       <arg name="cache_len"    addressQualifier="0" id="9" port="s_axi_control" size="0x4" offset="0x40" type="uint" hostOffset="0x0" hostSize="0x4"/>
       <arg name="kv_base"     addressQualifier="0" id="10" port="s_axi_control" size="0x4" offset="0x58" type="uint" hostOffset="0x0" hostSize="0x4"/>
+      <arg name="num_layers"  addressQualifier="0" id="11" port="s_axi_control" size="0x4" offset="0x60" type="uint" hostOffset="0x0" hostSize="0x4"/>
+      <arg name="debug_base"  addressQualifier="0" id="12" port="s_axi_control" size="0x4" offset="0x68" type="uint" hostOffset="0x0" hostSize="0x4"/>
     </args>
 
   </kernel>

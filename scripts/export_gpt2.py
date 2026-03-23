@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-export_gpt2.py — Export GPT-2 Medium weights to FPGA binary format.
+export_gpt2.py — Export GPT-2 Medium weights to FPGA binary format (FP16).
 
 Outputs:
-  weights.bin  — 24 layers packed per HBM layout (~576 MB)
-  embed.bin    — wte + wpe + ln_f params + quantization scales
+  weights.bin  — 24 layers packed per HBM layout, FP16 weights + interleaved LN params
+  embed.bin    — wte + wpe + ln_f params (FP32, for host-side processing)
 
 Usage:
   pip install torch transformers
@@ -43,70 +43,86 @@ LAYER_FFN1_OFFSET = 4 * MODEL_DIM * MODEL_DIM // WE                     # 262144
 LAYER_FFN2_OFFSET = LAYER_FFN1_OFFSET + MODEL_DIM * F_DIM // WE         # 524288
 LAYER_LN1_OFFSET  = LAYER_FFN2_OFFSET + F_DIM * MODEL_DIM // WE         # 786432
 LAYER_LN2_OFFSET  = LAYER_LN1_OFFSET + 2 * MODEL_DIM // WE             # 786560
-LAYER_SIZE        = LAYER_LN2_OFFSET + 2 * MODEL_DIM // WE              # 786688
+LAYER_BIAS_QKV_OFFSET  = LAYER_LN2_OFFSET + 2 * MODEL_DIM // WE       # 786688
+LAYER_BIAS_PROJ_OFFSET = LAYER_BIAS_QKV_OFFSET + 3 * MODEL_DIM // WE  # 786880
+LAYER_BIAS_FFN1_OFFSET = LAYER_BIAS_PROJ_OFFSET + MODEL_DIM // WE     # 786944
+LAYER_BIAS_FFN2_OFFSET = LAYER_BIAS_FFN1_OFFSET + F_DIM // WE         # 787200
+LAYER_SIZE             = LAYER_BIAS_FFN2_OFFSET + MODEL_DIM // WE      # 787264
+
+# Per-layer bias sizes (in FP16 elements)
+BIAS_QKV_LEN  = 3 * MODEL_DIM  # 3072
+BIAS_PROJ_LEN = MODEL_DIM      # 1024
+BIAS_FFN1_LEN = F_DIM          # 4096
+BIAS_FFN2_LEN = MODEL_DIM      # 1024
+BIAS_PER_LAYER = BIAS_QKV_LEN + BIAS_PROJ_LEN + BIAS_FFN1_LEN + BIAS_FFN2_LEN  # 9216
 
 TOTAL_WEIGHT_WORDS = LAYER_SIZE * NUM_LAYERS  # 18,880,512 words
 
 
 # ---------------------------------------------------------------------------
-# Quantization
+# FP16 Conversion
 # ---------------------------------------------------------------------------
 
-def quantize_int8_symmetric(tensor: np.ndarray) -> tuple:
-    """Symmetric per-tensor INT8 quantization.
+def to_fp16_bits(tensor: np.ndarray) -> np.ndarray:
+    """Convert FP32 tensor to FP16 bit patterns stored as uint16.
 
-    Returns (int8_array, scale) where scale = max(|tensor|) / 127.
+    Returns uint16 array with same shape, containing IEEE 754 half-precision bits.
     """
-    amax = np.max(np.abs(tensor))
-    if amax < 1e-10:
-        return np.zeros_like(tensor, dtype=np.int8), 1.0
-    scale = amax / 127.0
-    quantized = np.clip(np.round(tensor / scale), -127, 127).astype(np.int8)
-    return quantized, float(scale)
+    return tensor.astype(np.float16).view(np.uint16)
 
 
 # ---------------------------------------------------------------------------
 # Binary Packing (matches RTL HBM word layout)
 # ---------------------------------------------------------------------------
 
-def pack_word(int16_elements: np.ndarray) -> bytes:
-    """Pack 16 INT16 values into 32 bytes (256-bit word, little-endian element order).
+def pack_word(elements: np.ndarray) -> bytes:
+    """Pack 16 FP16 values (uint16 bit patterns) into 32 bytes (256-bit word).
 
     Element 0 at bytes [0:2], element 1 at bytes [2:4], ..., element 15 at bytes [30:32].
     """
-    assert len(int16_elements) == WE
-    return int16_elements.astype(np.int16).tobytes()
+    assert len(elements) == WE
+    return elements.astype(np.uint16).tobytes()
 
 
-def pack_weight_matrix(buf: bytearray, mat_int8: np.ndarray, rows: int, cols: int,
+def pack_weight_matrix(buf: bytearray, mat_fp16: np.ndarray, rows: int, cols: int,
                        base_word: int, stride: int):
-    """Pack INT8 weight matrix (sign-extended to INT16) into buffer at word offset.
+    """Pack FP16 weight matrix (uint16 bit patterns) into buffer at word offset.
 
     Row r stored at word addresses [base_word + r*stride .. base_word + r*stride + cols/WE - 1].
     """
     words_per_row = cols // WE
-    mat16 = mat_int8.astype(np.int16)  # sign-extend INT8 -> INT16
     for r in range(rows):
         row_base = (base_word + r * stride) * WORD_BYTES
         for w in range(words_per_row):
             col_start = w * WE
-            elements = mat16[r, col_start:col_start + WE]
+            elements = mat_fp16[r, col_start:col_start + WE]
             offset = row_base + w * WORD_BYTES
             buf[offset:offset + WORD_BYTES] = pack_word(elements)
 
 
-def pack_ln_params(buf: bytearray, gamma_int8: np.ndarray, beta_int8: np.ndarray,
+def pack_ln_params(buf: bytearray, gamma_fp16: np.ndarray, beta_fp16: np.ndarray,
                    base_word: int):
-    """Pack LN gamma/beta into buffer. Each INT16 element = {beta[7:0] << 8 | gamma[7:0]}."""
-    dim = len(gamma_int8)
+    """Pack LN gamma/beta as interleaved FP16: gamma[0], beta[0], gamma[1], beta[1], ...
+
+    Each value is a separate FP16 (uint16). Total = 2*dim values = 2*dim/WE words.
+    """
+    dim = len(gamma_fp16)
+    interleaved = np.empty(2 * dim, dtype=np.uint16)
+    interleaved[0::2] = gamma_fp16.astype(np.uint16)
+    interleaved[1::2] = beta_fp16.astype(np.uint16)
+    words = 2 * dim // WE
+    for w in range(words):
+        elements = interleaved[w * WE:(w + 1) * WE]
+        offset = (base_word + w) * WORD_BYTES
+        buf[offset:offset + WORD_BYTES] = pack_word(elements)
+
+
+def pack_bias_vector(buf: bytearray, bias_fp16: np.ndarray, base_word: int):
+    """Pack a 1D FP16 bias vector into consecutive 256-bit words at base_word."""
+    dim = len(bias_fp16)
     words = dim // WE
     for w in range(words):
-        elements = np.zeros(WE, dtype=np.int16)
-        for e in range(WE):
-            idx = w * WE + e
-            g = int(gamma_int8[idx]) & 0xFF
-            b = int(beta_int8[idx]) & 0xFF
-            elements[e] = np.int16((b << 8) | g)
+        elements = bias_fp16[w * WE:(w + 1) * WE]
         offset = (base_word + w) * WORD_BYTES
         buf[offset:offset + WORD_BYTES] = pack_word(elements)
 
@@ -150,8 +166,7 @@ def main():
           f"({TOTAL_WEIGHT_WORDS} words x {WORD_BYTES} bytes)")
     wgt_buf = bytearray(total_bytes)
 
-    # Per-layer quantization scales for optional host-side dequant
-    layer_scales = []
+    # Biases are now packed inline in wgt_buf at LAYER_BIAS_*_OFFSET
 
     # ------------------------------------------------------------------
     # Pack each layer
@@ -160,13 +175,17 @@ def main():
         prefix = f"transformer.h.{layer_idx}"
         print(f"  Layer {layer_idx}/{NUM_LAYERS}...", end="", flush=True)
 
-        # --- Load weights ---
+        # --- Load weights and biases ---
         # GPT-2 Conv1D: weight shape is (in_features, out_features)
         # c_attn: (1024, 3072) = concatenated QKV
         c_attn_w = sd[f"{prefix}.attn.c_attn.weight"].numpy()   # (1024, 3072)
+        c_attn_b = sd[f"{prefix}.attn.c_attn.bias"].numpy()     # (3072,)
         c_proj_w = sd[f"{prefix}.attn.c_proj.weight"].numpy()    # (1024, 1024)
+        c_proj_b = sd[f"{prefix}.attn.c_proj.bias"].numpy()      # (1024,)
         c_fc_w   = sd[f"{prefix}.mlp.c_fc.weight"].numpy()       # (1024, 4096)
+        c_fc_b   = sd[f"{prefix}.mlp.c_fc.bias"].numpy()         # (4096,)
         c_proj2_w = sd[f"{prefix}.mlp.c_proj.weight"].numpy()    # (4096, 1024)
+        c_proj2_b = sd[f"{prefix}.mlp.c_proj.bias"].numpy()      # (1024,)
 
         # Split QKV
         W_q = c_attn_w[:, :MODEL_DIM]            # (1024, 1024)
@@ -182,53 +201,64 @@ def main():
         ln2_gamma = sd[f"{prefix}.ln_2.weight"].numpy()  # (1024,)
         ln2_beta  = sd[f"{prefix}.ln_2.bias"].numpy()    # (1024,)
 
-        # --- Quantize weights to INT8 ---
-        scales = {}
-        W_q_i8, scales["wq"]   = quantize_int8_symmetric(W_q)
-        W_k_i8, scales["wk"]   = quantize_int8_symmetric(W_k)
-        W_v_i8, scales["wv"]   = quantize_int8_symmetric(W_v)
-        W_o_i8, scales["wo"]   = quantize_int8_symmetric(W_o)
-        W_f1_i8, scales["ff1"] = quantize_int8_symmetric(W_ffn1)
-        W_f2_i8, scales["ff2"] = quantize_int8_symmetric(W_ffn2)
+        # --- Convert weights to FP16 bit patterns ---
+        W_q_fp16   = to_fp16_bits(W_q)
+        W_k_fp16   = to_fp16_bits(W_k)
+        W_v_fp16   = to_fp16_bits(W_v)
+        W_o_fp16   = to_fp16_bits(W_o)
+        W_f1_fp16  = to_fp16_bits(W_ffn1)
+        W_f2_fp16  = to_fp16_bits(W_ffn2)
 
-        # Quantize LN params to INT8
-        ln1_g_i8, scales["ln1_g"] = quantize_int8_symmetric(ln1_gamma)
-        ln1_b_i8, scales["ln1_b"] = quantize_int8_symmetric(ln1_beta)
-        ln2_g_i8, scales["ln2_g"] = quantize_int8_symmetric(ln2_gamma)
-        ln2_b_i8, scales["ln2_b"] = quantize_int8_symmetric(ln2_beta)
+        # Convert LN params to FP16 bit patterns
+        ln1_g_fp16 = to_fp16_bits(ln1_gamma)
+        ln1_b_fp16 = to_fp16_bits(ln1_beta)
+        ln2_g_fp16 = to_fp16_bits(ln2_gamma)
+        ln2_b_fp16 = to_fp16_bits(ln2_beta)
 
-        layer_scales.append(scales)
+        # Convert biases to FP16 bit patterns
+        qkv_bias_fp16  = to_fp16_bits(c_attn_b)    # (3072,)
+        proj_bias_fp16 = to_fp16_bits(c_proj_b)     # (1024,)
+        ffn1_bias_fp16 = to_fp16_bits(c_fc_b)       # (4096,)
+        ffn2_bias_fp16 = to_fp16_bits(c_proj2_b)    # (1024,)
 
-        # --- Pack into buffer ---
+        # --- Pack weights into buffer (unchanged layout) ---
         layer_base = layer_idx * LAYER_SIZE
 
-        pack_weight_matrix(wgt_buf, W_q_i8, MODEL_DIM, MODEL_DIM,
+        pack_weight_matrix(wgt_buf, W_q_fp16, MODEL_DIM, MODEL_DIM,
                            layer_base + LAYER_WQ_OFFSET, MODEL_STRIDE)
-        pack_weight_matrix(wgt_buf, W_k_i8, MODEL_DIM, MODEL_DIM,
+        pack_weight_matrix(wgt_buf, W_k_fp16, MODEL_DIM, MODEL_DIM,
                            layer_base + LAYER_WK_OFFSET, MODEL_STRIDE)
-        pack_weight_matrix(wgt_buf, W_v_i8, MODEL_DIM, MODEL_DIM,
+        pack_weight_matrix(wgt_buf, W_v_fp16, MODEL_DIM, MODEL_DIM,
                            layer_base + LAYER_WV_OFFSET, MODEL_STRIDE)
-        pack_weight_matrix(wgt_buf, W_o_i8, MODEL_DIM, MODEL_DIM,
+        pack_weight_matrix(wgt_buf, W_o_fp16, MODEL_DIM, MODEL_DIM,
                            layer_base + LAYER_WO_OFFSET, MODEL_STRIDE)
-        pack_weight_matrix(wgt_buf, W_f1_i8, MODEL_DIM, F_DIM,
+        pack_weight_matrix(wgt_buf, W_f1_fp16, MODEL_DIM, F_DIM,
                            layer_base + LAYER_FFN1_OFFSET, F_STRIDE)
-        pack_weight_matrix(wgt_buf, W_f2_i8, F_DIM, MODEL_DIM,
+        pack_weight_matrix(wgt_buf, W_f2_fp16, F_DIM, MODEL_DIM,
                            layer_base + LAYER_FFN2_OFFSET, MODEL_STRIDE)
 
-        pack_ln_params(wgt_buf, ln1_g_i8, ln1_b_i8,
+        pack_ln_params(wgt_buf, ln1_g_fp16, ln1_b_fp16,
                        layer_base + LAYER_LN1_OFFSET)
-        pack_ln_params(wgt_buf, ln2_g_i8, ln2_b_i8,
+        pack_ln_params(wgt_buf, ln2_g_fp16, ln2_b_fp16,
                        layer_base + LAYER_LN2_OFFSET)
+
+        # --- Pack biases inline in weight buffer ---
+        pack_bias_vector(wgt_buf, qkv_bias_fp16,  layer_base + LAYER_BIAS_QKV_OFFSET)
+        pack_bias_vector(wgt_buf, proj_bias_fp16,  layer_base + LAYER_BIAS_PROJ_OFFSET)
+        pack_bias_vector(wgt_buf, ffn1_bias_fp16,  layer_base + LAYER_BIAS_FFN1_OFFSET)
+        pack_bias_vector(wgt_buf, ffn2_bias_fp16,  layer_base + LAYER_BIAS_FFN2_OFFSET)
 
         print(" done")
 
     # ------------------------------------------------------------------
-    # Write weights.bin
+    # Write weights.bin (unchanged layout)
     # ------------------------------------------------------------------
     wgt_path = os.path.join(args.output_dir, "weights.bin")
     with open(wgt_path, "wb") as f:
         f.write(wgt_buf)
     print(f"Wrote {wgt_path}: {len(wgt_buf):,} bytes ({len(wgt_buf)/1e6:.1f} MB)")
+
+    # Biases are now inline in weights.bin (no separate biases.bin needed)
 
     # ------------------------------------------------------------------
     # Write embed.bin (FP32 arrays for host-side processing)
@@ -264,21 +294,9 @@ def main():
     embed_size = 16 + vocab_size * MODEL_DIM * 4 + max_pos * MODEL_DIM * 4 + MODEL_DIM * 4 * 2
     print(f"Wrote {embed_path}: {embed_size:,} bytes ({embed_size/1e6:.1f} MB)")
 
-    # ------------------------------------------------------------------
-    # Write scales.bin (per-layer quantization scales for dequantization)
-    # ------------------------------------------------------------------
-    # Format: NUM_LAYERS entries, each with 10 FP32 scale values
-    # Order: wq, wk, wv, wo, ff1, ff2, ln1_g, ln1_b, ln2_g, ln2_b
-    scales_path = os.path.join(args.output_dir, "scales.bin")
-    with open(scales_path, "wb") as f:
-        for scales in layer_scales:
-            for key in ["wq", "wk", "wv", "wo", "ff1", "ff2",
-                        "ln1_g", "ln1_b", "ln2_g", "ln2_b"]:
-                f.write(struct.pack("<f", scales[key]))
-    print(f"Wrote {scales_path}: {NUM_LAYERS * 10 * 4} bytes")
-
     print("\nDone! Files ready for FPGA host application.")
     print(f"  Weight buffer size for XRT: {total_bytes:,} bytes")
+    print(f"  Format: FP16 weights + biases, interleaved FP16 LN params")
 
 
 if __name__ == "__main__":

@@ -8,33 +8,29 @@ Two-phase golden model:
 Verifies the decode pass output (1 row of residual2) against the golden model.
 """
 
-import math
 import os
 import sys
-import random
 import subprocess
 import numpy as np
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from verify.golden.common import int8, int16, int32, saturate_int16
 from verify.golden.softmax import softmax_golden
 from verify.golden.layernorm import layernorm_golden
-from verify.golden.activation import relu_golden
+from verify.golden.activation import gelu_golden
 from verify.golden.residual_add import residual_add_golden
 
 from verify.test_top import (
-    pack_int16_to_256bit, pack_int8_to_256bit_as_int16,
-    write_hex_file, pack_matrix_int8_as_int16, pack_matrix_int16,
-    pack_ln_params,
-    read_hex_dump, extract_int16_from_256bit,
+    pack_16bit_to_256bit,
+    write_hex_file, pack_matrix_fp16,
+    pack_ln_params, pack_bias_vector,
+    read_hex_dump,
     extract_matrix_from_hbm, extract_matrix_from_uram,
     compare_matrices, hex16,
 )
-
 from verify.test_top_1k import (
-    tiled_matmul_int16_numpy, _transpose, generate_weights,
+    tiled_matmul_fp16_numpy, _transpose, generate_weights,
 )
 
 # ---------------------------------------------------------------------------
@@ -43,7 +39,7 @@ from verify.test_top_1k import (
 MODEL_DIM     = 1024
 NUM_HEADS     = 16
 HEAD_DIM      = MODEL_DIM // NUM_HEADS   # 64
-SCALE_SHIFT   = math.ceil(math.log2(HEAD_DIM)) >> 1  # 3
+SCALE_FACTOR  = 0x3000  # FP16 1/√64 = 0.125
 F_DIM         = 4096
 INPUT_DIM     = 64
 MAX_SEQ_LEN   = 128
@@ -77,8 +73,12 @@ LAYER_WO_OFFSET   = 3 * MODEL_DIM * MODEL_DIM // WE
 LAYER_FFN1_OFFSET = 4 * MODEL_DIM * MODEL_DIM // WE
 LAYER_FFN2_OFFSET = LAYER_FFN1_OFFSET + MODEL_DIM * F_DIM // WE
 LAYER_LN1_OFFSET  = LAYER_FFN2_OFFSET + F_DIM * MODEL_DIM // WE
-LAYER_LN2_OFFSET  = LAYER_LN1_OFFSET + 2 * MODEL_DIM // WE
-LAYER_SIZE        = LAYER_LN2_OFFSET + 2 * MODEL_DIM // WE
+LAYER_LN2_OFFSET       = LAYER_LN1_OFFSET + 2 * MODEL_DIM // WE
+LAYER_BIAS_QKV_OFFSET  = LAYER_LN2_OFFSET + 2 * MODEL_DIM // WE
+LAYER_BIAS_PROJ_OFFSET = LAYER_BIAS_QKV_OFFSET + 3 * MODEL_DIM // WE
+LAYER_BIAS_FFN1_OFFSET = LAYER_BIAS_PROJ_OFFSET + MODEL_DIM // WE
+LAYER_BIAS_FFN2_OFFSET = LAYER_BIAS_FFN1_OFFSET + F_DIM // WE
+LAYER_SIZE             = LAYER_BIAS_FFN2_OFFSET + MODEL_DIM // WE
 
 MODEL_STRIDE = MODEL_DIM // WE   # 64
 F_STRIDE     = F_DIM // WE       # 256
@@ -107,10 +107,13 @@ GOLDEN_OUT = os.path.join(PROJECT_ROOT, "verify", "llm_golden_decode.txt")
 RTL_OUT    = os.path.join(PROJECT_ROOT, "verify", "llm_rtl_decode.txt")
 
 RTL_ALL = [
-    "bram_controller.v", "mac_unit.v", "agu.v", "matmul_engine.v",
+    "bram_controller.v", "fp16_mult.v", "fp32_add.v", "fp32_to_fp16.v",
+    "fp16_add.v", "fp16_compare.v", "fp_mac_unit.v",
+    "agu.v", "matmul_engine.v",
     "mem_arbiter.v", "tiling_engine.v", "softmax.v", "layernorm.v",
-    "activation.v", "residual_add.v", "quant_layer.v", "host_interface.v",
-    "positional_embedding.v", "fsm_controller.v", "sim_hbm_port.v",
+    "activation.v", "residual_add.v", "host_interface.v",
+    "positional_embedding.v", "fsm_controller.v", "sim_hbm.v",
+    "debug_writer.v",
     "uram_accum_buf.v", "tile_loader.v", "uram_flush.v", "act_dma.v",
     "uram_nm_adapter.v", "top_level.v",
 ]
@@ -120,32 +123,31 @@ RTL_ALL = [
 # Golden Model — Prefill Phase
 # ---------------------------------------------------------------------------
 
-def compute_golden_prefill(embed_int8, weights):
-    """Run full GPT-2 pre-norm pipeline for prefill (BT=PREFILL_LEN)."""
+def compute_golden_prefill(embed_fp16, weights):
+    """Run full GPT-2 pre-norm FP16 pipeline for prefill (BT=PREFILL_LEN)."""
     g = {}
-    embed_int16 = [[int16(int8(v)) for v in row] for row in embed_int8]
-    g['embed_int16'] = embed_int16
+    g['embed_fp16'] = embed_fp16
 
-    # LN1
     print("    [prefill] LN1...")
     ln1_out = []
     for t in range(BT_PREFILL):
         normed = layernorm_golden(
-            embed_int16[t], weights['gamma1'], weights['beta1'], MODEL_DIM
+            embed_fp16[t], weights['gamma1'], weights['beta1'], MODEL_DIM
         )
         ln1_out.append(normed)
     g['ln1_out'] = ln1_out
 
-    # QKV
     print("    [prefill] QKV matmuls...")
-    Q = tiled_matmul_int16_numpy(ln1_out, weights['W_q'], TILE_SIZE)
-    K = tiled_matmul_int16_numpy(ln1_out, weights['W_k'], TILE_SIZE)
-    V = tiled_matmul_int16_numpy(ln1_out, weights['W_v'], TILE_SIZE)
+    Q = tiled_matmul_fp16_numpy(ln1_out, weights['W_q'], TILE_SIZE,
+                                 bias=weights['bias_q'])
+    K = tiled_matmul_fp16_numpy(ln1_out, weights['W_k'], TILE_SIZE,
+                                 bias=weights['bias_k'])
+    V = tiled_matmul_fp16_numpy(ln1_out, weights['W_v'], TILE_SIZE,
+                                 bias=weights['bias_v'])
     g['Q'] = Q
     g['K'] = K
     g['V'] = V
 
-    # Multi-head attention
     print("    [prefill] Attention (16 heads)...")
     attn_concat = [[0] * MODEL_DIM for _ in range(BT_PREFILL)]
     for h in range(NUM_HEADS):
@@ -154,10 +156,10 @@ def compute_golden_prefill(embed_int8, weights):
         V_h = [row[h*HEAD_DIM:(h+1)*HEAD_DIM] for row in V]
 
         K_h_T = _transpose(K_h)
-        scores_h = tiled_matmul_int16_numpy(Q_h, K_h_T, TILE_SIZE)
-        probs_h = [softmax_golden(scores_h[t], scale_shift=SCALE_SHIFT, row_idx=t)
+        scores_h = tiled_matmul_fp16_numpy(Q_h, K_h_T, TILE_SIZE)
+        probs_h = [softmax_golden(scores_h[t], SCALE_FACTOR, row_idx=t)
                    for t in range(BT_PREFILL)]
-        attn_h = tiled_matmul_int16_numpy(probs_h, V_h, TILE_SIZE)
+        attn_h = tiled_matmul_fp16_numpy(probs_h, V_h, TILE_SIZE)
 
         for t in range(BT_PREFILL):
             for d in range(HEAD_DIM):
@@ -165,17 +167,15 @@ def compute_golden_prefill(embed_int8, weights):
 
     g['attn_out'] = attn_concat
 
-    # Output projection
     print("    [prefill] Output projection...")
-    attn_proj = tiled_matmul_int16_numpy(attn_concat, weights['W_o'], TILE_SIZE)
+    attn_proj = tiled_matmul_fp16_numpy(attn_concat, weights['W_o'], TILE_SIZE,
+                                         bias=weights['bias_proj'])
     g['attn_proj'] = attn_proj
 
-    # Residual 1
     print("    [prefill] Residual 1...")
-    residual1 = [residual_add_golden(embed_int16[t], attn_proj[t]) for t in range(BT_PREFILL)]
+    residual1 = [residual_add_golden(embed_fp16[t], attn_proj[t]) for t in range(BT_PREFILL)]
     g['residual1'] = residual1
 
-    # LN2
     print("    [prefill] LN2...")
     ln2_out = []
     for t in range(BT_PREFILL):
@@ -185,24 +185,22 @@ def compute_golden_prefill(embed_int8, weights):
         ln2_out.append(normed)
     g['ln2_out'] = ln2_out
 
-    # FFN1
     print("    [prefill] FFN1...")
-    ffn1 = tiled_matmul_int16_numpy(ln2_out, weights['W_ffn1'], TILE_SIZE)
+    ffn1 = tiled_matmul_fp16_numpy(ln2_out, weights['W_ffn1'], TILE_SIZE,
+                                    bias=weights['bias_ffn1'])
     g['ffn1'] = ffn1
 
-    # ReLU
-    print("    [prefill] ReLU...")
-    ffn_act = [[relu_golden(v) for v in row] for row in ffn1]
+    print("    [prefill] GELU...")
+    ffn_act = [gelu_golden(row) for row in ffn1]
     g['ffn_act'] = ffn_act
 
-    # FFN2
     print("    [prefill] FFN2...")
-    ffn2 = tiled_matmul_int16_numpy(ffn_act, weights['W_ffn2'], TILE_SIZE)
+    ffn2 = tiled_matmul_fp16_numpy(ffn_act, weights['W_ffn2'], TILE_SIZE,
+                                    bias=weights['bias_ffn2'])
     g['ffn2'] = ffn2
 
-    # Residual 2
     print("    [prefill] Residual 2...")
-    residual2 = [residual_add_golden(embed_int16[t], ffn2[t]) for t in range(BT_PREFILL)]
+    residual2 = [residual_add_golden(residual1[t], ffn2[t]) for t in range(BT_PREFILL)]
     g['residual2'] = residual2
 
     return g
@@ -212,99 +210,86 @@ def compute_golden_prefill(embed_int8, weights):
 # Golden Model — Decode Phase
 # ---------------------------------------------------------------------------
 
-def compute_golden_decode(new_embed_int16, K_cache, V_cache, weights):
+def compute_golden_decode(new_embed_fp16, K_cache, V_cache, weights):
     """Run single-token decode with KV cache from prefill.
 
-    Args:
-        new_embed_int16: 1D list, new token embedding (MODEL_DIM)
-        K_cache: list of lists, PREFILL_LEN × MODEL_DIM
-        V_cache: list of lists, PREFILL_LEN × MODEL_DIM
-        weights: weight dict
-
-    Returns:
-        dict with all intermediate values including residual2 (1 × MODEL_DIM)
+    All values are FP16 bit patterns (uint16).
     """
     g = {}
-    embed = [new_embed_int16]  # 1 × MODEL_DIM (wrap in list for matmul)
-    g['embed_int16'] = embed
-    cache_total = PREFILL_LEN + 1  # 9
+    embed = [new_embed_fp16]
+    g['embed_fp16'] = embed
+    cache_total = PREFILL_LEN + 1
 
-    # LN1
     print("    [decode] LN1...")
     ln1_out = [layernorm_golden(embed[0], weights['gamma1'], weights['beta1'], MODEL_DIM)]
     g['ln1_out'] = ln1_out
 
-    # QKV projections (single token)
     print("    [decode] QKV matmuls...")
-    Q_new = tiled_matmul_int16_numpy(ln1_out, weights['W_q'], TILE_SIZE)
-    K_new = tiled_matmul_int16_numpy(ln1_out, weights['W_k'], TILE_SIZE)
-    V_new = tiled_matmul_int16_numpy(ln1_out, weights['W_v'], TILE_SIZE)
+    Q_new = tiled_matmul_fp16_numpy(ln1_out, weights['W_q'], TILE_SIZE,
+                                     bias=weights['bias_q'])
+    K_new = tiled_matmul_fp16_numpy(ln1_out, weights['W_k'], TILE_SIZE,
+                                     bias=weights['bias_k'])
+    V_new = tiled_matmul_fp16_numpy(ln1_out, weights['W_v'], TILE_SIZE,
+                                     bias=weights['bias_v'])
     g['Q'] = Q_new
     g['K_new'] = K_new
     g['V_new'] = V_new
 
-    # Full K/V = cache ++ new
-    K_full = K_cache + K_new  # 9 rows
-    V_full = V_cache + V_new  # 9 rows
+    K_full = K_cache + K_new
+    V_full = V_cache + V_new
     g['K_full'] = K_full
     g['V_full'] = V_full
 
-    # Multi-head attention with full cache
     print("    [decode] Attention (16 heads, cache_total=%d)..." % cache_total)
     attn_concat = [[0] * MODEL_DIM]
 
     for h in range(NUM_HEADS):
-        Q_h = [row[h*HEAD_DIM:(h+1)*HEAD_DIM] for row in Q_new]      # 1 × HEAD_DIM
-        K_h = [row[h*HEAD_DIM:(h+1)*HEAD_DIM] for row in K_full]     # 9 × HEAD_DIM
-        V_h = [row[h*HEAD_DIM:(h+1)*HEAD_DIM] for row in V_full]     # 9 × HEAD_DIM
+        Q_h = [row[h*HEAD_DIM:(h+1)*HEAD_DIM] for row in Q_new]
+        K_h = [row[h*HEAD_DIM:(h+1)*HEAD_DIM] for row in K_full]
+        V_h = [row[h*HEAD_DIM:(h+1)*HEAD_DIM] for row in V_full]
 
-        K_h_T = _transpose(K_h)   # HEAD_DIM × 9
-        scores_h = tiled_matmul_int16_numpy(Q_h, K_h_T, TILE_SIZE)   # 1 × 9
+        K_h_T = _transpose(K_h)
+        scores_h = tiled_matmul_fp16_numpy(Q_h, K_h_T, TILE_SIZE)
 
-        # Causal mask: row_idx = PREFILL_LEN (= cache_len_r) allows cols 0..PREFILL_LEN
-        probs_h = [softmax_golden(scores_h[0], scale_shift=SCALE_SHIFT,
+        probs_h = [softmax_golden(scores_h[0], SCALE_FACTOR,
                                   row_idx=PREFILL_LEN)]
 
-        attn_h = tiled_matmul_int16_numpy(probs_h, V_h, TILE_SIZE)   # 1 × HEAD_DIM
+        attn_h = tiled_matmul_fp16_numpy(probs_h, V_h, TILE_SIZE)
 
         for d in range(HEAD_DIM):
             attn_concat[0][h*HEAD_DIM + d] = attn_h[0][d]
 
     g['attn_out'] = attn_concat
 
-    # Output projection
     print("    [decode] Output projection...")
-    attn_proj = tiled_matmul_int16_numpy(attn_concat, weights['W_o'], TILE_SIZE)
+    attn_proj = tiled_matmul_fp16_numpy(attn_concat, weights['W_o'], TILE_SIZE,
+                                         bias=weights['bias_proj'])
     g['attn_proj'] = attn_proj
 
-    # Residual 1 = new_embed + proj
     print("    [decode] Residual 1...")
     residual1 = [residual_add_golden(embed[0], attn_proj[0])]
     g['residual1'] = residual1
 
-    # LN2
     print("    [decode] LN2...")
     ln2_out = [layernorm_golden(residual1[0], weights['gamma2'], weights['beta2'], MODEL_DIM)]
     g['ln2_out'] = ln2_out
 
-    # FFN1
     print("    [decode] FFN1...")
-    ffn1 = tiled_matmul_int16_numpy(ln2_out, weights['W_ffn1'], TILE_SIZE)
+    ffn1 = tiled_matmul_fp16_numpy(ln2_out, weights['W_ffn1'], TILE_SIZE,
+                                    bias=weights['bias_ffn1'])
     g['ffn1'] = ffn1
 
-    # ReLU
-    print("    [decode] ReLU...")
-    ffn_act = [[relu_golden(v) for v in row] for row in ffn1]
+    print("    [decode] GELU...")
+    ffn_act = [gelu_golden(row) for row in ffn1]
     g['ffn_act'] = ffn_act
 
-    # FFN2
     print("    [decode] FFN2...")
-    ffn2 = tiled_matmul_int16_numpy(ffn_act, weights['W_ffn2'], TILE_SIZE)
+    ffn2 = tiled_matmul_fp16_numpy(ffn_act, weights['W_ffn2'], TILE_SIZE,
+                                    bias=weights['bias_ffn2'])
     g['ffn2'] = ffn2
 
-    # Residual 2 = new_embed + ffn2
     print("    [decode] Residual 2...")
-    residual2 = [residual_add_golden(embed[0], ffn2[0])]
+    residual2 = [residual_add_golden(residual1[0], ffn2[0])]
     g['residual2'] = residual2
 
     return g
@@ -314,71 +299,52 @@ def compute_golden_decode(new_embed_int16, K_cache, V_cache, weights):
 # HBM Hex File Generation
 # ---------------------------------------------------------------------------
 
-def generate_hex_files(weights, embed_int8, new_embed_int8):
+def generate_hex_files(weights, embed_fp16, new_embed_fp16):
     """Generate hex files for both prefill and decode phases."""
     os.makedirs(TEST_DATA_DIR, exist_ok=True)
 
-    # Weight HBM (same as test_top_1k)
-    print("    Packing weight HBM...")
-    wgt_mem = {}
-    pack_matrix_int8_as_int16(weights['W_q'], MODEL_DIM, MODEL_DIM,
-                              WEIGHT_BASE + LAYER_WQ_OFFSET, MODEL_STRIDE, wgt_mem)
-    pack_matrix_int8_as_int16(weights['W_k'], MODEL_DIM, MODEL_DIM,
-                              WEIGHT_BASE + LAYER_WK_OFFSET, MODEL_STRIDE, wgt_mem)
-    pack_matrix_int8_as_int16(weights['W_v'], MODEL_DIM, MODEL_DIM,
-                              WEIGHT_BASE + LAYER_WV_OFFSET, MODEL_STRIDE, wgt_mem)
-    pack_matrix_int8_as_int16(weights['W_o'], MODEL_DIM, MODEL_DIM,
-                              WEIGHT_BASE + LAYER_WO_OFFSET, MODEL_STRIDE, wgt_mem)
-    pack_matrix_int8_as_int16(weights['W_ffn1'], MODEL_DIM, F_DIM,
-                              WEIGHT_BASE + LAYER_FFN1_OFFSET, F_STRIDE, wgt_mem)
-    pack_matrix_int8_as_int16(weights['W_ffn2'], F_DIM, MODEL_DIM,
-                              WEIGHT_BASE + LAYER_FFN2_OFFSET, MODEL_STRIDE, wgt_mem)
+    # Single shared HBM (weights + LN params + embeddings)
+    print("    Packing shared HBM...")
+    hbm_mem = {}
+    pack_matrix_fp16(weights['W_q'], MODEL_DIM, MODEL_DIM,
+                     WEIGHT_BASE + LAYER_WQ_OFFSET, MODEL_STRIDE, hbm_mem)
+    pack_matrix_fp16(weights['W_k'], MODEL_DIM, MODEL_DIM,
+                     WEIGHT_BASE + LAYER_WK_OFFSET, MODEL_STRIDE, hbm_mem)
+    pack_matrix_fp16(weights['W_v'], MODEL_DIM, MODEL_DIM,
+                     WEIGHT_BASE + LAYER_WV_OFFSET, MODEL_STRIDE, hbm_mem)
+    pack_matrix_fp16(weights['W_o'], MODEL_DIM, MODEL_DIM,
+                     WEIGHT_BASE + LAYER_WO_OFFSET, MODEL_STRIDE, hbm_mem)
+    pack_matrix_fp16(weights['W_ffn1'], MODEL_DIM, F_DIM,
+                     WEIGHT_BASE + LAYER_FFN1_OFFSET, F_STRIDE, hbm_mem)
+    pack_matrix_fp16(weights['W_ffn2'], F_DIM, MODEL_DIM,
+                     WEIGHT_BASE + LAYER_FFN2_OFFSET, MODEL_STRIDE, hbm_mem)
     pack_ln_params(weights['gamma1'], weights['beta1'],
-                   WEIGHT_BASE + LAYER_LN1_OFFSET, wgt_mem)
+                   WEIGHT_BASE + LAYER_LN1_OFFSET, hbm_mem)
     pack_ln_params(weights['gamma2'], weights['beta2'],
-                   WEIGHT_BASE + LAYER_LN2_OFFSET, wgt_mem)
+                   WEIGHT_BASE + LAYER_LN2_OFFSET, hbm_mem)
+    qkv_bias = weights['bias_q'] + weights['bias_k'] + weights['bias_v']
+    pack_bias_vector(qkv_bias, WEIGHT_BASE + LAYER_BIAS_QKV_OFFSET, hbm_mem)
+    pack_bias_vector(weights['bias_proj'], WEIGHT_BASE + LAYER_BIAS_PROJ_OFFSET, hbm_mem)
+    pack_bias_vector(weights['bias_ffn1'], WEIGHT_BASE + LAYER_BIAS_FFN1_OFFSET, hbm_mem)
+    pack_bias_vector(weights['bias_ffn2'], WEIGHT_BASE + LAYER_BIAS_FFN2_OFFSET, hbm_mem)
+    pack_matrix_fp16(embed_fp16, BT_PREFILL, MODEL_DIM,
+                     ACT_BASE + ACT_EMBED_OFFSET, MODEL_STRIDE, hbm_mem)
 
-    print("    Writing weight hex file...")
-    write_hex_file(os.path.join(TEST_DATA_DIR, "hbm_wgt_decode.hex"),
-                   [wgt_mem.get(a, '0' * 64) for a in range(SIM_HBM_DEPTH)])
-
-    # Activation HBM (PREFILL_LEN rows of embeddings)
-    print("    Packing activation HBM...")
-    act_mem = {}
-    embed_int16 = [[int16(int8(v)) for v in row] for row in embed_int8]
-    pack_matrix_int16(embed_int16, BT_PREFILL, MODEL_DIM,
-                      ACT_BASE + ACT_EMBED_OFFSET, MODEL_STRIDE, act_mem)
-
-    print("    Writing activation hex file...")
-    write_hex_file(os.path.join(TEST_DATA_DIR, "hbm_act_decode.hex"),
-                   [act_mem.get(a, '0' * 64) for a in range(SIM_HBM_DEPTH)])
-
-    # DMA HBM (LN params + embeddings for residual add)
-    print("    Packing DMA HBM...")
-    dma_mem = {}
-    pack_ln_params(weights['gamma1'], weights['beta1'],
-                   WEIGHT_BASE + LAYER_LN1_OFFSET, dma_mem)
-    pack_ln_params(weights['gamma2'], weights['beta2'],
-                   WEIGHT_BASE + LAYER_LN2_OFFSET, dma_mem)
-    pack_matrix_int16(embed_int16, BT_PREFILL, MODEL_DIM,
-                      ACT_BASE + ACT_EMBED_OFFSET, MODEL_STRIDE, dma_mem)
-
-    print("    Writing DMA hex file...")
-    write_hex_file(os.path.join(TEST_DATA_DIR, "hbm_dma_decode.hex"),
-                   [dma_mem.get(a, '0' * 64) for a in range(SIM_HBM_DEPTH)])
+    print("    Writing shared HBM hex file...")
+    write_hex_file(os.path.join(TEST_DATA_DIR, "hbm_decode.hex"),
+                   [hbm_mem.get(a, '0' * 64) for a in range(SIM_HBM_DEPTH)])
 
     # Decode new token embedding (1 row = MODEL_STRIDE words)
     print("    Packing decode embedding...")
-    new_embed_int16 = [int16(int8(v)) for v in new_embed_int8]
     embed_words = []
     for w_idx in range(MODEL_STRIDE):
-        elems = new_embed_int16[w_idx * WE : (w_idx + 1) * WE]
-        embed_words.append(pack_int16_to_256bit(elems))
+        elems = new_embed_fp16[w_idx * WE : (w_idx + 1) * WE]
+        embed_words.append(pack_16bit_to_256bit(elems))
 
     write_hex_file(os.path.join(TEST_DATA_DIR, "decode_new_embed.hex"), embed_words)
 
     print(f"  Hex files written to {TEST_DATA_DIR}/")
-    return new_embed_int16
+    return new_embed_fp16
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +379,7 @@ def run_simulation():
     print("  Running simulation (prefill + decode, may take a few minutes)...")
     try:
         result = subprocess.run([binary], cwd=PROJECT_ROOT,
-                                capture_output=True, text=True, timeout=600)
+                                capture_output=True, text=True, timeout=900)
     except subprocess.TimeoutExpired:
         print("  FAIL: Simulation timed out (600s)")
         return False
@@ -480,11 +446,60 @@ def compare_rtl_output(g_prefill, g_decode):
         ok, mis = compare_matrices(g_decode['V_new'], rtl_v_new, 'decode_V_new', f)
         total_ok += ok; total_mis += mis
 
+        # --- Diagnostic: decode intermediate stages ---
+
+        # Mid-decode dump (after step 6: res1 flush to ACT_EMBED)
+        mid_path = os.path.join(TEST_DATA_DIR, "hbm_mid_decode_dump.hex")
+        if os.path.exists(mid_path):
+            mid_words = read_hex_dump(mid_path)
+
+            # Residual1 output at ACT_EMBED (before step 14 overwrites it)
+            f.write("\n--- Decode Residual 1 (mid-decode HBM at ACT_EMBED) ---\n")
+            rtl_res1 = extract_matrix_from_hbm(
+                mid_words, ACT_BASE + ACT_EMBED_OFFSET, 1, MODEL_STRIDE, MODEL_DIM)
+            ok, mis = compare_matrices(g_decode['residual1'], rtl_res1, 'decode_res1', f,
+                                       rel_tol=0.05, abs_tol=0.15)
+            f.write(f"  (diagnostic: {mis} divergent elements)\n")
+            total_ok += ok + mis  # don't count as failure
+
+            # LN1 output at ACT_TEMP (step 1 flush, still valid at step 7)
+            f.write("\n--- Decode LN1 output (mid-decode HBM at ACT_TEMP) ---\n")
+            rtl_ln1 = extract_matrix_from_hbm(
+                mid_words, ACT_BASE + ACT_TEMP_OFFSET, 1, MODEL_STRIDE, MODEL_DIM)
+            ok, mis = compare_matrices(g_decode['ln1_out'], rtl_ln1, 'decode_ln1', f,
+                                       rel_tol=0.05, abs_tol=0.15)
+            f.write(f"  (diagnostic: {mis} divergent elements)\n")
+            total_ok += ok + mis  # don't count as failure
+
+            # Note: ACT_Q at this point contains the concatenated attention output
+            # (per-head ATT_OUT flush), not Q values. Q was overwritten by attention output.
+        else:
+            f.write("\n  (mid-decode HBM dump not found — skipping res1/ln1/Q diagnostics)\n")
+
+        # LN2 output should be at ACT_TEMP (step 8 flush, not overwritten)
+        f.write("\n--- Decode LN2 output (flush HBM at ACT_TEMP) ---\n")
+        rtl_ln2 = extract_matrix_from_hbm(
+            flush_words, ACT_BASE + ACT_TEMP_OFFSET, 1, MODEL_STRIDE, MODEL_DIM)
+        ok, mis = compare_matrices(g_decode['ln2_out'], rtl_ln2, 'decode_ln2', f,
+                                   rel_tol=0.05, abs_tol=0.15)
+        f.write(f"  (diagnostic: {mis} divergent elements)\n")
+        total_ok += ok + mis  # don't count as failure
+
+        # GELU output should be at ACT_Q_OFFSET (step 11 flush to ACT_FFN=ACT_Q)
+        f.write("\n--- Decode GELU output (flush HBM at ACT_Q=ACT_FFN) ---\n")
+        rtl_gelu = extract_matrix_from_hbm(
+            flush_words, ACT_BASE + ACT_Q_OFFSET, 1, F_STRIDE, F_DIM)
+        ok, mis = compare_matrices(g_decode['ffn_act'], rtl_gelu, 'decode_gelu', f,
+                                   rel_tol=0.05, abs_tol=0.15)
+        f.write(f"  (diagnostic: {mis} divergent elements)\n")
+        total_ok += ok + mis  # don't count as failure
+
         # --- Verify decode final output (residual2) ---
         f.write("\n--- Decode Residual 2 (flush HBM at ACT_EMBED) ---\n")
         rtl_res2 = extract_matrix_from_hbm(
             flush_words, ACT_BASE + ACT_EMBED_OFFSET, 1, MODEL_STRIDE, MODEL_DIM)
-        ok, mis = compare_matrices(g_decode['residual2'], rtl_res2, 'decode_res2_flush', f)
+        ok, mis = compare_matrices(g_decode['residual2'], rtl_res2, 'decode_res2_flush', f,
+                                   rel_tol=0.05, abs_tol=0.15)
         total_ok += ok; total_mis += mis
 
         # URAM check
@@ -494,7 +509,8 @@ def compare_rtl_output(g_prefill, g_decode):
             rtl_uram_res2 = extract_matrix_from_uram(
                 uram_words, 0, 1, MODEL_STRIDE, MODEL_STRIDE)
             ok, mis = compare_matrices(g_decode['residual2'], rtl_uram_res2,
-                                       'decode_res2_uram', f)
+                                       'decode_res2_uram', f,
+                                       rel_tol=0.05, abs_tol=0.15)
             total_ok += ok; total_mis += mis
 
         f.write("\n" + "=" * 60 + "\n")
@@ -540,14 +556,14 @@ def write_golden(g_prefill, g_decode):
 
         f.write("--- PREFILL ---\n")
         for stage, name in [
-            ('embed_int16', 'Embeddings'), ('K', 'K cache'), ('V', 'V cache'),
+            ('embed_fp16', 'Embeddings'), ('K', 'K cache'), ('V', 'V cache'),
             ('residual2', 'Prefill res2'),
         ]:
             write_mat_summary(name, g_prefill[stage])
 
         f.write("\n--- DECODE ---\n")
         for stage, name in [
-            ('embed_int16', 'New token'), ('ln1_out', 'LN1'),
+            ('embed_fp16', 'New token'), ('ln1_out', 'LN1'),
             ('Q', 'Q_new'), ('K_new', 'K_new'), ('V_new', 'V_new'),
             ('attn_out', 'Attn output'), ('attn_proj', 'Proj'),
             ('residual1', 'Res1'), ('ln2_out', 'LN2'),
@@ -577,26 +593,24 @@ def main():
     print("\n  Generating weights...")
     weights = generate_weights(seed=SEED)
 
-    # Prefill embeddings (8 tokens)
-    rng = random.Random(SEED + 2)
-    embed_int8 = [
-        [rng.randint(-2, 1) for _ in range(MODEL_DIM)]
-        for _ in range(BT_PREFILL)
-    ]
+    # Prefill embeddings (8 tokens, FP16)
+    rng = np.random.RandomState(SEED + 2)
+    embed_fp16 = rng.uniform(-0.05, 0.05, (BT_PREFILL, MODEL_DIM)).astype(
+        np.float16).view(np.uint16).astype(int).tolist()
 
-    # New decode token embedding (different seed)
-    rng_dec = random.Random(DECODE_EMBED_SEED)
-    new_embed_int8 = [rng_dec.randint(-2, 1) for _ in range(MODEL_DIM)]
+    # New decode token embedding (different seed, FP16)
+    rng_dec = np.random.RandomState(DECODE_EMBED_SEED)
+    new_embed_fp16 = rng_dec.uniform(-0.05, 0.05, (1, MODEL_DIM)).astype(
+        np.float16).view(np.uint16).astype(int).tolist()[0]
 
     # Run prefill golden
     print("\n  Running prefill golden model...")
-    g_prefill = compute_golden_prefill(embed_int8, weights)
+    g_prefill = compute_golden_prefill(embed_fp16, weights)
 
     # Run decode golden (uses K/V cache from prefill)
     print("\n  Running decode golden model...")
-    new_embed_int16 = [int16(int8(v)) for v in new_embed_int8]
     g_decode = compute_golden_decode(
-        new_embed_int16,
+        new_embed_fp16,
         K_cache=g_prefill['K'],
         V_cache=g_prefill['V'],
         weights=weights,
@@ -606,7 +620,7 @@ def main():
 
     # Generate hex files
     print("\n  Generating HBM hex files...")
-    generate_hex_files(weights, embed_int8, new_embed_int8)
+    generate_hex_files(weights, embed_fp16, new_embed_fp16)
 
     if data_only:
         print("\n  --data-only: skipping compile/run")

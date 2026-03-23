@@ -5,7 +5,7 @@ module tb_cosim_layernorm;
 
     parameter DATA_W  = 16;
     parameter OUT_W   = 16;
-    parameter PARAM_W = 8;
+    parameter PARAM_W = 16;   // FP16 gamma/beta
     parameter DIM_W   = 16;
     parameter DIM     = 16;
     parameter MAX_DIM = 256;
@@ -29,10 +29,10 @@ module tb_cosim_layernorm;
     wire [DIM_W-1:0] out_wr_addr;
     wire [OUT_W-1:0] out_wr_data;
 
-    // Memory models
-    reg signed [DATA_W-1:0] input_mem [0:MAX_DIM-1];
-    reg signed [PARAM_W-1:0] gamma_mem [0:MAX_DIM-1];
-    reg signed [PARAM_W-1:0] beta_mem [0:MAX_DIM-1];
+    // Memory models (FP16 bit patterns — unsigned)
+    reg [DATA_W-1:0] input_mem [0:MAX_DIM-1];
+    // Interleaved param memory: gamma[0], beta[0], gamma[1], beta[1], ...
+    reg [PARAM_W-1:0] param_mem [0:2*MAX_DIM-1];
     reg [OUT_W-1:0] output_mem [0:MAX_DIM-1];
 
     integer i, fd;
@@ -59,25 +59,25 @@ module tb_cosim_layernorm;
         .out_wr_data(out_wr_data)
     );
 
-    // 1-cycle registered memory reads (matches real hardware: URAM adapter / act_dma)
+    // 1-cycle registered memory reads (matches real hardware)
     reg in_rd_valid_r;
     reg [DATA_W-1:0] in_rd_data_r;
     reg param_rd_valid_r;
-    reg [PARAM_W-1:0] gamma_data_r, beta_data_r;
+    reg [PARAM_W-1:0] param_data_r;
 
     always @(posedge clk) begin
         in_rd_valid_r    <= in_rd_en;
         in_rd_data_r     <= input_mem[in_rd_addr];
         param_rd_valid_r <= param_rd_en;
-        gamma_data_r     <= gamma_mem[param_rd_addr];
-        beta_data_r      <= beta_mem[param_rd_addr];
+        param_data_r     <= param_mem[param_rd_addr];
     end
 
     assign in_rd_valid = in_rd_valid_r;
     assign in_rd_data  = in_rd_data_r;
     assign param_rd_valid = param_rd_valid_r;
-    assign gamma_data     = gamma_data_r;
-    assign beta_data      = beta_data_r;
+    // Both gamma_data and beta_data come from the same interleaved memory
+    assign gamma_data     = param_data_r;
+    assign beta_data      = param_data_r;
 
     // Capture writes
     always @(posedge clk) begin
@@ -87,8 +87,7 @@ module tb_cosim_layernorm;
 
     initial begin
         $readmemh("verify/test_data/layernorm_in.hex", input_mem);
-        $readmemh("verify/test_data/layernorm_gamma.hex", gamma_mem);
-        $readmemh("verify/test_data/layernorm_beta.hex", beta_mem);
+        $readmemh("verify/test_data/layernorm_params.hex", param_mem);
         for (i = 0; i < MAX_DIM; i = i + 1)
             output_mem[i] = 0;
 

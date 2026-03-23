@@ -50,11 +50,12 @@ module tb_top_decode;
 
     // Weight/act base addresses
     localparam WEIGHT_BASE = 0;
-    localparam ACT_BASE    = 786688;       // LAYER_SIZE (production)
+    localparam ACT_BASE    = 787264;       // LAYER_SIZE (production, with biases)
     localparam KV_V_OFFSET  = 128 * 1024 / 16;               // 8192
     localparam KV_LAYER_SIZE = 2 * 128 * 1024 / 16;          // 16384
     localparam KV_BASE     = ACT_BASE + 6 * 128 * 1024 / 16; // after activation scratch
     localparam OUTPUT_BASE = 32'h8000;
+    localparam DEBUG_BASE  = TB_HBM_DEPTH - 512;  // Last 512 words for debug trace
 
     // =========================================================================
     // Signals
@@ -163,23 +164,15 @@ module tb_top_decode;
     initial begin
         #1;
 
-        // Load weight + activation data into shared prefetch HBM ports
-        // Shared weight prefetch HBM
-        $readmemh("verify/test_data/hbm_wgt_decode.hex", dut.u_hbm_pf_wgt.mem);
-        $readmemh("verify/test_data/hbm_act_decode.hex", dut.u_hbm_pf_wgt.mem);
-        // Shared activation prefetch HBM
-        $readmemh("verify/test_data/hbm_wgt_decode.hex", dut.u_hbm_pf_act.mem);
-        $readmemh("verify/test_data/hbm_act_decode.hex", dut.u_hbm_pf_act.mem);
-
-        // Load DMA HBM data
-        $readmemh("verify/test_data/hbm_dma_decode.hex", dut.u_hbm_dma.mem);
+        // Load combined weight + activation data into shared HBM
+        $readmemh("verify/test_data/hbm_decode.hex", dut.u_hbm.mem);
 
         // Preload URAM with PREFILL_LEN rows of initial embeddings
         for (uram_r = 0; uram_r < PREFILL_LEN; uram_r = uram_r + 1) begin
             for (uram_c = 0; uram_c < MODEL_STRIDE_L; uram_c = uram_c + 1) begin
                 uram_src = URAM_EMBED_SRC + uram_r * MODEL_STRIDE_L + uram_c;
                 dut.u_uram.mem[uram_r * URAM_COL_WORDS_HW + uram_c] =
-                    dut.u_hbm_pf_act.mem[uram_src];
+                    dut.u_hbm.mem[uram_src];
             end
         end
 
@@ -221,6 +214,8 @@ module tb_top_decode;
         axi_write(32'h18, OUTPUT_BASE);
         axi_write(32'h1C, 32'd0);   // decode_mode = 0
         axi_write(32'h20, 32'd0);   // cache_len = 0
+        axi_write(32'h28, NUM_ENC_LAYERS);  // num_layers
+        axi_write(32'h2C, DEBUG_BASE);  // debug trace base
 
         // Start prefill
         axi_write(32'h00, 32'h1);
@@ -240,7 +235,7 @@ module tb_top_decode;
         dump_fd = $fopen("verify/test_data/hbm_flush_prefill_dump.hex", "w");
         if (dump_fd != 0) begin
             for (dump_addr = 0; dump_addr < TB_HBM_DEPTH; dump_addr = dump_addr + 1) begin
-                $fwrite(dump_fd, "%064h\n", dut.u_hbm_flush.mem[dump_addr]);
+                $fwrite(dump_fd, "%064h\n", dut.u_hbm.mem[dump_addr]);
             end
             $fclose(dump_fd);
             $display("[%0t] Dumped prefill flush HBM", $time);
@@ -255,15 +250,9 @@ module tb_top_decode;
 
         $readmemh("verify/test_data/decode_new_embed.hex", decode_embed);
 
-        // Write new embedding to shared prefetch HBMs at ACT_BASE (1 row)
+        // Write new embedding to shared HBM at ACT_BASE (1 row) + URAM row 0
         for (de_i = 0; de_i < MODEL_STRIDE_L; de_i = de_i + 1) begin
-            dut.u_hbm_pf_act.mem[ACT_BASE + de_i] = decode_embed[de_i];
-            dut.u_hbm_pf_wgt.mem[ACT_BASE + de_i] = decode_embed[de_i];
-            // DMA HBM (for residual add skip connection)
-            dut.u_hbm_dma.mem[ACT_BASE + de_i] = decode_embed[de_i];
-            // Flush HBM (so mirror works correctly)
-            dut.u_hbm_flush.mem[ACT_BASE + de_i] = decode_embed[de_i];
-            // URAM row 0 (for LN1 to read)
+            dut.u_hbm.mem[ACT_BASE + de_i] = decode_embed[de_i];
             dut.u_uram.mem[0 * URAM_COL_WORDS_HW + de_i] = decode_embed[de_i];
         end
 
@@ -284,6 +273,23 @@ module tb_top_decode;
 
         // Start decode
         axi_write(32'h00, 32'h1);
+
+        // Wait for FSM to reach step 7 (LN2) — dump residual1 at ACT_EMBED
+        while (!(dut.u_fsm.step_idx == 4'd7 && dut.u_fsm.state != 5'd14)) begin
+            @(posedge clk);
+        end
+        $display("[%0t] DECODE: FSM at step 7 (LN2) — dumping intermediate HBM", $time);
+        $fflush();
+
+        dump_fd = $fopen("verify/test_data/hbm_mid_decode_dump.hex", "w");
+        if (dump_fd != 0) begin
+            for (dump_addr = 0; dump_addr < TB_HBM_DEPTH; dump_addr = dump_addr + 1) begin
+                $fwrite(dump_fd, "%064h\n", dut.u_hbm.mem[dump_addr]);
+            end
+            $fclose(dump_fd);
+            $display("[%0t] Dumped mid-decode HBM (after res1 flush)", $time);
+            $fflush();
+        end
 
         // Wait for FSM to reach DONE
         while (dut.u_fsm.state != 5'd15) begin
@@ -314,26 +320,28 @@ module tb_top_decode;
             $fflush();
         end
 
-        // --- Flush HBM dump ---
+        // --- Shared HBM dump (used as flush dump by comparison script) ---
         dump_fd = $fopen("verify/test_data/hbm_flush_decode_dump.hex", "w");
         if (dump_fd != 0) begin
             for (dump_addr = 0; dump_addr < TB_HBM_DEPTH; dump_addr = dump_addr + 1) begin
-                $fwrite(dump_fd, "%064h\n", dut.u_hbm_flush.mem[dump_addr]);
+                $fwrite(dump_fd, "%064h\n", dut.u_hbm.mem[dump_addr]);
             end
             $fclose(dump_fd);
-            $display("[%0t] Dumped flush HBM to verify/test_data/hbm_flush_decode_dump.hex",
+            $display("[%0t] Dumped shared HBM to verify/test_data/hbm_flush_decode_dump.hex",
                      $time);
             $fflush();
         end
 
-        // --- DMA HBM dump ---
-        dump_fd = $fopen("verify/test_data/hbm_dma_decode_dump.hex", "w");
+        // --- Debug trace dump ---
+        dump_fd = $fopen("verify/test_data/debug_trace_decode.hex", "w");
         if (dump_fd != 0) begin
-            for (dump_addr = 0; dump_addr < TB_HBM_DEPTH; dump_addr = dump_addr + 1) begin
-                $fwrite(dump_fd, "%064h\n", dut.u_hbm_dma.mem[dump_addr]);
+            for (dump_addr = DEBUG_BASE; dump_addr < DEBUG_BASE + 512; dump_addr = dump_addr + 1) begin
+                if (dut.u_hbm.mem[dump_addr] != 256'd0) begin
+                    $fwrite(dump_fd, "%064h\n", dut.u_hbm.mem[dump_addr]);
+                end
             end
             $fclose(dump_fd);
-            $display("[%0t] Dumped DMA HBM to verify/test_data/hbm_dma_decode_dump.hex", $time);
+            $display("[%0t] Dumped debug trace to verify/test_data/debug_trace_decode.hex", $time);
             $fflush();
         end
 
@@ -388,17 +396,12 @@ module tb_top_decode;
                 flush_params_valid <= 1'b1;
             end
 
+            // With shared HBM, flush writes are visible to prefetch reads automatically.
+            // Mirror is a no-op but we keep the display for debug logging.
             uf_done_prev <= dut.uf_done;
             if (dut.uf_done && !uf_done_prev && flush_params_valid) begin
-                for (mirror_r = 0; mirror_r <= saved_flush_rows; mirror_r = mirror_r + 1) begin
-                    for (mirror_c = 0; mirror_c <= saved_flush_cols; mirror_c = mirror_c + 1) begin
-                        mirror_addr = saved_flush_base + mirror_r * saved_flush_stride + mirror_c;
-                        dut.u_hbm_pf_act.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                        dut.u_hbm_pf_wgt.mem[mirror_addr] = dut.u_hbm_flush.mem[mirror_addr];
-                    end
-                end
                 flush_params_valid <= 1'b0;
-                $display("[%0t] FLUSH MIRROR: base=%0d stride=%0d rows=%0d cols=%0d (state=%0d)",
+                $display("[%0t] FLUSH COMPLETE: base=%0d stride=%0d rows=%0d cols=%0d (state=%0d)",
                          $time, saved_flush_base, saved_flush_stride,
                          saved_flush_rows + 1, saved_flush_cols + 1, dut.u_fsm.state);
                 $fflush();

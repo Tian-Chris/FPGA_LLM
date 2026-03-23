@@ -1,24 +1,28 @@
 `include "defines.vh"
 
 // =============================================================================
-// matmul_engine.v - 32x32 Outer-Product MAC Engine
+// matmul_engine.v - 32x32 Outer-Product FP16 MAC Engine
 // =============================================================================
 //
-// Uses 1024 mac_unit instances (32x32 generate grid).
+// Uses 1024 fp_mac_unit instances (32x32 generate grid).
 // Data loading: 256-bit bus, 2 reads per 32-element row.
 // Supports OP_MATMUL (standard) and OP_MATMUL_T (transposed B) via full
 // B-tile buffer: for OP_MATMUL, rows of B are broadcast; for OP_MATMUL_T,
 // columns of B are extracted (B[n][k] instead of B[k][n]).
-// Output serialization: 16 INT16 elements per write, 2 writes per row.
+// Output serialization: FP32 acc → FP16 conversion, 16 elements per write.
+//
+// MAC pipeline drain uses parameterized counter (MAC_DEPTH) instead of
+// hardcoded delay chain — engine is MAC-latency-agnostic.
 // =============================================================================
 
 module matmul_engine #(
-    parameter TILE     = 32,
-    parameter DATA_W   = 16,
-    parameter ACC_W    = 32,
-    parameter OUT_W    = 16,
-    parameter BUS_W    = 256,
-    parameter BUS_EL   = BUS_W / DATA_W    // 16 elements per bus read
+    parameter TILE      = 32,
+    parameter DATA_W    = 16,
+    parameter ACC_W     = 32,
+    parameter OUT_W     = 16,
+    parameter BUS_W     = 256,
+    parameter BUS_EL    = BUS_W / DATA_W,   // 16 elements per bus read
+    parameter MAC_DEPTH = 3                  // MAC pipeline stages for drain timing
 )(
     input  wire                 clk,
     input  wire                 rst_n,
@@ -43,8 +47,9 @@ module matmul_engine #(
     input  wire [4:0]           tile_row,
     input  wire [4:0]           tile_col,
     input  wire                 first_tile,    // Clear MACs only on first k-tile
+    input  wire [4:0]           tile_k_limit,  // Last valid compute_k index (0-based)
 
-    // Output interface: BUS_EL (16) INT16 per write = 256 bits
+    // Output interface: BUS_EL (16) FP16 per write = 256 bits
     (* mark_debug = "true" *) output reg                  out_valid,
     output reg  [BUS_W-1:0]     out_data,
     output reg  [4:0]           out_row,
@@ -62,9 +67,9 @@ module matmul_engine #(
     localparam [2:0] OP_T    = 3'd1;                // OP_MATMUL_T
 
     // =========================================================================
-    // A-tile buffer: TILE x TILE array of INT16
+    // A-tile buffer: TILE x TILE array of FP16 bit patterns
     // =========================================================================
-    reg signed [DATA_W-1:0] a_buf [0:TILE-1][0:TILE-1];
+    reg [DATA_W-1:0] a_buf [0:TILE-1][0:TILE-1];
 
     // Counters for multi-cycle loading
     reg [4:0] a_row_cnt;        // Which row of A we're loading
@@ -73,7 +78,7 @@ module matmul_engine #(
     // =========================================================================
     // B-tile buffer: TILE x TILE (full 2D for transpose support)
     // =========================================================================
-    reg signed [DATA_W-1:0] b_buf [0:TILE-1][0:TILE-1];
+    reg [DATA_W-1:0] b_buf [0:TILE-1][0:TILE-1];
     reg [4:0] b_load_row;       // Which row of B we're loading
     reg       b_load_half;      // 0 = first 16 elems, 1 = second 16 elems
     reg [6:0] b_load_cnt;       // Total b_valid beats received: 0..BUF_BEATS
@@ -90,37 +95,36 @@ module matmul_engine #(
     reg       compute_done_flag;   // Stays set until tile_start clears it
 
     // B broadcast: frozen row/column extracted from b_buf during compute
-    reg signed [DATA_W-1:0] b_frozen [0:TILE-1];
+    reg [DATA_W-1:0] b_frozen [0:TILE-1];
     // MAC control
     reg  mac_clear;
     reg  mac_enable;
 
-    // Pipeline tile control (tile_done → output serialization timing)
-    reg tile_done_d1, tile_done_d2, tile_done_d3, tile_done_d4, tile_done_d5;
-    reg [4:0] tile_col_d1, tile_col_d2, tile_col_d3, tile_col_d4, tile_col_d5;
+    // Drain counter: replaces hardcoded tile_done delay chain
+    reg        flush_pending;
+    reg [4:0]  flush_col;
+    reg [3:0]  drain_cnt;
 
     integer i, j;
 
     // =========================================================================
-    // MAC unit wires
+    // FP MAC unit wires
     // =========================================================================
-    wire signed [ACC_W-1:0] mac_acc [0:TILE-1][0:TILE-1];
+    wire [ACC_W-1:0] mac_acc [0:TILE-1][0:TILE-1];
 
-    // Broadcast signals for outer-product
-    reg  signed [DATA_W-1:0] a_broadcast_r [0:TILE-1]; // a_buf[row][k] — registered
-    wire signed [DATA_W-1:0] b_broadcast   [0:TILE-1]; // b_frozen[col]
+    // Broadcast signals for outer-product (FP16 bit patterns, not signed)
+    reg  [DATA_W-1:0] a_broadcast_r [0:TILE-1]; // a_buf[row][k] — registered
+    wire [DATA_W-1:0] b_broadcast   [0:TILE-1]; // b_frozen[col]
 
     genvar gi, gj;
     generate
         for (gi = 0; gi < TILE; gi = gi + 1) begin : mac_row
-            // Register a_broadcast using compute_k (1 cycle ahead of old b_k_cnt)
-            // so the registered output aligns with b_frozen — zero net latency change
             always @(posedge clk) begin
                 a_broadcast_r[gi] <= a_buf[gi][compute_k];
             end
 
             for (gj = 0; gj < TILE; gj = gj + 1) begin : mac_col
-                mac_unit #(
+                fp_mac_unit #(
                     .DATA_W(DATA_W),
                     .ACC_W(ACC_W)
                 ) u_mac (
@@ -172,9 +176,9 @@ module matmul_engine #(
                 // Unpack 16 elements from bus into a_buf
                 for (j = 0; j < BUS_EL; j = j + 1) begin
                     if (!a_half)
-                        a_buf[a_row_cnt][j] <= $signed(a_data[j*DATA_W +: DATA_W]);
+                        a_buf[a_row_cnt][j] <= a_data[j*DATA_W +: DATA_W];
                     else
-                        a_buf[a_row_cnt][j + BUS_EL] <= $signed(a_data[j*DATA_W +: DATA_W]);
+                        a_buf[a_row_cnt][j + BUS_EL] <= a_data[j*DATA_W +: DATA_W];
                 end
 
                 if (a_half) begin
@@ -210,9 +214,9 @@ module matmul_engine #(
             end else if (b_valid && !b_loaded) begin
                 for (j = 0; j < BUS_EL; j = j + 1) begin
                     if (!b_load_half)
-                        b_buf[b_load_row][j] <= $signed(b_data[j*DATA_W +: DATA_W]);
+                        b_buf[b_load_row][j] <= b_data[j*DATA_W +: DATA_W];
                     else
-                        b_buf[b_load_row][j + BUS_EL] <= $signed(b_data[j*DATA_W +: DATA_W]);
+                        b_buf[b_load_row][j + BUS_EL] <= b_data[j*DATA_W +: DATA_W];
                 end
                 b_load_cnt <= b_load_cnt + 1;
                 if (b_load_half) begin
@@ -228,26 +232,31 @@ module matmul_engine #(
     // =========================================================================
     // Compute Phase State Machine
     // =========================================================================
-    // After b_loaded, iterate compute_k from 0 to TILE-1.
+    // After b_loaded, iterate compute_k from 0 to tile_k_limit.
     // Each cycle extracts a row (OP_MATMUL) or column (OP_MATMUL_T) from b_buf
     // into b_frozen. MAC fires one cycle later (mac_enable = computing delayed 1).
+    // tile_k_limit is normally TILE-1 (31) but can be smaller for the last k-tile
+    // when cmd_k is not a multiple of TILE (e.g., decode attention with k=9).
+    reg [4:0] k_limit_r;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             computing         <= 1'b0;
             compute_k         <= 5'd0;
             compute_done_flag <= 1'b0;
+            k_limit_r         <= TILE[4:0] - 1;
         end else begin
             if (tile_start) begin
                 computing         <= 1'b0;
                 compute_k         <= 5'd0;
                 compute_done_flag <= 1'b0;
+                k_limit_r         <= tile_k_limit;
             end else if (b_loaded && !computing && !compute_done_flag) begin
                 // Start compute phase
                 computing <= 1'b1;
                 compute_k <= 5'd0;
             end else if (computing) begin
-                if (compute_k == TILE - 1) begin
+                if (compute_k == k_limit_r) begin
                     computing         <= 1'b0;
                     compute_done_flag <= 1'b1;
                 end else begin
@@ -305,21 +314,35 @@ module matmul_engine #(
     assign compute_done = mac_enable_prev && !mac_enable;
 
     // =========================================================================
-    // Pipeline Tile Control
+    // Drain Counter — replaces hardcoded 5-stage delay chain
     // =========================================================================
-    // tile_done propagates through 5-stage delay chain before triggering output.
-    // This provides time for the MAC pipeline (3 stages) to drain plus margin.
-    always @(posedge clk) begin
-        tile_done_d1 <= tile_done;
-        tile_done_d2 <= tile_done_d1;
-        tile_done_d3 <= tile_done_d2;
-        tile_done_d4 <= tile_done_d3;
-        tile_done_d5 <= tile_done_d4;
-        tile_col_d1  <= tile_col;
-        tile_col_d2  <= tile_col_d1;
-        tile_col_d3  <= tile_col_d2;
-        tile_col_d4  <= tile_col_d3;
-        tile_col_d5  <= tile_col_d4;
+    // When tile_done arrives, latch it and count MAC_DEPTH cycles for the
+    // MAC pipeline to drain. Then trigger output serialization.
+    // This makes the engine MAC-latency-agnostic.
+
+    // Consume signal: drain done → output serialization triggered
+    wire flush_consumed = flush_pending && drain_cnt == 4'd0
+                          && !start_pending && !outputting;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            flush_pending <= 1'b0;
+            flush_col     <= 5'd0;
+            drain_cnt     <= 4'd0;
+        end else begin
+            if (tile_start) begin
+                flush_pending <= 1'b0;
+                drain_cnt     <= 4'd0;
+            end else if (tile_done) begin
+                flush_pending <= 1'b1;
+                flush_col     <= tile_col;
+                drain_cnt     <= MAC_DEPTH[3:0];
+            end else if (flush_consumed) begin
+                flush_pending <= 1'b0;
+            end else if (flush_pending && drain_cnt > 4'd0) begin
+                drain_cnt <= drain_cnt - 4'd1;
+            end
+        end
     end
 
     // =========================================================================
@@ -352,9 +375,10 @@ module matmul_engine #(
             // pipeline bubble causes lost beats when the arbiter denies
             // the write.
 
-            if (tile_done_d5) begin
+            // Drain counter expired → trigger output serialization
+            if (flush_pending && drain_cnt == 4'd0 && !start_pending && !outputting) begin
                 start_pending  <= 1'b1;
-                tile_col_saved <= tile_col_d5;
+                tile_col_saved <= flush_col;
             end
 
             // Wait for MAC pipeline to drain before starting output
@@ -371,9 +395,9 @@ module matmul_engine #(
                 out_row   <= out_row_cnt;
                 out_col   <= tile_col_saved;
 
-                // Pack 16 elements from acc row, offset by out_sub_col * 16
+                // Pack 16 FP16 elements: FP32 acc → FP16 conversion
                 for (j = 0; j < BUS_EL; j = j + 1) begin
-                    out_data[j*OUT_W +: OUT_W] <= saturate(mac_acc[out_row_cnt][out_sub_col * BUS_EL + j]);
+                    out_data[j*OUT_W +: OUT_W] <= fp32_to_fp16_func(mac_acc[out_row_cnt][out_sub_col * BUS_EL + j]);
                 end
 
                 if (out_sub_col) begin
@@ -389,30 +413,63 @@ module matmul_engine #(
                 end
             end
 
-            // Clear out_valid after last beat is consumed (outputting=0)
-            // or during idle. Only when not stalled (so held beat persists).
-            if (!outputting && !out_stall)
+            // Clear out_valid when not outputting. Must be unconditional
+            // (no out_stall gate) to prevent infinite re-issue after the
+            // last beat when the URAM arbiter denies the engine write.
+            if (!outputting)
                 out_valid <= 1'b0;
         end
     end
 
     // =========================================================================
-    // Saturation: ACC_W (32) → OUT_W (16)
+    // FP32 → FP16 Conversion (replaces saturate)
     // =========================================================================
-    function signed [OUT_W-1:0] saturate;
-        input signed [ACC_W-1:0] val;
-        reg signed [OUT_W-1:0] max_val;
-        reg signed [OUT_W-1:0] min_val;
+    function [OUT_W-1:0] fp32_to_fp16_func;
+        input [ACC_W-1:0] val;
+        reg        sign;
+        reg [7:0]  exp;
+        reg [22:0] mant;
+        reg signed [8:0] new_exp;
+        reg [9:0]  trunc_mant;
+        reg        guard, rnd, sticky;
+        reg        round_up;
+        reg [10:0] rounded;
+        reg [9:0]  rmant;
+        reg signed [8:0] rexp;
         begin
-            max_val = {1'b0, {(OUT_W-1){1'b1}}};
-            min_val = {1'b1, {(OUT_W-1){1'b0}}};
+            sign = val[31];
+            exp  = val[30:23];
+            mant = val[22:0];
+            new_exp = {1'b0, exp} - 9'sd112;
 
-            if (val > max_val)
-                saturate = max_val;
-            else if (val < min_val)
-                saturate = min_val;
-            else
-                saturate = val[OUT_W-1:0];
+            if (exp == 8'hFF && mant != 23'd0)
+                fp32_to_fp16_func = {sign, 5'b11111, 1'b1, mant[21:13]};  // NaN
+            else if (exp == 8'hFF)
+                fp32_to_fp16_func = {sign, 5'b11111, 10'd0};              // Inf
+            else if (exp == 8'd0)
+                fp32_to_fp16_func = {sign, 15'd0};                        // Zero
+            else begin
+                trunc_mant = mant[22:13];
+                guard   = mant[12];
+                rnd     = mant[11];
+                sticky  = |mant[10:0];
+                round_up = guard && (rnd || sticky || trunc_mant[0]);
+                rounded = {1'b0, trunc_mant} + {10'd0, round_up};
+                if (rounded[10]) begin
+                    rmant = 10'd0;
+                    rexp = new_exp + 9'sd1;
+                end else begin
+                    rmant = rounded[9:0];
+                    rexp = new_exp;
+                end
+
+                if (rexp >= 9'sd31)
+                    fp32_to_fp16_func = {sign, 5'b11111, 10'd0};  // Overflow → Inf
+                else if (rexp <= 9'sd0)
+                    fp32_to_fp16_func = {sign, 15'd0};            // Underflow → zero
+                else
+                    fp32_to_fp16_func = {sign, rexp[4:0], rmant};
+            end
         end
     endfunction
 
@@ -487,6 +544,8 @@ module matmul_controller #(
     input  wire [URAM_ROW_W-1:0]   cmd_out_row,       // URAM output starting row
     input  wire [URAM_COL_W-1:0]   cmd_out_col_word,  // URAM output starting col word
     input  wire                     cmd_first_k_chunk, // 1=first k-chunk (overwrite), 0=accumulate
+    input  wire                     cmd_last_k_chunk,  // 1=last k-chunk (apply bias if has_bias)
+    input  wire                     cmd_has_bias,      // 1=add bias on last k-chunk output
     (* mark_debug = "true" *) output reg                      cmd_ready,
     (* mark_debug = "true" *) output reg                      cmd_done,
 
@@ -518,8 +577,110 @@ module matmul_controller #(
     output reg                      uram_wr_accum,     // 1=accumulate (add to existing)
 
     // Backpressure from URAM write arbiter
-    input  wire                     uram_wr_accept
+    input  wire                     uram_wr_accept,
+
+    // -----------------------------------------------------------------
+    // Bias read interface (from tiling_engine bias_buf)
+    // -----------------------------------------------------------------
+    output wire [7:0]               bias_rd_addr,
+    input  wire [BUS_W-1:0]        bias_rd_data
 );
+
+    // FP16 add (inlined from fp_funcs.vh to avoid include-guard conflict)
+    function [15:0] fp16_add_comb;
+        input [15:0] a, b;
+        reg        a_s, b_s, lg_s, sm_s, res_s, eff_sub;
+        reg [4:0]  a_e, b_e, lg_e, sm_e;
+        reg [9:0]  a_m, b_m, lg_mr, sm_mr;
+        reg        a_z, b_z;
+        reg [4:0]  ediff;
+        reg [3:0]  shift;
+        reg [13:0] lg_ext, sm_ext, aligned, restored;
+        reg        sticky_bit;
+        reg [14:0] sum_m;
+        reg [3:0]  lzc;
+        reg [14:0] norm_m;
+        reg [5:0]  norm_e;
+        reg        norm_sticky;
+        reg [9:0]  fmant;
+        reg        g, r, s_all, rup;
+        reg [10:0] rounded;
+        reg [9:0]  rmant;
+        reg [5:0]  rexp;
+        integer    k;
+        begin
+            a_s = a[15]; a_e = a[14:10]; a_m = a[9:0];
+            b_s = b[15]; b_e = b[14:10]; b_m = b[9:0];
+            a_z = (a_e == 5'd0); b_z = (b_e == 5'd0);
+            if ((a_e == 5'd31) || (b_e == 5'd31)) begin
+                if (a_e == 5'd31 && a_m != 0)      fp16_add_comb = a;
+                else if (b_e == 5'd31 && b_m != 0)  fp16_add_comb = b;
+                else fp16_add_comb = (a_e == 5'd31) ? a : b;
+            end else if (a_z && b_z) begin
+                fp16_add_comb = {a_s & b_s, 15'd0};
+            end else if (a_z) begin
+                fp16_add_comb = b;
+            end else if (b_z) begin
+                fp16_add_comb = a;
+            end else begin
+                if (a_e > b_e || (a_e == b_e && a_m >= b_m)) begin
+                    lg_s = a_s; lg_e = a_e; lg_mr = a_m;
+                    sm_s = b_s; sm_e = b_e; sm_mr = b_m;
+                end else begin
+                    lg_s = b_s; lg_e = b_e; lg_mr = b_m;
+                    sm_s = a_s; sm_e = a_e; sm_mr = a_m;
+                end
+                res_s = lg_s;
+                eff_sub = lg_s ^ sm_s;
+                ediff = lg_e - sm_e;
+                shift = (ediff > 5'd14) ? 4'd14 : ediff[3:0];
+                lg_ext = {1'b1, lg_mr, 3'b000};
+                sm_ext = {1'b1, sm_mr, 3'b000};
+                aligned = sm_ext >> shift;
+                restored = aligned << shift;
+                sticky_bit = (restored != sm_ext);
+                if (eff_sub)
+                    sum_m = {1'b0, lg_ext} - {1'b0, aligned} - {14'd0, sticky_bit};
+                else
+                    sum_m = {1'b0, lg_ext} + {1'b0, aligned};
+                if (sum_m == 15'd0) begin
+                    fp16_add_comb = 16'd0;
+                end else begin
+                    lzc = 4'd15;
+                    for (k = 14; k >= 0; k = k - 1)
+                        if (sum_m[k] && lzc == 4'd15) lzc = 14 - k;
+                    norm_sticky = sticky_bit;
+                    if (lzc == 4'd0) begin
+                        norm_sticky = sticky_bit | sum_m[0];
+                        norm_m = {1'b0, sum_m[14:1]};
+                        norm_e = {1'b0, lg_e} + 6'd1;
+                    end else if (lzc == 4'd1) begin
+                        norm_m = sum_m;
+                        norm_e = {1'b0, lg_e};
+                    end else begin
+                        norm_m = sum_m << (lzc - 4'd1);
+                        norm_e = {1'b0, lg_e} - {2'd0, lzc} + 6'd1;
+                    end
+                    fmant = norm_m[12:3];
+                    g = norm_m[2]; r = norm_m[1];
+                    s_all = norm_m[0] | norm_sticky;
+                    rup = g && (r || s_all || fmant[0]);
+                    rounded = {1'b0, fmant} + {10'd0, rup};
+                    if (rounded[10]) begin
+                        rmant = 10'd0; rexp = norm_e + 6'd1;
+                    end else begin
+                        rmant = rounded[9:0]; rexp = norm_e;
+                    end
+                    if (rexp >= 6'd31)
+                        fp16_add_comb = {res_s, 5'b11111, 10'd0};
+                    else if (rexp[5] || rexp == 6'd0)
+                        fp16_add_comb = {res_s, 15'd0};
+                    else
+                        fp16_add_comb = {res_s, rexp[4:0], rmant};
+                end
+            end
+        end
+    endfunction
 
     // =====================================================================
     // Constants
@@ -569,6 +730,16 @@ module matmul_controller #(
     reg [DIM_W-1:0]        num_k_tiles;
     reg [DIM_W-1:0]        k_tile_idx;
     reg                     first_k_chunk_r;
+    reg                     last_k_chunk_r;
+    reg                     has_bias_r;
+
+    // Last k-tile may have fewer than TILE valid elements.
+    // last_tile_k_limit = (cmd_k % TILE == 0) ? TILE-1 : (cmd_k % TILE) - 1
+    // For non-last tiles, k_limit = TILE-1.
+    reg [4:0]              last_tile_k_limit;
+    wire [4:0]             cur_tile_k_limit = (k_tile_idx == num_k_tiles - 1)
+                                              ? last_tile_k_limit
+                                              : (TILE[4:0] - 1);
 
     // Data feed counter
     reg [6:0] feed_cnt;  // 0..64 (needs 7 bits)
@@ -593,6 +764,9 @@ module matmul_controller #(
             act_uram_rd_en   <= 1'b0;
             mm_done_r        <= 1'b0;
             first_k_chunk_r  <= 1'b1;
+            last_k_chunk_r   <= 1'b1;
+            has_bias_r       <= 1'b0;
+            last_tile_k_limit <= TILE[4:0] - 1;
         end else begin
             // Defaults
             cmd_done         <= 1'b0;
@@ -620,9 +794,15 @@ module matmul_controller #(
                         out_row_start_r     <= cmd_out_row;
                         out_col_word_start_r <= cmd_out_col_word;
                         first_k_chunk_r     <= cmd_first_k_chunk;
+                        last_k_chunk_r      <= cmd_last_k_chunk;
+                        has_bias_r          <= cmd_has_bias;
                         // K-loop init
                         num_k_tiles   <= (cmd_k + TILE - 1) >> TILE_W;
                         k_tile_idx    <= {DIM_W{1'b0}};
+                        // Last tile's k limit: (cmd_k % TILE) - 1, or TILE-1 if exact multiple
+                        last_tile_k_limit <= (cmd_k[4:0] == 5'd0)
+                                             ? (TILE[4:0] - 1)
+                                             : (cmd_k[4:0] - 1);
                     end
                 end
 
@@ -690,8 +870,12 @@ module matmul_controller #(
                         k_tile_idx  <= k_tile_idx + 1;
                         // A advances along K columns: col offset += WORDS_PER_ROW
                         a_col_off_r <= a_col_off_r + WORDS_PER_ROW[PF_COL_W-1:0];
-                        // B advances along K rows: row offset += TILE
-                        b_row_off_r <= b_row_off_r + TILE[PF_ROW_W-1:0];
+                        // B: for standard matmul, K is the row dimension → advance rows
+                        //    for transposed matmul, K is the column dimension → advance cols
+                        if (op_r == OP_MATMUL_T)
+                            b_col_off_r <= b_col_off_r + WORDS_PER_ROW[PF_COL_W-1:0];
+                        else
+                            b_row_off_r <= b_row_off_r + TILE[PF_ROW_W-1:0];
                         state       <= ST_TILE_START;
                     end
                 end
@@ -743,6 +927,7 @@ module matmul_controller #(
         .tile_row(5'd0),
         .tile_col(5'd0),
         .first_tile(first_tile_r),
+        .tile_k_limit(cur_tile_k_limit),
         .out_valid(mm_out_valid),
         .out_data(mm_out_data),
         .out_row(mm_out_row),
@@ -750,6 +935,24 @@ module matmul_controller #(
         .out_stall(mm_out_stall),
         .compute_done(mm_compute_done)
     );
+
+    // =====================================================================
+    // Bias Add — element-wise FP16 add on matmul output
+    // =====================================================================
+    // Bias read address = global URAM column word for current output
+    assign bias_rd_addr = out_col_word_start_r + wr_sub_col;
+
+    // Generate biased output: 16× parallel fp16_add_comb
+    wire [BUS_W-1:0] biased_data;
+    genvar bi;
+    generate
+        for (bi = 0; bi < BUS_W / DATA_W; bi = bi + 1) begin : gen_bias_add
+            assign biased_data[bi*DATA_W +: DATA_W] =
+                (has_bias_r && last_k_chunk_r) ? fp16_add_comb(mm_out_data[bi*DATA_W +: DATA_W],
+                                                                bias_rd_data[bi*DATA_W +: DATA_W])
+                                               : mm_out_data[bi*DATA_W +: DATA_W];
+        end
+    endgenerate
 
     // =====================================================================
     // URAM Write Control — with backpressure from write arbiter
@@ -775,9 +978,14 @@ module matmul_controller #(
             uram_wr_accum    <= 1'b0;
         end else begin
             if (mm_out_new) begin
+                // synthesis translate_off
+                if (has_bias_r && wr_sub_col == 0 && mm_out_row == 0)
+                    $display("[MC %0t] BIAS row0 col0: raw=%h bias=%h biased=%h addr=%0d",
+                             $time, mm_out_data[15:0], bias_rd_data[15:0], biased_data[15:0], bias_rd_addr);
+                // synthesis translate_on
                 wr_pending       <= 1'b1;
                 uram_wr_en       <= 1'b1;
-                uram_wr_data     <= mm_out_data;
+                uram_wr_data     <= biased_data;
                 uram_wr_row      <= out_row_start_r + mm_out_row;
                 uram_wr_col_word <= out_col_word_start_r + wr_sub_col;
                 uram_wr_accum    <= !first_k_chunk_r;

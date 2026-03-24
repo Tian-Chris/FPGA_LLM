@@ -136,14 +136,18 @@ RTL_ALL = [
 def tiled_matmul_fp16_numpy(mat_a, mat_b, tile_size, prefetch_dim=1024, bias=None):
     """Numpy-accelerated tiled matmul with FP16 bit pattern inputs.
 
-    Per tile: FP16 × FP16 → FP32 accumulation per k-chunk, convert to FP16,
-    then accumulate across k-chunks with FP16 addition.
+    Per tile: FP16 inputs → float64 accumulation per k-chunk (models integer
+    accumulation — no intermediate rounding), convert to FP16, then accumulate
+    across k-chunks with FP16 addition.
 
     This matches the RTL's fp_mac_unit + uram_accum_buf behavior:
-    - Each k-chunk: FP32 accumulation within the chunk, FP32→FP16 at output
+    - Each k-chunk: integer accumulation (modeled as float64), FP16 at output
     - Last k-chunk: add bias (if provided) before FP16 conversion
     - First k-chunk: write to result
     - Subsequent k-chunks: FP16 add to result (fp16_add_comb in uram_accum_buf)
+
+    float64's 52-bit mantissa exceeds the ~27 bits needed for 32 products of
+    22-bit FP16 mantissas, so no rounding occurs during accumulation.
 
     Args:
         bias: optional list of FP16 bit patterns (uint16), length N.
@@ -155,8 +159,8 @@ def tiled_matmul_fp16_numpy(mat_a, mat_b, tile_size, prefetch_dim=1024, bias=Non
     """
     A_bits = np.array(mat_a, dtype=np.uint16)
     B_bits = np.array(mat_b, dtype=np.uint16)
-    A = A_bits.view(np.float16).astype(np.float32)
-    B = B_bits.view(np.float16).astype(np.float32)
+    A = A_bits.view(np.float16).astype(np.float64)
+    B = B_bits.view(np.float16).astype(np.float64)
     M, K = A.shape
     _, N = B.shape
 
@@ -175,10 +179,10 @@ def tiled_matmul_fp16_numpy(mat_a, mat_b, tile_size, prefetch_dim=1024, bias=Non
             for kc in range(num_k_chunks):
                 ks = kc * prefetch_dim
                 ke = min(ks + prefetch_dim, K)
-                # FP32 accumulation within this k-chunk
+                # float64 accumulation within this k-chunk (models integer accum)
                 partial = A[ti:te, ks:ke] @ B[ks:ke, tj:je]
-                # Convert to FP16 (matches RTL fp32_to_fp16 at matmul output)
-                partial_fp16 = partial.astype(np.float16)
+                # RTL path: integer → FP32 → FP16 (double rounding)
+                partial_fp16 = partial.astype(np.float32).astype(np.float16)
                 # On last k-chunk, add bias before accumulation (matches RTL)
                 if bias_fp16 is not None and kc == num_k_chunks - 1:
                     partial_fp16 = (partial_fp16.astype(np.float32) +
@@ -666,6 +670,7 @@ def compare_rtl_output(g):
 
 def main():
     data_only = '--data-only' in sys.argv
+    golden_only = '--golden-only' in sys.argv
 
     print("=" * 60)
     print("  Production 1K Full Pipeline Test (GPT-2 Pre-Norm)")
@@ -688,6 +693,10 @@ def main():
     print("\n  Running golden model...")
     g = compute_golden(embed_fp16, weights)
     write_golden(g)
+
+    if golden_only:
+        print("\n  --golden-only: golden complete, skipping RTL")
+        return
 
     # Generate hex files for testbench
     print("\n  Generating HBM hex files (this may take a while for 1M-depth HBMs)...")

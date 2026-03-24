@@ -1258,6 +1258,7 @@ def cleanup_intermediates():
 
 def main():
     data_only = '--data-only' in sys.argv
+    golden_only = '--golden-only' in sys.argv
     prefill_only = '--prefill-only' in sys.argv
 
     # Clean previous intermediates first (these can be 3+ GB)
@@ -1327,6 +1328,10 @@ def main():
         'dec2_v_news': dec2_v_news,
         'decode_output': dec2_out,
     }
+
+    if golden_only:
+        print("\n  --golden-only: golden complete, skipping RTL")
+        return
 
     # Generate hex files (including decode embeds)
     print("\n  Generating HBM hex files...")

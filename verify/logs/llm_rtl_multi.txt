@@ -1,0 +1,82 @@
+============================================================
+MULTI-LAYER DECODE TEST (2 layers) - RTL vs GOLDEN
+============================================================
+
+
+--- Layer 0 K cache (prefill, 32 rows) ---
+  L0_K_prefill: 32768/32768 match (30602 exact, max_rel=0.500000, max_abs=0.003906, tol=0.05)
+
+--- Layer 0 V cache (prefill, 32 rows) ---
+  L0_V_prefill: 32768/32768 match (30439 exact, max_rel=1.000000, max_abs=1.000000, tol=0.05)
+
+--- Layer 1 K cache (prefill, 32 rows) ---
+  L1_K_prefill: 32768/32768 match (2225 exact, max_rel=1.963303, max_abs=0.509766, tol=0.05)
+  (layer>0: 0 divergent elements — expected, not counted as failure)
+
+--- Layer 1 V cache (prefill, 32 rows) ---
+  L1_V_prefill: 32768/32768 match (2123 exact, max_rel=2.000000, max_abs=0.034180, tol=0.05)
+  (layer>0: 0 divergent elements — expected, not counted as failure)
+
+========================================
+  DECODE TOKEN 1 KV ROWS (row 32)
+========================================
+
+--- Layer 0 K_new (row 32) ---
+  L0_K_dec1: 1024/1024 match (957 exact, max_rel=0.058824, max_abs=0.001953, tol=0.05)
+
+--- Layer 0 V_new (row 32) ---
+  L0_V_dec1: 1024/1024 match (961 exact, max_rel=0.017241, max_abs=0.001953, tol=0.05)
+
+--- Layer 1 K_new (row 32) ---
+  L1_K_dec1: 1024/1024 match (37 exact, max_rel=1.387755, max_abs=0.032227, tol=0.05)
+  (layer>0: 0 divergent elements — expected, not counted as failure)
+
+--- Layer 1 V_new (row 32) ---
+  L1_V_dec1: 1024/1024 match (23 exact, max_rel=1.791667, max_abs=0.039062, tol=0.05)
+  (layer>0: 0 divergent elements — expected, not counted as failure)
+
+========================================
+  DECODE TOKEN 2 KV ROWS (row 33)
+========================================
+
+--- Layer 0 K_new (row 33) ---
+  L0_K_dec2: 1024/1024 match (959 exact, max_rel=0.050000, max_abs=0.001953, tol=0.05)
+
+--- Layer 0 V_new (row 33) ---
+  L0_V_dec2: 1024/1024 match (943 exact, max_rel=0.014286, max_abs=0.001953, tol=0.05)
+
+--- Layer 1 K_new (row 33) ---
+  L1_K_dec2: 1024/1024 match (59 exact, max_rel=0.947368, max_abs=0.017578, tol=0.05)
+  (layer>0: 0 divergent elements — expected, not counted as failure)
+
+--- Layer 1 V_new (row 33) ---
+  L1_V_dec2: 1024/1024 match (61 exact, max_rel=2.000000, max_abs=0.019043, tol=0.05)
+  (layer>0: 0 divergent elements — expected, not counted as failure)
+
+========================================
+  DECODE TOKEN 1 OUTPUT (intermediate)
+========================================
+
+--- Decode 1 output (URAM row 0) ---
+  dec1_output_uram: 1024/1024 match (19 exact, max_rel=1.781250, max_abs=0.079102, tol=0.05)
+  (multi-layer output: 0 divergent elements — not counted as failure)
+
+--- Decode 1 output (flush HBM ACT_BASE) ---
+  dec1_output_flush: 1024/1024 match (19 exact, max_rel=1.781250, max_abs=0.079102, tol=0.05)
+  (multi-layer output: 0 divergent elements — not counted as failure)
+
+========================================
+  DECODE TOKEN 2 FINAL OUTPUT
+========================================
+
+--- Decode output (flush HBM @ ACT_BASE row 0) ---
+  decode_output_flush: 1024/1024 match (40 exact, max_rel=1.000000, max_abs=0.052734, tol=0.05)
+  (multi-layer output: 0 divergent elements — not counted as failure)
+
+--- Decode output (URAM row 0) ---
+  decode_output_uram: 1024/1024 match (40 exact, max_rel=1.000000, max_abs=0.052734, tol=0.05)
+  (multi-layer output: 0 divergent elements — not counted as failure)
+
+============================================================
+SUMMARY: 143360/143360 elements match
+ALL CHECKS PASSED

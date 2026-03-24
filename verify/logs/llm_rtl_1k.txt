@@ -1,0 +1,22 @@
+============================================================
+PRODUCTION 1K INTEGRATION TEST - RTL vs GOLDEN COMPARISON
+============================================================
+
+--- Final Output: Residual 2 (flush HBM) ---
+  residual2_flush [5][680]: golden=c54a rtl=c5cc MISMATCH (rel=0.0876 abs=0.507812)
+  residual2_flush [6][785]: golden=353a rtl=3895 MISMATCH (rel=0.4297 abs=0.246094)
+  residual2_flush [24][126]: golden=3796 rtl=39cf MISMATCH (rel=0.3470 abs=0.251953)
+  residual2_flush [25][632]: golden=ba6e rtl=bc34 MISMATCH (rel=0.2351 abs=0.247070)
+  residual2_flush: 32764/32768 match (2266 exact, max_rel=2.000000, max_abs=0.507812, tol=0.05)
+  residual2_flush correlation: 0.999982 (mean_abs=0.005614, max_abs=0.507812, median_abs=0.003906)
+
+--- URAM Contents (should be residual2) ---
+  residual2_uram [5][680]: golden=c54a rtl=c5cc MISMATCH (rel=0.0876 abs=0.507812)
+  residual2_uram [6][785]: golden=353a rtl=3895 MISMATCH (rel=0.4297 abs=0.246094)
+  residual2_uram [24][126]: golden=3796 rtl=39cf MISMATCH (rel=0.3470 abs=0.251953)
+  residual2_uram [25][632]: golden=ba6e rtl=bc34 MISMATCH (rel=0.2351 abs=0.247070)
+  residual2_uram: 32764/32768 match (2266 exact, max_rel=2.000000, max_abs=0.507812, tol=0.05)
+
+============================================================
+SUMMARY: 65528/65536 elements match
+MISMATCHES: 8 element(s) differ

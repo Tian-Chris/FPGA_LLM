@@ -1,0 +1,41 @@
+============================================================
+DECODE MODE TEST - RTL vs GOLDEN COMPARISON
+============================================================
+
+--- Prefill K cache (flush HBM) ---
+  prefill_K_cache: 8192/8192 match (7215 exact, max_rel=0.333333, max_abs=0.001953, tol=0.01)
+
+--- Prefill V cache (flush HBM) ---
+  prefill_V_cache: 8192/8192 match (7148 exact, max_rel=0.333333, max_abs=0.001953, tol=0.01)
+
+--- Decode K_new at row 8 (flush HBM) ---
+  decode_K_new: 1024/1024 match (865 exact, max_rel=1.000000, max_abs=0.003906, tol=0.01)
+
+--- Decode V_new at row 8 (flush HBM) ---
+  decode_V_new: 1024/1024 match (855 exact, max_rel=0.166667, max_abs=0.001953, tol=0.01)
+
+--- Decode Residual 1 (mid-decode HBM at ACT_EMBED) ---
+  decode_res1: 1024/1024 match (695 exact, max_rel=0.111111, max_abs=0.001953, tol=0.05)
+  (diagnostic: 0 divergent elements)
+
+--- Decode LN1 output (mid-decode HBM at ACT_TEMP) ---
+  decode_ln1: 1024/1024 match (1006 exact, max_rel=0.003606, max_abs=0.001465, tol=0.05)
+  (diagnostic: 0 divergent elements)
+
+--- Decode LN2 output (flush HBM at ACT_TEMP) ---
+  decode_ln2: 1024/1024 match (659 exact, max_rel=0.062768, max_abs=0.001953, tol=0.05)
+  (diagnostic: 0 divergent elements)
+
+--- Decode GELU output (flush HBM at ACT_Q=ACT_FFN) ---
+  decode_gelu: 4096/4096 match (4063 exact, max_rel=0.396088, max_abs=0.059326, tol=0.05)
+  (diagnostic: 0 divergent elements)
+
+--- Decode Residual 2 (flush HBM at ACT_EMBED) ---
+  decode_res2_flush: 1024/1024 match (90 exact, max_rel=1.107143, max_abs=0.066406, tol=0.05)
+
+--- Decode Residual 2 (URAM row 0) ---
+  decode_res2_uram: 1024/1024 match (90 exact, max_rel=1.107143, max_abs=0.066406, tol=0.05)
+
+============================================================
+SUMMARY: 27648/27648 elements match
+ALL CHECKS PASSED

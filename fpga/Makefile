@@ -54,7 +54,7 @@ $(XO_FILE): build.tcl kernel.xml rtl/fpga_kernel.v rtl/vitis_control.v $(wildcar
 # =============================================================================
 # Link: .xo → .xclbin (v++)
 # =============================================================================
-.PHONY: link-emu link-hw link-hw-spread
+.PHONY: link-emu link-hw link-hw-fast link-hw-spread
 
 link-emu: TARGET := hw_emu
 link-emu: $(KERNEL)_hw_emu.xclbin
@@ -70,6 +70,15 @@ $(KERNEL)_%.xclbin: $(XO_FILE) $(CFG_FILE)
 		--dk chipscope:fpga_kernel_1 \
 		-o $@
 	@echo "=== Link complete: $@ ==="
+
+link-hw-fast: $(XO_FILE) $(CFG_FILE)
+	$(VPP) -t hw --platform $(PLATFORM_PATH) \
+		--link $(XO_FILE) \
+		--config $(CFG_FILE) \
+		--kernel_frequency 10 \
+		--dk chipscope:fpga_kernel_1 \
+		-o $(KERNEL)_hw.xclbin
+	@echo "=== Link complete (10MHz, default directives): $(KERNEL)_hw.xclbin ==="
 
 link-hw-spread: $(XO_FILE) $(CFG_FILE)
 	$(VPP) -t hw --platform $(PLATFORM_PATH) \

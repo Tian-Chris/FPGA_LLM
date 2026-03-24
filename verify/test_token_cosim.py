@@ -41,7 +41,7 @@ from verify.test_multi_layer import (
     compute_one_layer, write_verilator_flags,
 )
 
-from verify.parse_debug_trace import parse_trace_file, print_trace
+from verify.debug.parse_debug_trace import parse_trace_file, print_trace
 
 # ---------------------------------------------------------------------------
 # Parameters (production dimensions)
@@ -138,12 +138,14 @@ def _fp32_to_fp16_bits_mat(arr2d):
     return [fp16[i].tolist() for i in range(fp16.shape[0])]
 
 def _matmul_fp16_io_fp32_accum(A_bits, B_bits):
-    """Matmul with FP16 inputs, FP32 accumulation, FP16 output.
-    Matches RTL's fp_mac_unit behavior (no tiling artifacts)."""
-    A = np.array(A_bits, dtype=np.uint16).view(np.float16).astype(np.float32)
-    B = np.array(B_bits, dtype=np.uint16).view(np.float16).astype(np.float32)
+    """Matmul with FP16 inputs, integer accumulation (via float64), FP16 output.
+    Matches RTL's fp_mac_unit behavior (no tiling artifacts).
+    float64's 52-bit mantissa models exact integer accumulation."""
+    A = np.array(A_bits, dtype=np.uint16).view(np.float16).astype(np.float64)
+    B = np.array(B_bits, dtype=np.uint16).view(np.float16).astype(np.float64)
     C = A @ B
-    return C.astype(np.float16).view(np.uint16).astype(int).tolist()
+    # RTL path: integer → FP32 → FP16 (double rounding)
+    return C.astype(np.float32).astype(np.float16).view(np.uint16).astype(int).tolist()
 
 def _add_bias_fp16(matrix_bits, bias_bits):
     """Add FP16 bias[j] to each matrix[i][j]. Returns list-of-lists of FP16 bit patterns."""
@@ -882,6 +884,8 @@ def main():
                         help='Generate data files only, skip compile/run')
     parser.add_argument('--compare-only', action='store_true',
                         help='Skip compile/run, compare existing dumps')
+    parser.add_argument('--golden-only', action='store_true',
+                        help='Run golden model only, skip RTL')
     args = parser.parse_args()
 
     num_layers = int(os.environ.get('NUM_LAYERS', '2'))
@@ -1028,6 +1032,12 @@ def main():
         print(f"  RTL-match:   \"{prompt_text}\" → \"{tokenizer.decode(rtl_match_tokens)}\"")
     except ImportError:
         pass
+
+    if args.golden_only:
+        print("\n  --golden-only: golden complete, skipping RTL")
+        print(f"\n  FP32 golden tokens: {golden_tokens}")
+        print(f"  RTL-match tokens:   {rtl_match_tokens}")
+        return
 
     # Step 6: Generate hex files (BT=32 padded embeddings)
     print("\n  Generating HBM hex files...")

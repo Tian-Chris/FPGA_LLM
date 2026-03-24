@@ -1,4 +1,4 @@
-.PHONY: all lint lint-all sim wave synth show sta clean help cosim cosim-matmul cosim-softmax cosim-layernorm cosim-activation cosim-residual_add cosim-fp-primitives cosim-fp16-mult cosim-fp32-add cosim-fp32-to-fp16 cosim-fp16-add cosim-fp16-compare cosim-clean sim-small test-small test-top test-matmul1k test-1k test-decode test-multi test-token
+.PHONY: all lint lint-all sim wave synth show sta clean help cosim cosim-matmul cosim-softmax cosim-layernorm cosim-activation cosim-residual_add cosim-fp-primitives cosim-fp16-mult cosim-fp32-add cosim-fp32-to-fp16 cosim-fp16-add cosim-fp16-compare cosim-clean sim-small test-small test-top test-matmul1k test-1k test-decode test-multi test-token test-golden test-golden-24 test-golden-1k test-golden-multi test-golden-token test-golden-token-24 test-pytorch
 
 STA_TIME ?= 10.0
 
@@ -228,7 +228,8 @@ help:
 	@echo ""
 	@echo "Targets: lint lint-all sim wave synth show show-synth sta clean all"
 	@echo "         cosim cosim-{matmul,softmax,layernorm,activation,residual_add}"
-	@echo "         test-small sim-small"
+	@echo "         test-small sim-small test-1k test-decode test-multi test-token"
+	@echo "         test-golden test-pytorch (see verify/README.md for details)"
 	@echo ""
 	@echo "TARGETs: top_level bram_controller agu matmul_engine softmax"
 	@echo "         layernorm activation residual_add host_interface fsm_controller"
@@ -300,5 +301,26 @@ test-multi:
 
 test-token:
 	python3 verify/test_token_cosim.py
+
+test-golden:
+	python3 verify/test_golden_intacc.py
+
+test-golden-24:
+	NUM_LAYERS=24 python3 verify/test_golden_intacc.py
+
+test-golden-1k:
+	python3 verify/test_top_1k.py --golden-only
+
+test-golden-multi:
+	python3 verify/test_multi_layer.py --golden-only
+
+test-golden-token:
+	python3 verify/test_token_cosim.py --golden-only
+
+test-golden-token-24:
+	NUM_LAYERS=24 python3 verify/test_token_cosim.py --golden-only
+
+test-pytorch:
+	python3.11 verify/fp32_baseline.py
 
 all: lint sim synth sta

@@ -18,7 +18,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from verify.hex_utils import to_hex
-from verify.bram_layout import (
+from verify.debug.bram_layout import (
     encode_to_banks,
     flatten_weight_layout,
     write_bank_hex_files,

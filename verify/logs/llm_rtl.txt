@@ -1,0 +1,22 @@
+============================================================
+SIM_SMALL INTEGRATION TEST — RTL vs GOLDEN COMPARISON
+============================================================
+
+--- Final Output: Residual 2 (flush HBM) ---
+  residual2: 2048/2048 match (1509 exact, max_rel=0.300000, max_abs=0.001465, tol=0.01)
+
+--- Intermediate: K (KV cache) ---
+  K: 2048/2048 match (1622 exact, max_rel=0.083333, max_abs=0.000977, tol=0.01)
+
+--- Intermediate: V (KV cache) ---
+  V: 2048/2048 match (1609 exact, max_rel=0.166667, max_abs=0.000977, tol=0.01)
+
+--- Intermediate: LN2 (at ACT_TEMP_OFFSET) ---
+  ln2_out: 2048/2048 match (1736 exact, max_rel=0.158455, max_abs=0.001953, tol=0.01)
+
+--- URAM Contents (should be residual2) ---
+  uram_residual2: 2048/2048 match (1509 exact, max_rel=0.300000, max_abs=0.001465, tol=0.01)
+
+============================================================
+SUMMARY: 10240/10240 elements match
+ALL CHECKS PASSED

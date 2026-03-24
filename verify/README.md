@@ -103,8 +103,7 @@ make test-token                                # Real weights → token output
 ## Weight Files
 
 Tests expect weight files in `fpga/data/`:
-- `weights.bin` — 24 layers, old format (786688 words/layer, no inline biases)
-- `biases.bin` — Separate biases, flat FP16, 9216 elements/layer
+- `weights.bin` — 24 layers, inline biases (787264 words/layer)
 - `embed.bin` — Vocabulary + position embeddings + ln_f parameters
 
-Export with: `python3 scripts/export_gpt2.py --model gpt2-medium --output-dir fpga/data`
+Export with: `python3.11 scripts/export_gpt2.py --model gpt2-medium --output-dir fpga/data`

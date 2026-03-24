@@ -42,7 +42,7 @@ static constexpr int NUM_HEADS     = 16;
 static constexpr int HEAD_DIM      = MODEL_DIM / NUM_HEADS;  // 64
 static constexpr int F_DIM         = 4096;
 static constexpr int MAX_SEQ_LEN   = 128;
-static int NUM_LAYERS              = 24;  // default; overridable via env NUM_LAYERS
+static int NUM_LAYERS              = 2;   // default; overridable via env NUM_LAYERS
 static constexpr int BUS_ELEMS     = 16;   // 256-bit / 16-bit
 
 // AXI-Lite debug register offsets (match vitis_control.v)

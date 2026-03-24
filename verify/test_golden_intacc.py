@@ -17,13 +17,13 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from verify.test_token_cosim import (
-    load_embed_bin,
+    load_embed_bin, load_weights_bin, load_biases_from_weights,
     compute_embeddings, apply_final_pipeline,
     _fp16_to_fp32_vec, _fp32_to_fp16_bits_mat, _fp32_to_fp16_bits_vec,
     _matmul_fp16_io_fp32_accum, _add_bias_fp16, _add_bias_f32,
     _softmax_fp32,
     MODEL_DIM, NUM_HEADS, HEAD_DIM, F_DIM, WORD_BYTES, WE,
-    DATA_DIR, MODEL_STRIDE, F_STRIDE,
+    DATA_DIR, MODEL_STRIDE, F_STRIDE, LAYER_SIZE,
     LAYER_WQ_OFFSET, LAYER_WK_OFFSET, LAYER_WV_OFFSET, LAYER_WO_OFFSET,
     LAYER_FFN1_OFFSET, LAYER_FFN2_OFFSET, LAYER_LN1_OFFSET, LAYER_LN2_OFFSET,
 )
@@ -39,107 +39,6 @@ BT = SEQ_LEN
 DEFAULT_PROMPT = "The meaning of life is"
 DEFAULT_TOKEN_IDS = [464, 3616, 286, 1204, 318]
 
-# Old LAYER_SIZE (without inline biases) — matches the weights.bin on disk
-OLD_LAYER_SIZE = LAYER_LN2_OFFSET + 2 * MODEL_DIM // WE  # 786688
-
-
-# ---------------------------------------------------------------------------
-# Weight loading (old format: weights.bin + separate biases.bin)
-# ---------------------------------------------------------------------------
-
-def load_weights_old_format(weights_path, num_layers):
-    """Load weights from old-format weights.bin (no inline biases).
-
-    Uses OLD_LAYER_SIZE (786688 words/layer) instead of the new LAYER_SIZE (787264).
-    """
-    layer_bytes = OLD_LAYER_SIZE * WORD_BYTES
-    total_read = num_layers * layer_bytes
-
-    with open(weights_path, 'rb') as f:
-        raw = f.read(total_read)
-
-    if len(raw) < total_read:
-        raise ValueError(f"weights.bin too small: {len(raw)} < {total_read} bytes "
-                         f"(need {num_layers} layers at OLD_LAYER_SIZE={OLD_LAYER_SIZE})")
-
-    layers = []
-    for layer_idx in range(num_layers):
-        base = layer_idx * layer_bytes
-        w = {}
-
-        def read_weight_matrix(offset, rows, cols, stride):
-            mat = []
-            words_per_row = cols // WE
-            for r in range(rows):
-                row = []
-                for ww in range(words_per_row):
-                    word_offset = base + (offset + r * stride + ww) * WORD_BYTES
-                    elements = np.frombuffer(
-                        raw[word_offset:word_offset + WORD_BYTES], dtype=np.uint16)
-                    row.extend(int(e) for e in elements)
-                mat.append(row)
-            return mat
-
-        def read_ln_params(offset):
-            gamma, beta = [], []
-            ln_words = 2 * MODEL_DIM // WE
-            for ww in range(ln_words):
-                word_offset = base + (offset + ww) * WORD_BYTES
-                elements = np.frombuffer(
-                    raw[word_offset:word_offset + WORD_BYTES], dtype=np.uint16)
-                for i in range(0, len(elements), 2):
-                    gamma.append(int(elements[i]))
-                    beta.append(int(elements[i + 1]))
-            return gamma, beta
-
-        w['W_q']    = read_weight_matrix(LAYER_WQ_OFFSET, MODEL_DIM, MODEL_DIM, MODEL_STRIDE)
-        w['W_k']    = read_weight_matrix(LAYER_WK_OFFSET, MODEL_DIM, MODEL_DIM, MODEL_STRIDE)
-        w['W_v']    = read_weight_matrix(LAYER_WV_OFFSET, MODEL_DIM, MODEL_DIM, MODEL_STRIDE)
-        w['W_o']    = read_weight_matrix(LAYER_WO_OFFSET, MODEL_DIM, MODEL_DIM, MODEL_STRIDE)
-        w['W_ffn1'] = read_weight_matrix(LAYER_FFN1_OFFSET, MODEL_DIM, F_DIM, F_STRIDE)
-        w['W_ffn2'] = read_weight_matrix(LAYER_FFN2_OFFSET, F_DIM, MODEL_DIM, MODEL_STRIDE)
-        w['gamma1'], w['beta1'] = read_ln_params(LAYER_LN1_OFFSET)
-        w['gamma2'], w['beta2'] = read_ln_params(LAYER_LN2_OFFSET)
-
-        layers.append(w)
-        if layer_idx < 2 or layer_idx == num_layers - 1:
-            print(f"    Layer {layer_idx}: loaded "
-                  f"(W_q[0][:4]={[f'0x{v:04x}' for v in w['W_q'][0][:4]]})")
-
-    return layers
-
-
-def load_biases_from_file(biases_path, num_layers):
-    """Load biases from separate biases.bin file.
-
-    Format: flat FP16 per layer: [qkv(3072), proj(1024), ffn1(4096), ffn2(1024)]
-    """
-    data = np.fromfile(biases_path, dtype=np.uint16)
-    elements_per_layer = 3 * MODEL_DIM + MODEL_DIM + F_DIM + MODEL_DIM  # 9216
-
-    biases = []
-    for layer_idx in range(num_layers):
-        base = layer_idx * elements_per_layer
-        layer = data[base:base + elements_per_layer]
-
-        off = 0
-        qkv = [int(e) for e in layer[off:off + 3*MODEL_DIM]]; off += 3*MODEL_DIM
-        proj = [int(e) for e in layer[off:off + MODEL_DIM]]; off += MODEL_DIM
-        ffn1 = [int(e) for e in layer[off:off + F_DIM]]; off += F_DIM
-        ffn2 = [int(e) for e in layer[off:off + MODEL_DIM]]; off += MODEL_DIM
-
-        biases.append({
-            'qkv_bias': qkv,
-            'proj_bias': proj,
-            'ffn1_bias': ffn1,
-            'ffn2_bias': ffn2,
-        })
-
-        if layer_idx == 0:
-            qkv_f = np.array(qkv[:4], dtype=np.uint16).view(np.float16).astype(np.float32)
-            print(f"    Layer 0 biases: qkv[:4]={qkv_f}")
-
-    return biases
 
 
 # ---------------------------------------------------------------------------
@@ -360,13 +259,12 @@ def main():
     prompt_text = DEFAULT_PROMPT
 
     weights_path = os.path.join(DATA_DIR, "weights.bin")
-    biases_path = os.path.join(DATA_DIR, "biases.bin")
     embed_path = os.path.join(DATA_DIR, "embed.bin")
 
-    for p in [weights_path, embed_path, biases_path]:
+    for p in [weights_path, embed_path]:
         if not os.path.exists(p):
             print(f"ERROR: Missing {p}")
-            print(f"  Run: python3 scripts/export_gpt2.py --model gpt2-medium --output-dir fpga/data")
+            print(f"  Run: python3.11 scripts/export_gpt2.py --model gpt2-medium --output-dir fpga/data")
             sys.exit(1)
 
     print(f"=" * 60)
@@ -375,15 +273,17 @@ def main():
     print(f"  Prompt: \"{prompt_text}\"")
     print(f"  Tokens: {token_ids}")
 
-    # Load weights
+    # Load weights (inline biases, LAYER_SIZE={LAYER_SIZE})
     print(f"\n  Loading embed.bin...")
     embed_data = load_embed_bin(embed_path)
 
-    print(f"  Loading weights.bin ({num_layers} layers, old format)...")
-    layer_weights = load_weights_old_format(weights_path, num_layers)
+    print(f"  Loading weights.bin ({num_layers} layers, inline biases)...")
+    layer_weights = load_weights_bin(weights_path, num_layers)
 
-    print(f"  Loading biases.bin...")
-    layer_biases = load_biases_from_file(biases_path, num_layers)
+    print(f"  Extracting inline biases...")
+    with open(weights_path, 'rb') as f:
+        wgt_data = f.read(num_layers * LAYER_SIZE * WORD_BYTES)
+    layer_biases = load_biases_from_weights(wgt_data, num_layers)
     for i in range(num_layers):
         layer_weights[i].update(layer_biases[i])
 

@@ -96,6 +96,16 @@ module layernorm #(
     reg [31:0] stored_gamma_fp32;
     reg [31:0] stored_normed;
 
+    // BRAM input buffer — separate always block with NO async reset
+    // (async reset prevents Vivado BRAM inference: Synth 8-4767)
+    always @(posedge clk) begin
+        // Write port (during mean pass only)
+        if (valid_r && state == ST_COMP_MEAN)
+            input_buffer[idx_r] <= data_r;
+        // Read port (simple dual-port, registered output)
+        bram_rd_data <= input_buffer[bram_rd_addr];
+    end
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state       <= ST_IDLE;
@@ -118,13 +128,6 @@ module layernorm #(
             valid_r <= in_rd_valid;
             data_r  <= in_rd_data;
             idx_r   <= idx - 1;
-
-            // BRAM write (during mean pass only)
-            if (valid_r && state == ST_COMP_MEAN) begin
-                input_buffer[idx_r] <= data_r;
-            end
-            // BRAM registered read (simple dual-port)
-            bram_rd_data <= input_buffer[bram_rd_addr];
 
             // Normalize Stage 2: out = normed * gamma + beta → FP16
             if (pipe1_valid) begin

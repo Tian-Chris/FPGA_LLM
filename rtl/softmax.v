@@ -83,7 +83,11 @@ module softmax #(
 
     // Exp LUT: 256 entries, exp_lut[i] = FP16(exp(-i/16))
     reg [15:0] exp_lut [0:255];
+    `ifdef FPGA_TARGET
+    initial $readmemh("exp_lut.hex", exp_lut);
+    `else
     initial $readmemh("rtl/exp_lut.hex", exp_lut);
+    `endif
 
     // ---- Exp LUT index from FP16 diff ----
     // diff is always ≤ 0. Index = clamp(|diff| * 16, 0, 255)

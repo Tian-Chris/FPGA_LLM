@@ -40,7 +40,11 @@ module activation_unit #(
 
     // GELU LUT: 512 entries of FP16 bit patterns
     reg [15:0] gelu_lut [0:511];
+    `ifdef FPGA_TARGET
+    initial $readmemh("gelu_lut.hex", gelu_lut);
+    `else
     initial $readmemh("rtl/gelu_lut.hex", gelu_lut);
+    `endif
 
     reg rd_inflight;
 

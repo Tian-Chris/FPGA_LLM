@@ -40,6 +40,9 @@ foreach f $rtl_files {
 }
 add_files -norecurse $filtered_files
 
+# LUT hex files (for $readmemh during synthesis)
+add_files -norecurse [glob -nocomplain ${rtl_dir}/*.hex]
+
 # FPGA-specific RTL
 add_files -norecurse [glob ${fpga_rtl_dir}/*.v]
 

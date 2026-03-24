@@ -12,6 +12,11 @@
 // RAM template (1 write always + 1 read always) that Vivado can infer
 // as URAM. Engines receive backpressure via eng_wr_accept.
 //
+// Accumulation pipeline: When eng_wr_accum=1, the write becomes a 2-cycle
+// read-modify-write operation. Cycle 1 issues a read on the shared read
+// port; cycle 2 computes fp16_add and writes back. The arbiter stalls
+// during the writeback cycle.
+//
 // In simulation: same serialized write path (matches FPGA behavior).
 // In synthesis:  (* ram_style = "ultra" *) for Vivado URAM inference.
 // =============================================================================
@@ -73,7 +78,8 @@ module uram_accum_buf #(
     // Storage — 1024 rows × 64 words × 256-bit
     // =====================================================================
     // Flatten to [ROWS * WORDS] for Vivado URAM inference.
-    // Simple dual-port template: one write always + one read always.
+    // Simple dual-port template: one write port + one read port,
+    // each in a separate always @(posedge clk) block with NO async reset.
     (* ram_style = "ultra" *)
     reg [BUS_W-1:0] mem [0:ROWS * WORDS - 1];
 
@@ -100,15 +106,19 @@ module uram_accum_buf #(
     end
 
     // =====================================================================
+    // Accumulation Pipeline — 2-cycle read-modify-write
+    // =====================================================================
+    // Cycle N:   acc_rd_start fires, read port reads old value from URAM
+    // Cycle N+1: acc_pending=1, compute fp16_add, write result via write port
+    //            Arbiter is stalled (no new writes accepted)
+    reg                  acc_pending;
+    reg [ADDR_W-1:0]    acc_addr_r;
+    reg [BUS_W-1:0]     acc_data_r;
+
+    // =====================================================================
     // Write Arbiter — round-robin among engines, priority to clear/nm_wr
     // =====================================================================
-    // Selects one writer per cycle. Produces a single (addr, data, en)
-    // tuple for the memory write port.
-    //
-    // Priority: clearing > nm_wr > engines (round-robin)
-    //
-    // The round-robin pointer advances past the accepted engine each
-    // cycle an engine write is granted.
+    // Priority: acc_pending (stall) > clearing > nm_wr > engines (round-robin)
 
     localparam ENG_W = $clog2(N_ENG > 1 ? N_ENG : 2);
     reg [ENG_W-1:0] arb_ptr;
@@ -147,7 +157,9 @@ module uram_accum_buf #(
         arb_eng_found = 1'b0;
         arb_winner    = {ENG_W{1'b0}};
 
-        if (clearing) begin
+        if (acc_pending) begin
+            // Stall: accumulation writeback owns the write port this cycle
+        end else if (clearing) begin
             // Highest priority: clear
             wr_en_mux   = 1'b1;
             wr_addr_mux = clear_idx;
@@ -155,7 +167,7 @@ module uram_accum_buf #(
         end else if (nm_wr_en) begin
             // Second priority: non-matmul adapter write
             wr_en_mux   = 1'b1;
-            wr_addr_mux = nm_wr_row * WORDS + nm_wr_col_word;
+            wr_addr_mux = {nm_wr_row, nm_wr_col_word};
             wr_data_mux = nm_wr_data;
         end else begin
             // Round-robin among engines using pre-computed priority order
@@ -164,8 +176,8 @@ module uram_accum_buf #(
                     arb_eng_found              = 1'b1;
                     arb_winner                 = pri_idx[e];
                     wr_en_mux                  = 1'b1;
-                    wr_addr_mux                = eng_wr_row[pri_idx[e] * ROW_W +: ROW_W] * WORDS +
-                                                 eng_wr_col_word[pri_idx[e] * COL_W +: COL_W];
+                    wr_addr_mux                = {eng_wr_row[pri_idx[e] * ROW_W +: ROW_W],
+                                                  eng_wr_col_word[pri_idx[e] * COL_W +: COL_W]};
                     wr_data_mux                = eng_wr_data[pri_idx[e] * BUS_W +: BUS_W];
                     wr_accum_mux               = eng_wr_accum[pri_idx[e]];
                     eng_wr_accept[pri_idx[e]]  = 1'b1;
@@ -187,15 +199,73 @@ module uram_accum_buf #(
     end
 
     // =====================================================================
-    // Port A: Single Write with optional FP16 accumulation
+    // Accumulation FSM
     // =====================================================================
-    // When wr_accum_mux=1, perform element-wise FP16 addition
-    // (read-modify-write). This implements k-chunk accumulation for matmuls
-    // where K > PREFETCH_DIM.
-    //
-    // The read of mem[addr] in a non-blocking assignment uses the OLD value
-    // (read-before-write), which is correct for accumulation.
+    // acc_rd_start: the arbiter accepted an accumulate write; issue read
+    wire acc_rd_start = wr_en_mux && wr_accum_mux && !acc_pending;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            acc_pending <= 1'b0;
+        end else if (acc_rd_start) begin
+            acc_pending <= 1'b1;
+            acc_addr_r  <= wr_addr_mux;
+            acc_data_r  <= wr_data_mux;
+        end else begin
+            acc_pending <= 1'b0;
+        end
+    end
+
     // =====================================================================
+    // Port B: Shared Read Port (flush + accumulation)
+    // =====================================================================
+    // Flush reads and accumulation reads are mutually exclusive:
+    //   - Flush reads happen after matmul (no engine writes)
+    //   - Accumulation reads happen during matmul (no flush reads)
+    // acc_rd_start takes priority if they ever overlap (defensive).
+    wire                rd_en_int   = acc_rd_start || rd_en;
+    wire [ADDR_W-1:0]  rd_addr_int = acc_rd_start ? wr_addr_mux
+                                                   : {rd_row, rd_col_word};
+
+    // URAM registered read output — NO async reset (required for URAM inference)
+    // Pipeline stage 0 is the URAM output register itself.
+    // Stages 1..RD_LATENCY-1 are additional delay registers.
+    reg [BUS_W-1:0] rd_pipe_data [0:RD_LATENCY-1];
+    integer s;
+
+    always @(posedge clk) begin
+        // Stage 0: URAM registered output (conditional enable)
+        if (rd_en_int)
+            rd_pipe_data[0] <= mem[rd_addr_int];
+        // Stages 1+: pipeline shift (unconditional)
+        for (s = 1; s < RD_LATENCY; s = s + 1)
+            rd_pipe_data[s] <= rd_pipe_data[s-1];
+    end
+
+    // Flush valid pipeline (async reset on valid bits is fine — not URAM fabric)
+    reg [RD_LATENCY-1:0] rd_valid_sr;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            rd_valid_sr <= {RD_LATENCY{1'b0}};
+        else begin
+            rd_valid_sr[0] <= rd_en && !acc_rd_start;
+            for (s = 1; s < RD_LATENCY; s = s + 1)
+                rd_valid_sr[s] <= rd_valid_sr[s-1];
+        end
+    end
+
+    // Connect output from last pipeline stage
+    always @(*) begin
+        rd_data  = rd_pipe_data[RD_LATENCY-1];
+        rd_valid = rd_valid_sr[RD_LATENCY-1];
+    end
+
+    // =====================================================================
+    // Accumulation: FP16 element-wise add (combinational on registered data)
+    // =====================================================================
+    // rd_pipe_data[0] holds the old URAM value (registered previous cycle).
+    // acc_data_r holds the new engine data (registered previous cycle).
+    // Both inputs are registered, so this combinational logic is fine for timing.
     integer acc_i;
     reg [BUS_W-1:0] acc_result;
 
@@ -203,13 +273,30 @@ module uram_accum_buf #(
         acc_result = {BUS_W{1'b0}};
         for (acc_i = 0; acc_i < BUS_EL; acc_i = acc_i + 1) begin
             acc_result[acc_i*DATA_W +: DATA_W] = fp16_add_comb(
-                mem[wr_addr_mux][acc_i*DATA_W +: DATA_W],
-                wr_data_mux[acc_i*DATA_W +: DATA_W]
+                rd_pipe_data[0][acc_i*DATA_W +: DATA_W],
+                acc_data_r[acc_i*DATA_W +: DATA_W]
             );
         end
     end
 
+    // =====================================================================
+    // Port A: Write Port
+    // =====================================================================
+    // Mux between direct writes (clear/nm/engine) and accumulation writeback.
+    // acc_pending has exclusive use of the write port on its cycle.
+    // MUST be in a separate always block from the read port for URAM inference.
+    wire                mem_wr_en   = acc_pending || (wr_en_mux && !wr_accum_mux);
+    wire [ADDR_W-1:0]  mem_wr_addr = acc_pending ? acc_addr_r  : wr_addr_mux;
+    wire [BUS_W-1:0]   mem_wr_data = acc_pending ? acc_result  : wr_data_mux;
+
+    always @(posedge clk) begin
+        if (mem_wr_en)
+            mem[mem_wr_addr] <= mem_wr_data;
+    end
+
+    // =====================================================================
     // Combinational FP16 adder for k-chunk accumulation
+    // =====================================================================
     function [15:0] fp16_add_comb;
         input [15:0] a, b;
         reg        a_s, b_s, lg_s, sm_s, res_s, eff_sub;
@@ -314,58 +401,15 @@ module uram_accum_buf #(
         end
     endfunction
 
-    always @(posedge clk) begin
-        if (wr_en_mux) begin
-            if (wr_accum_mux)
-                mem[wr_addr_mux] <= acc_result;
-            else
-                mem[wr_addr_mux] <= wr_data_mux;
-        end
-    end
-
     // =====================================================================
-    // Port B: Flush Read — configurable latency pipeline (RD_LATENCY cycles)
+    // Simulation init — zero memory (synthesis-excluded to avoid loop limit)
     // =====================================================================
-    // Stage 0 is the registered memory read. Stages 1..RD_LATENCY-1 are
-    // additional delay registers. Output is taken from the last stage.
-    // When RD_LATENCY=1, the for-loop body never executes (0 iterations).
-    reg [BUS_W-1:0] rd_pipe_data  [0:RD_LATENCY-1];
-    reg             rd_pipe_valid [0:RD_LATENCY-1];
-    integer s;
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            for (s = 0; s < RD_LATENCY; s = s + 1) begin
-                rd_pipe_data[s]  <= {BUS_W{1'b0}};
-                rd_pipe_valid[s] <= 1'b0;
-            end
-        end else begin
-            // Stage 0: registered memory read
-            rd_pipe_valid[0] <= rd_en;
-            if (rd_en) begin
-                rd_pipe_data[0] <= mem[rd_row * WORDS + rd_col_word];
-            end
-            // Stages 1..RD_LATENCY-1: shift register (no iterations when RD_LATENCY=1)
-            for (s = 1; s < RD_LATENCY; s = s + 1) begin
-                rd_pipe_data[s]  <= rd_pipe_data[s-1];
-                rd_pipe_valid[s] <= rd_pipe_valid[s-1];
-            end
-        end
-    end
-
-    // Connect output from last pipeline stage
-    always @(*) begin
-        rd_data  = rd_pipe_data[RD_LATENCY-1];
-        rd_valid = rd_pipe_valid[RD_LATENCY-1];
-    end
-
-    // =====================================================================
-    // Simulation init — zero memory
-    // =====================================================================
+    // synthesis translate_off
     integer init_i;
     initial begin
         for (init_i = 0; init_i < ROWS * WORDS; init_i = init_i + 1)
             mem[init_i] = {BUS_W{1'b0}};
     end
+    // synthesis translate_on
 
 endmodule

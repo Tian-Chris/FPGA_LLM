@@ -122,6 +122,12 @@ See plan: `.claude/plans/snuggly-swinging-beacon.md`
 - This caused hbm_prefetch arlen underflow (0-1=255), reading 256 words of garbage
 - Fix: ceiling division `(k + BUS_EL - 1) / BUS_EL` for both k_chunk_col_words and n_chunk_col_words
 
+**Matmul Engine Last-Beat Loss During Accumulation (RESOLVED)**
+- `if (!outputting) out_valid <= 0` unconditionally killed last output beat when URAM accumulation stall overlapped
+- Only affected multi-k-chunk matmuls (FFN2) where wr_accum=1 triggers read-modify-write stalls
+- Symptom: 63 beats instead of 64 per tile → wr_sub_col drift → odd n_tiles get swapped columns + wrong bias
+- Fix: `if (!outputting && !(out_valid && out_stall)) out_valid <= 0` — hold during stall, clear on consumption
+
 ### Phase 10: Bias Support (IN PROGRESS) — **REQUIRED for coherent text**
 
 #### Phase 10A: Golden Model + Verification (before RTL)
@@ -155,6 +161,23 @@ See plan: `.claude/plans/snuggly-swinging-beacon.md`
 - **fp16_mult_comb exponent underflow**: swapped underflow/overflow check order in fp_funcs.vh
 - **Multi-k-chunk bias**: bias was applied on every k-chunk; fixed to only apply on last k-chunk via `eng_cmd_last_k_chunk` / `cmd_last_k_chunk` signals
 - **TB ACT_BASE stale**: testbenches had old LAYER_SIZE (786688) not accounting for bias words
+
+### Phase 11: Per-Step FPGA Debug (STEP_DEBUG) ✅
+
+- [x] 11-1. `defines.vh`: `STEP_DEBUG` define (commented out), `S_STEP_DBG_FLUSH` state
+- [x] 11-2. `fsm_controller.v`: `S_STEP_DBG_FLUSH` state — flushes full URAM (MODEL_DIM cols) to `output_base + running_offset` after every non-END step
+  - Precomputed `step_dbg_stride = bt * MODEL_STRIDE` in S_IDLE
+  - Running `step_dbg_offset` increments after each flush
+- [x] 11-3. `scripts/verilator_1k_debug.f`: `-DSTEP_DEBUG` flag
+- [x] 11-4. `fpga/build.tcl`: `STEP_DEBUG` env var propagation
+- [x] 11-5. `fpga/Makefile`: `link-prod`, `link-debug`, `package-debug` targets
+- [x] 11-6. `Makefile`: `test-1k-debug` target
+- [x] 11-7. `verify/test_top_1k.py`: `compare_step_debug()` — reads 15 per-step dumps, compares against golden with correlation stats
+- [x] 11-8. `tb_top_1k.v`: OUTPUT_BASE moved after KV cache (was 0x8000 inside weight region)
+- [x] 11-9. Verify: `test-1k` (prod) ✅, `test-1k-debug` (STEP_DEBUG) ✅ — all 15 steps match golden (>0.999 correlation)
+
+#### Bug found during Phase 11
+- **OUTPUT_BASE overlap with weights**: TB had `OUTPUT_BASE = 0x8000` (32768) which is inside the weight region (0..787263). STEP_DEBUG flushes overwrote WQ weights, corrupting all downstream matmuls. Fixed by moving OUTPUT_BASE after KV cache.
 
 ---
 

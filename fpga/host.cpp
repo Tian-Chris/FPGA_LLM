@@ -42,7 +42,7 @@ static constexpr int NUM_HEADS     = 16;
 static constexpr int HEAD_DIM      = MODEL_DIM / NUM_HEADS;  // 64
 static constexpr int F_DIM         = 4096;
 static constexpr int MAX_SEQ_LEN   = 128;
-static int NUM_LAYERS              = 2;   // default; overridable via env NUM_LAYERS
+static int NUM_LAYERS              = 1;   // default; overridable via env NUM_LAYERS
 static constexpr int BUS_ELEMS     = 16;   // 256-bit / 16-bit
 
 // AXI-Lite debug register offsets (match vitis_control.v)
@@ -52,7 +52,7 @@ static const char* FSM_NAMES[] = {
     "IDLE", "DECODE", "LN_RUN", "QKV_MM", "QKV_FL",
     "ATT_SCORE", "ATT_SM", "ATT_SM_FL", "ATT_OUT", "ATT_OUT_FL",
     "MM_RUN", "ACT_RUN", "RES_RUN", "UF_RUN", "NEXT_STEP",
-    "DONE", "OUTPUT_COPY"
+    "DONE", "OUTPUT_COPY", "CHECKPOINT", "STEP_DBG"
 };
 static constexpr int WORD_BYTES    = 32;   // 256 bits = 32 bytes
 static constexpr int MODEL_STRIDE  = MODEL_DIM / BUS_ELEMS;  // 64 words
@@ -62,7 +62,7 @@ static constexpr int MODEL_STRIDE  = MODEL_DIM / BUS_ELEMS;  // 64 words
 static constexpr size_t LAYER_SIZE        = 787264;  // words per layer (incl. bias)
 static constexpr size_t ACT_SCRATCH_WORDS = 6 * MAX_SEQ_LEN * MODEL_DIM / BUS_ELEMS;  // 49152
 static constexpr int    KV_LAYER_SIZE     = 2 * MAX_SEQ_LEN * MODEL_DIM / BUS_ELEMS;  // 16384
-static constexpr size_t OUTPUT_BUF_SIZE   =  4 * 1024 * 1024;   //  4 MB
+static constexpr size_t OUTPUT_BUF_SIZE   = 32 * 1024 * 1024;   // 32 MB (room for STEP_DEBUG: 15 steps × 24 layers)
 // Computed at runtime (depend on NUM_LAYERS):
 static size_t WEIGHT_BUF_SIZE;
 static size_t ACT_BUF_SIZE;
@@ -526,6 +526,18 @@ int main(int argc, char* argv[]) {
     std::cout << "Syncing weights to device...\n";
     bo_weight.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
+    // Verify HBM weight readback (first 16 FP16 values = first 256-bit word of W_q)
+    bo_weight.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    {
+        auto* wgt16 = reinterpret_cast<uint16_t*>(weight_map);
+        std::cout << "  Weight readback[0:16]: ";
+        for (int i = 0; i < 16; ++i) {
+            std::cout << "0x" << std::hex << wgt16[i] << std::dec;
+            if (i < 15) std::cout << " ";
+        }
+        std::cout << "\n";
+    }
+
     // -----------------------------------------------------------------
     // Prefill: embed all prompt tokens → run kernel → get last logit
     // -----------------------------------------------------------------
@@ -540,6 +552,23 @@ int main(int argc, char* argv[]) {
     embed_to_fp16(embed_fp32, act_map, prompt_len);
 
     bo_act.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+    // Verify embedding readback (first 16 FP16 values = row 0 of embeddings)
+    bo_act.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    {
+        std::cout << "  Embed readback[0:16]: ";
+        for (int i = 0; i < 16; ++i) {
+            int word_in_row = i / BUS_ELEMS;
+            int elem_in_word = i % BUS_ELEMS;
+            size_t byte_offset = static_cast<size_t>(
+                (ACT_EMBED_OFFSET + 0 * MODEL_STRIDE + word_in_row) * WORD_BYTES
+                + elem_in_word * 2);
+            uint16_t raw = act_map[byte_offset / 2];
+            std::cout << "0x" << std::hex << raw << std::dec;
+            if (i < 15) std::cout << " ";
+        }
+        std::cout << "\n";
+    }
 
     // Run kernel: prefill mode
     uint32_t batch_size  = 1;
@@ -612,16 +641,35 @@ int main(int argc, char* argv[]) {
         // Each debug record is 256 bits = 16 x int16 = 32 bytes
         // Read up to 512 records (covers 24 layers × 16 steps + DONE)
         for (int rec = 0; rec < 512; ++rec) {
-            uint32_t cycle = static_cast<uint32_t>(output_map[rec * 16 + 0]) |
-                             (static_cast<uint32_t>(static_cast<uint16_t>(output_map[rec * 16 + 1])) << 16);
+            // Cast via uint16_t first to avoid int16_t sign extension
+            uint32_t w0 = static_cast<uint16_t>(output_map[rec * 16 + 0]);
+            uint32_t w1 = static_cast<uint16_t>(output_map[rec * 16 + 1]);
+            uint32_t cycle = w0 | (w1 << 16);
             uint16_t layer = static_cast<uint16_t>(output_map[rec * 16 + 2]);
             uint8_t  state = static_cast<uint8_t>(output_map[rec * 16 + 3] & 0xFF);
-            uint8_t  step  = static_cast<uint8_t>((output_map[rec * 16 + 3] >> 8) & 0xFF);
+            uint8_t  step  = static_cast<uint8_t>((static_cast<uint16_t>(output_map[rec * 16 + 3]) >> 8) & 0xFF);
             uint8_t  bt    = static_cast<uint8_t>(output_map[rec * 16 + 4] & 0xFF);
-            uint8_t  cfg   = static_cast<uint8_t>((output_map[rec * 16 + 4] >> 8) & 0xFF);
+            uint8_t  cfg   = static_cast<uint8_t>((static_cast<uint16_t>(output_map[rec * 16 + 4]) >> 8) & 0xFF);
             if (cycle == 0 && layer == 0 && state == 0 && step == 0)
                 break;  // empty record — end of trace
-            const char* sname = (state < 17) ? FSM_NAMES[state] : "???";
+
+            // Detect URAM checkpoint records (header byte 0xCC)
+            uint8_t hdr = static_cast<uint8_t>((cycle >> 24) & 0xFF);
+            if (hdr == 0xCC) {
+                uint8_t col = static_cast<uint8_t>((cycle >> 16) & 0xFF);
+                uint16_t chk_layer = static_cast<uint16_t>(output_map[rec * 16 + 0]);
+                std::cout << "  [" << rec << "] CHECKPOINT L" << chk_layer
+                          << " col=" << (int)col << " data:";
+                // Print URAM FP16 values from bits [255:32] = words 2..15
+                for (int w = 2; w < 16; ++w) {
+                    uint16_t val = static_cast<uint16_t>(output_map[rec * 16 + w]);
+                    std::cout << " " << fp16_to_float(val);
+                }
+                std::cout << "\n";
+                continue;
+            }
+
+            const char* sname = (state < 19) ? FSM_NAMES[state] : "???";
             std::cout << "  [" << rec << "] cyc=" << cycle
                       << " L" << layer << " " << sname
                       << " step=" << (int)step
@@ -631,6 +679,53 @@ int main(int argc, char* argv[]) {
             std::cout << "\n";
         }
         std::cout << "===================\n\n";
+    }
+
+    // -----------------------------------------------------------------
+    // STEP_DEBUG readback: per-step URAM dumps in output buffer
+    // Layout: step 0 at offset 0, step 1 at bt*MODEL_STRIDE, etc.
+    // 15 non-END steps per layer × NUM_LAYERS layers
+    // -----------------------------------------------------------------
+    {
+        static const char* STEP_NAMES[] = {
+            "LN1", "Flush->TEMP", "QKV", "Attention", "Proj", "Res1",
+            "Flush->EMBED", "LN2", "Flush->TEMP", "FFN1", "GELU",
+            "Flush->FFN", "FFN2", "Res2", "Flush->EMBED"
+        };
+        int bt = seq_len;  // batch=1
+        int step_stride_elems = bt * MODEL_STRIDE * BUS_ELEMS;  // FP16 elements per step
+        int steps_per_layer = 15;
+        int total_steps = steps_per_layer * NUM_LAYERS;
+        int total_elems = total_steps * step_stride_elems;
+        int buf_elems = static_cast<int>(OUTPUT_BUF_SIZE / 2);  // int16 elements in buffer
+
+        // Check if first step has nonzero data (indicates STEP_DEBUG build)
+        bool has_step_data = false;
+        for (int i = 0; i < 16 && i < buf_elems; ++i) {
+            if (output_map[i] != 0) { has_step_data = true; break; }
+        }
+
+        if (has_step_data && total_elems <= buf_elems) {
+            std::cout << "\n=== Per-Step URAM Debug Dumps ===\n";
+            std::cout << "  bt=" << bt << " MODEL_STRIDE=" << MODEL_STRIDE
+                      << " step_stride=" << step_stride_elems << " elems\n";
+            for (int layer = 0; layer < NUM_LAYERS; ++layer) {
+                std::cout << "  --- Layer " << layer << " ---\n";
+                for (int s = 0; s < steps_per_layer; ++s) {
+                    int global_step = layer * steps_per_layer + s;
+                    int base_elem = global_step * step_stride_elems;
+                    std::cout << "    Step " << s << " (" << STEP_NAMES[s] << ") row0[0:8]:";
+                    for (int i = 0; i < 8 && (base_elem + i) < buf_elems; ++i) {
+                        float val = fp16_to_float(static_cast<uint16_t>(output_map[base_elem + i]));
+                        std::cout << " " << val;
+                    }
+                    std::cout << "\n";
+                }
+            }
+            std::cout << "================================\n\n";
+        } else if (!has_step_data) {
+            std::cout << "\n  (No STEP_DEBUG data — production build)\n\n";
+        }
     }
 
     // Verify all layers completed by checking KV cache per layer
@@ -655,6 +750,41 @@ int main(int argc, char* argv[]) {
                   << (embed_has_data ? "yes" : "no") << ")\n";
     }
 
+    // -----------------------------------------------------------------
+    // Intermediate value dump: read all surviving activation regions
+    // to compare against golden model for debugging
+    // -----------------------------------------------------------------
+    std::cout << "\n=== Intermediate Activation Dump (pos 0, first 16 elements) ===\n";
+    {
+        auto dump_region = [&](const char* name, int word_offset) {
+            std::cout << "  " << name << ": ";
+            for (int i = 0; i < 16; ++i) {
+                int word_in_row = i / BUS_ELEMS;
+                int elem_in_word = i % BUS_ELEMS;
+                size_t byte_offset = static_cast<size_t>(
+                    (word_offset + 0 * MODEL_STRIDE + word_in_row) * WORD_BYTES
+                    + elem_in_word * 2);
+                uint16_t raw = act_map[byte_offset / 2];
+                float val = fp16_to_float(raw);
+                if (i > 0) std::cout << ", ";
+                std::cout << val;
+            }
+            std::cout << "\n";
+        };
+
+        dump_region("EMBED(=res2)", ACT_EMBED_OFFSET);
+        dump_region("Q(=attn_out)", ACT_Q_OFFSET);
+        dump_region("K(=K_qkv)   ", 2 * MAX_SEQ_LEN * MODEL_DIM / BUS_ELEMS);
+        dump_region("V(=V_qkv)   ", 3 * MAX_SEQ_LEN * MODEL_DIM / BUS_ELEMS);
+        dump_region("ATTN(scores)", ACT_ATTN_OFFSET);
+        dump_region("TEMP(=LN2)  ", ACT_TEMP_OFFSET);
+
+        // Also dump KV cache layer 0 K (first row)
+        int kv0_offset = ACT_SCRATCH_WORDS;
+        dump_region("KV_L0_K     ", kv0_offset);
+    }
+    std::cout << "=============================================================\n";
+
     std::vector<float> hidden(MODEL_DIM);
     std::vector<float> normed(MODEL_DIM);
 
@@ -670,13 +800,31 @@ int main(int argc, char* argv[]) {
         ? unembed_sample(normed.data(), ed, temperature)
         : unembed_argmax(normed.data(), ed);
 
-    // Dump raw FP16 values from last position for debugging
+    // Dump raw FP16 values from position 0 and last position for debugging
+    // Use proper byte-level addressing (each 256-bit word = 16 FP16 elements)
+    std::cout << "\n--- Raw FP16 output (pos 0, first 32 of " << MODEL_DIM << ") ---\n";
+    for (int i = 0; i < 32 && i < MODEL_DIM; ++i) {
+        int word_in_row = i / BUS_ELEMS;
+        int elem_in_word = i % BUS_ELEMS;
+        size_t byte_offset = static_cast<size_t>(
+            (ACT_EMBED_OFFSET + 0 * MODEL_STRIDE + word_in_row) * WORD_BYTES
+            + elem_in_word * 2);
+        uint16_t raw = act_map[byte_offset / 2];
+        std::cout << fp16_to_float(raw);
+        if (i < 31) std::cout << ", ";
+    }
+    std::cout << "\n";
+
     std::cout << "\n--- Raw FP16 output (last position, first 32 of " << MODEL_DIM << ") ---\n";
     {
         int last_pos = prompt_len - 1;
-        int base = last_pos * MODEL_STRIDE;
         for (int i = 0; i < 32 && i < MODEL_DIM; ++i) {
-            uint16_t raw = act_map[base + i];
+            int word_in_row = i / BUS_ELEMS;
+            int elem_in_word = i % BUS_ELEMS;
+            size_t byte_offset = static_cast<size_t>(
+                (ACT_EMBED_OFFSET + last_pos * MODEL_STRIDE + word_in_row) * WORD_BYTES
+                + elem_in_word * 2);
+            uint16_t raw = act_map[byte_offset / 2];
             float val = fp16_to_float(raw);
             std::cout << val;
             if (i < 31) std::cout << ", ";
@@ -686,7 +834,12 @@ int main(int argc, char* argv[]) {
         // Check for all-zeros / Inf/NaN
         int zeros = 0, inf_nan = 0;
         for (int i = 0; i < MODEL_DIM; ++i) {
-            uint16_t raw = act_map[base + i];
+            int word_in_row = i / BUS_ELEMS;
+            int elem_in_word = i % BUS_ELEMS;
+            size_t byte_offset = static_cast<size_t>(
+                (ACT_EMBED_OFFSET + last_pos * MODEL_STRIDE + word_in_row) * WORD_BYTES
+                + elem_in_word * 2);
+            uint16_t raw = act_map[byte_offset / 2];
             if (raw == 0 || raw == 0x8000) zeros++;
             if ((raw & 0x7C00) == 0x7C00) inf_nan++;
         }

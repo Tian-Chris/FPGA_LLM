@@ -50,12 +50,16 @@ if {[llength $hex_files] > 0} {
 add_files -norecurse [glob ${fpga_rtl_dir}/*.v]
 
 # Set defines.vh include path and verilog defines
+set defines {FPGA_TARGET}
 if {[info exists ::env(EMU_SMALL)]} {
-    set_property verilog_define {FPGA_TARGET SIM_SMALL} [current_fileset]
+    lappend defines SIM_SMALL
     puts "INFO: EMU_SMALL mode — using SIM_SMALL dimensions"
-} else {
-    set_property verilog_define {FPGA_TARGET} [current_fileset]
 }
+if {[info exists ::env(STEP_DEBUG)]} {
+    lappend defines STEP_DEBUG
+    puts "INFO: STEP_DEBUG mode — per-step URAM flushes enabled"
+}
+set_property verilog_define $defines [current_fileset]
 set_property include_dirs $rtl_dir [current_fileset]
 
 # Mark all .v files as SystemVerilog (defines.vh uses root-scope

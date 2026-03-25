@@ -10,6 +10,10 @@
 `ifndef DEFINES_VH
 `define DEFINES_VH
 
+// Per-step debug: flush full URAM to output region after every FSM step
+// Enable via Verilator: +define+STEP_DEBUG   or   Vivado: -DSTEP_DEBUG
+// `define STEP_DEBUG
+
 // =============================================================================
 // Transformer Parameters
 // =============================================================================
@@ -153,6 +157,9 @@ localparam S_NEXT_STEP  = 5'd14;  // advance step_idx, handle layer loop
 localparam S_DONE        = 5'd15;
 localparam S_OUTPUT_COPY = 5'd16;
 localparam S_CHECKPOINT  = 5'd17;  // post-layer URAM checkpoint dump to debug trace
+`ifdef STEP_DEBUG
+localparam S_STEP_DBG_FLUSH = 5'd18;  // per-step URAM dump to output region
+`endif
 
 // Legacy aliases (kept for host_interface status register compatibility)
 localparam FSM_IDLE = 6'd0;

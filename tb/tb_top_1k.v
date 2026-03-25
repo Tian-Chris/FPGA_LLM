@@ -56,7 +56,7 @@ module tb_top_1k;
     localparam WEIGHT_BASE = 0;
     localparam ACT_BASE    = 787264;       // LAYER_SIZE (production, with biases)
     localparam KV_BASE     = ACT_BASE + 6 * 128 * 1024 / 16;  // after activation scratch
-    localparam OUTPUT_BASE = 32'h8000;
+    localparam OUTPUT_BASE = KV_BASE + 2 * 128 * 1024 / 16;  // after KV cache
     localparam DEBUG_BASE  = TB_HBM_DEPTH - 512;  // Last 512 words for debug trace
 
     // =========================================================================

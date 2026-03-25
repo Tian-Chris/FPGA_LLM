@@ -413,10 +413,13 @@ module matmul_engine #(
                 end
             end
 
-            // Clear out_valid when not outputting. Must be unconditional
-            // (no out_stall gate) to prevent infinite re-issue after the
-            // last beat when the URAM arbiter denies the engine write.
-            if (!outputting)
+            // Clear out_valid when not outputting, BUT hold it during a
+            // stall so the last beat isn't lost.  Once the stall lifts,
+            // mm_out_new fires (consuming the beat) and this condition
+            // becomes true in the same cycle, clearing out_valid via NBA.
+            // No infinite re-issue: out_valid goes to 0 the cycle after
+            // consumption, so mm_out_new cannot fire again.
+            if (!outputting && !(out_valid && out_stall))
                 out_valid <= 1'b0;
         end
     end
@@ -960,6 +963,7 @@ module matmul_controller #(
     reg wr_sub_col;
     reg wr_pending;
     wire mm_out_stall = wr_pending && !uram_wr_accept;
+
 
     wire mm_out_new = mm_out_valid && !mm_out_stall;
 

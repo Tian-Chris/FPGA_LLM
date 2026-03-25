@@ -269,6 +269,12 @@ module fsm_controller #(
     (* mark_debug = "true" *) reg [DIM_W-1:0]  head_cnt;
     reg              flush_sent;
 
+    `ifdef STEP_DEBUG
+    reg              step_dbg_flush_sent;
+    reg [HBM_ADDR_W-1:0] step_dbg_offset;   // running offset into output region
+    reg [HBM_ADDR_W-1:0] step_dbg_stride;   // bt * MODEL_STRIDE (precomputed)
+    `endif
+
     // Computed values
     wire [DIM_W-1:0] bt = batch_r * seq_r;
     wire [HBM_ADDR_W-1:0] layer_wgt_base = weight_base + layer_cnt * LAYER_SIZE;
@@ -369,6 +375,11 @@ module fsm_controller #(
             nm_flush_phase   <= 1'b0;
             head_cnt         <= {DIM_W{1'b0}};
             flush_sent       <= 1'b0;
+            `ifdef STEP_DEBUG
+            step_dbg_flush_sent <= 1'b0;
+            step_dbg_offset     <= {HBM_ADDR_W{1'b0}};
+            step_dbg_stride     <= {HBM_ADDR_W{1'b0}};
+            `endif
             flush_hbm_base   <= {HBM_ADDR_W{1'b0}};
             flush_hbm_stride <= {HBM_ADDR_W{1'b0}};
             flush_num_rows   <= 10'd0;
@@ -418,6 +429,11 @@ module fsm_controller #(
                         head_cnt       <= {DIM_W{1'b0}};
                         nm_row_cnt     <= {DIM_W{1'b0}};
                         nm_addr_offset <= {NM_ADDR_W{1'b0}};
+                        `ifdef STEP_DEBUG
+                        step_dbg_flush_sent <= 1'b0;
+                        step_dbg_offset     <= {HBM_ADDR_W{1'b0}};
+                        step_dbg_stride     <= batch_size * seq_len * MODEL_STRIDE;
+                        `endif
                         state     <= S_DECODE;
                         // synthesis translate_off
                         $display("[FSM %0t] START: batch=%0d seq=%0d decode=%0d cache_len=%0d",
@@ -937,8 +953,13 @@ module fsm_controller #(
                                 state <= S_DONE;
                             end
                         end else begin
+                            `ifdef STEP_DEBUG
+                            // Per-step debug: flush URAM before advancing
+                            state <= S_STEP_DBG_FLUSH;
+                            `else
                             step_idx <= step_idx + 1;
                             state    <= S_DECODE;
+                            `endif
                         end
                     end
                 end
@@ -996,6 +1017,34 @@ module fsm_controller #(
                         end
                     end
                 end
+
+                `ifdef STEP_DEBUG
+                // ---------------------------------------------------------
+                // S_STEP_DBG_FLUSH: dump full URAM (MODEL_DIM cols) to
+                // output_base + running offset after each FSM step
+                // ---------------------------------------------------------
+                S_STEP_DBG_FLUSH: begin
+                    if (!step_dbg_flush_sent && !uram_flush_done) begin
+                        uram_flush_start         <= 1'b1;
+                        step_dbg_flush_sent      <= 1'b1;
+                        uram_flush_hbm_base      <= output_base + step_dbg_offset;
+                        uram_flush_hbm_stride    <= MODEL_STRIDE;
+                        uram_flush_num_rows      <= bt - 1;
+                        uram_flush_num_col_words <= URAM_MODEL_COLS_M1;
+                        uram_flush_start_col     <= 8'd0;
+                        // synthesis translate_off
+                        $display("[STEP_DBG %0t] Flush step %0d layer %0d -> output_base+%0d",
+                                 $time, step_idx, layer_cnt, step_dbg_offset);
+                        // synthesis translate_on
+                    end
+                    if (uram_flush_done) begin
+                        step_dbg_flush_sent <= 1'b0;
+                        step_dbg_offset     <= step_dbg_offset + step_dbg_stride;
+                        step_idx            <= step_idx + 1;
+                        state               <= S_DECODE;
+                    end
+                end
+                `endif
 
                 // ---------------------------------------------------------
                 S_OUTPUT_COPY: begin

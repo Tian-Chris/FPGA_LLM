@@ -1,4 +1,4 @@
-.PHONY: all lint lint-all sim wave synth show sta clean help cosim cosim-matmul cosim-softmax cosim-layernorm cosim-activation cosim-residual_add cosim-fp-primitives cosim-fp16-mult cosim-fp32-add cosim-fp32-to-fp16 cosim-fp16-add cosim-fp16-compare cosim-clean sim-small test-small test-top test-matmul1k test-1k test-decode test-multi test-token test-golden test-golden-24 test-golden-1k test-golden-multi test-golden-token test-golden-token-24 test-pytorch
+.PHONY: all lint lint-all sim wave synth show sta clean help cosim cosim-matmul cosim-softmax cosim-layernorm cosim-activation cosim-residual_add cosim-fp-primitives cosim-fp16-mult cosim-fp32-add cosim-fp32-to-fp16 cosim-fp16-add cosim-fp16-compare cosim-clean sim-small test-small test-top test-matmul1k test-1k test-1k-debug test-decode test-multi test-token test-golden test-golden-24 test-golden-1k test-golden-multi test-golden-token test-golden-token-24 test-pytorch
 
 STA_TIME ?= 10.0
 
@@ -292,6 +292,9 @@ test-matmul1k:
 
 test-1k:
 	python3 verify/test_top_1k.py
+
+test-1k-debug:
+	STEP_DEBUG=1 python3 verify/test_top_1k.py
 
 test-decode:
 	python3 verify/test_decode_1k.py

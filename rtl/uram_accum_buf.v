@@ -289,6 +289,7 @@ module uram_accum_buf #(
     wire [ADDR_W-1:0]  mem_wr_addr = acc_pending ? acc_addr_r  : wr_addr_mux;
     wire [BUS_W-1:0]   mem_wr_data = acc_pending ? acc_result  : wr_data_mux;
 
+
     always @(posedge clk) begin
         if (mem_wr_en)
             mem[mem_wr_addr] <= mem_wr_data;

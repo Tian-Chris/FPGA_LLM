@@ -92,6 +92,45 @@ link-hw-spread: $(XO_FILE) $(CFG_FILE)
 		-o $(KERNEL)_hw.xclbin
 	@echo "=== Link complete (AltSpreadLogic_high): $(KERNEL)_hw.xclbin ==="
 
+# =============================================================================
+# Production vs Debug builds (compile-time STEP_DEBUG toggle)
+# =============================================================================
+# Debug .xo has STEP_DEBUG define baked in during Vivado package step
+DEBUG_XO := $(KERNEL)_debug.xo
+
+.PHONY: package-debug link-prod link-debug
+
+package-debug: $(DEBUG_XO)
+
+$(DEBUG_XO): build.tcl kernel.xml rtl/fpga_kernel.v rtl/vitis_control.v $(wildcard ../rtl/*.v ../rtl/*.vh)
+	cd .. && export STEP_DEBUG=1 && $(VIVADO) -mode batch -source fpga/build.tcl -tclargs
+	mv $(XO_FILE) $(DEBUG_XO)
+	@echo "=== Package-debug complete: $(DEBUG_XO) ==="
+
+link-prod: $(XO_FILE) $(CFG_FILE)
+	$(VPP) -t hw --platform $(PLATFORM_PATH) \
+		--link $(XO_FILE) \
+		--config $(CFG_FILE) \
+		--kernel_frequency 100 \
+		--dk chipscope:fpga_kernel_1 \
+		--vivado.prop run.impl_1.STEPS.PLACE_DESIGN.ARGS.DIRECTIVE=AltSpreadLogic_high \
+		--vivado.prop run.impl_1.STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE=AlternateCLBRouting \
+		--vivado.prop run.impl_1.STEPS.OPT_DESIGN.ARGS.DIRECTIVE=ExploreWithRemap \
+		-o $(KERNEL)_hw.xclbin
+	@echo "=== Link-prod complete: $(KERNEL)_hw.xclbin ==="
+
+link-debug: $(DEBUG_XO) $(CFG_FILE)
+	$(VPP) -t hw --platform $(PLATFORM_PATH) \
+		--link $(DEBUG_XO) \
+		--config $(CFG_FILE) \
+		--kernel_frequency 100 \
+		--dk chipscope:fpga_kernel_1 \
+		--vivado.prop run.impl_1.STEPS.PLACE_DESIGN.ARGS.DIRECTIVE=AltSpreadLogic_high \
+		--vivado.prop run.impl_1.STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE=AlternateCLBRouting \
+		--vivado.prop run.impl_1.STEPS.OPT_DESIGN.ARGS.DIRECTIVE=ExploreWithRemap \
+		-o $(KERNEL)_debug_hw.xclbin
+	@echo "=== Link-debug complete (STEP_DEBUG): $(KERNEL)_debug_hw.xclbin ==="
+
 link-hw-ila: $(XO_FILE) $(CFG_FILE)
 	$(VPP) -t hw --platform $(PLATFORM_PATH) \
 		--link $(XO_FILE) \

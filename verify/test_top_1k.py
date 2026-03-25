@@ -106,6 +106,7 @@ ACT_FFN_OFFSET   = 0
 KV_V_OFFSET   = MAX_SEQ_LEN * MODEL_DIM // WE          # 8192
 KV_LAYER_SIZE = 2 * MAX_SEQ_LEN * MODEL_DIM // WE      # 16384
 KV_BASE       = ACT_BASE + 6 * MAX_SEQ_LEN * MODEL_DIM // WE
+OUTPUT_BASE   = KV_BASE + KV_LAYER_SIZE                 # after KV cache
 
 # Directories
 TEST_DATA_DIR = os.path.join(PROJECT_ROOT, "verify", "test_data")
@@ -400,7 +401,6 @@ def compute_golden(embed_fp16, weights):
     print("    FFN2 (4096x1024)...")
     ffn2 = tiled_matmul_fp16_numpy(ffn_act, weights['W_ffn2'], TILE_SIZE, bias=weights['bias_ffn2'])
     g['ffn2'] = ffn2
-    print(f"      golden ffn2[0][0:4] = {' '.join(f'{v:04x}' for v in ffn2[0][:4])}")
 
     # ------------------------------------------------------------------
     # Step 13: Residual2 = ffn2 + residual1 (pre-norm architecture)
@@ -540,7 +540,11 @@ def compile_design():
     """Compile with Verilator using production 1K flags."""
     tb_path = os.path.join(TB_DIR, "tb_top_1k.v")
     rtl_paths = [os.path.join(RTL_DIR, f) for f in RTL_ALL]
-    verilator_f = os.path.join(PROJECT_ROOT, "scripts", "verilator_1k.f")
+    step_debug = os.environ.get("STEP_DEBUG", "0") == "1"
+    if step_debug:
+        verilator_f = os.path.join(PROJECT_ROOT, "scripts", "verilator_1k_debug.f")
+    else:
+        verilator_f = os.path.join(PROJECT_ROOT, "scripts", "verilator_1k.f")
 
     cmd = (["verilator", "--binary", "-f", verilator_f, tb_path]
            + rtl_paths + ["--top-module", "tb_top_1k"])
@@ -665,6 +669,120 @@ def compare_rtl_output(g):
 
 
 # ---------------------------------------------------------------------------
+# Per-Step Debug Comparison (STEP_DEBUG mode)
+# ---------------------------------------------------------------------------
+
+# Map FSM step index to golden model key and expected URAM width
+# Steps that don't produce meaningful new URAM content (flushes) map to None
+STEP_GOLDEN_MAP = [
+    (0,  'ln1_out',    MODEL_DIM),    # Step 0:  LN1
+    (1,  None,         None),          # Step 1:  Flush LN1→TEMP (URAM unchanged)
+    (2,  None,         None),          # Step 2:  QKV (multi-phase, last phase is V)
+    (3,  'attn_out',   MODEL_DIM),    # Step 3:  Attention block
+    (4,  'attn_proj',  MODEL_DIM),    # Step 4:  Output projection
+    (5,  'residual1',  MODEL_DIM),    # Step 5:  Residual1
+    (6,  None,         None),          # Step 6:  Flush res1→EMBED
+    (7,  'ln2_out',    MODEL_DIM),    # Step 7:  LN2
+    (8,  None,         None),          # Step 8:  Flush LN2→TEMP
+    (9,  'ffn1',       F_DIM),        # Step 9:  FFN1
+    (10, 'ffn_act',    F_DIM),        # Step 10: GELU
+    (11, None,         None),          # Step 11: Flush act→FFN
+    (12, 'ffn2',       MODEL_DIM),    # Step 12: FFN2
+    (13, 'residual2',  MODEL_DIM),    # Step 13: Residual2
+    (14, None,         None),          # Step 14: Flush res2→EMBED
+]
+
+STEP_NAMES = [
+    "LN1", "Flush→TEMP", "QKV", "Attention", "Proj", "Res1",
+    "Flush→EMBED", "LN2", "Flush→TEMP", "FFN1", "GELU",
+    "Flush→FFN", "FFN2", "Res2", "Flush→EMBED"
+]
+
+
+def compare_step_debug(g):
+    """Read per-step URAM dumps from output region and compare against golden."""
+    flush_path = os.path.join(TEST_DATA_DIR, "hbm_flush_1k_full_dump.hex")
+    if not os.path.exists(flush_path):
+        print("  ERROR: flush dump file not found for step debug")
+        return False
+
+    flush_words = read_hex_dump(flush_path)
+    step_stride = BT * MODEL_STRIDE  # words per step dump region
+
+    step_out = os.path.join(PROJECT_ROOT, "verify", "step_debug_1k.txt")
+    all_pass = True
+
+    with open(step_out, 'w') as f:
+        f.write("=" * 60 + "\n")
+        f.write("PER-STEP URAM DEBUG DUMP COMPARISON\n")
+        f.write(f"OUTPUT_BASE=0x{OUTPUT_BASE:X}, step_stride={step_stride}\n")
+        f.write("=" * 60 + "\n\n")
+
+        for step_idx in range(15):  # 15 non-END steps
+            region_base = OUTPUT_BASE + step_idx * step_stride
+            step_name = STEP_NAMES[step_idx]
+            _, golden_key, expected_width = STEP_GOLDEN_MAP[step_idx]
+
+            f.write(f"--- Step {step_idx}: {step_name} (HBM offset {region_base}) ---\n")
+
+            # Extract RTL dump (always MODEL_DIM wide from the flush)
+            rtl_step = extract_matrix_from_hbm(
+                flush_words, region_base, BT, MODEL_STRIDE, MODEL_DIM)
+
+            # Print first few values for quick inspection
+            if rtl_step and rtl_step[0]:
+                first_vals = rtl_step[0][:8]
+                fp_vals = [np.uint16(v).view(np.float16) for v in first_vals]
+                f.write(f"  RTL row0[0:8]: {[f'{v:.4f}' for v in fp_vals]}\n")
+
+            if golden_key is None:
+                f.write(f"  (flush step — no golden comparison)\n\n")
+                continue
+
+            golden_mat = g[golden_key]
+
+            # For F_DIM-wide steps, only compare MODEL_DIM columns (first 1024 of 4096)
+            if expected_width > MODEL_DIM:
+                # Truncate golden to MODEL_DIM columns
+                golden_trunc = [row[:MODEL_DIM] for row in golden_mat]
+                f.write(f"  (comparing first {MODEL_DIM} of {expected_width} columns)\n")
+            else:
+                golden_trunc = golden_mat
+
+            if golden_trunc and golden_trunc[0]:
+                first_vals_g = golden_trunc[0][:8]
+                fp_vals_g = [np.uint16(v).view(np.float16) for v in first_vals_g]
+                f.write(f"  Golden row0[0:8]: {[f'{v:.4f}' for v in fp_vals_g]}\n")
+
+            ok, mis = compare_matrices(golden_trunc, rtl_step,
+                                       f'step{step_idx}_{golden_key}', f,
+                                       rel_tol=0.05, abs_tol=0.6)
+            _print_correlation(golden_trunc, rtl_step,
+                               f'step{step_idx}_{golden_key}', f)
+
+            if mis > 0:
+                total = ok + mis
+                pct = 100.0 * mis / total if total else 0
+                f.write(f"  ** {mis} mismatches ({pct:.2f}%) **\n")
+                if pct > 5.0:
+                    all_pass = False
+            f.write("\n")
+
+        f.write("=" * 60 + "\n")
+        if all_pass:
+            f.write("ALL STEP CHECKS PASSED (< 5% mismatch rate per step)\n")
+        else:
+            f.write("SOME STEPS EXCEEDED 5% MISMATCH THRESHOLD\n")
+
+    print(f"  Step debug comparison written: {step_out}")
+    if all_pass:
+        print("  ALL STEP CHECKS PASSED")
+    else:
+        print("  WARNING: Some steps exceeded mismatch threshold")
+    return all_pass
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -718,6 +836,11 @@ def main():
     passed = compare_rtl_output(g)
     if not passed:
         sys.exit(1)
+
+    # Per-step debug comparison (when STEP_DEBUG=1)
+    if os.environ.get("STEP_DEBUG", "0") == "1":
+        print("\n  Running per-step debug comparison...")
+        compare_step_debug(g)
 
     print("\nDone.")
 

@@ -78,6 +78,10 @@ module host_interface #(
     // Debug trace base address
     output reg  [HBM_ADDR_W-1:0]       debug_base,
 
+    // Diagnostic test controls
+    output reg  [DIM_WIDTH-1:0]         max_steps,
+    output reg  [3:0]                   test_mode,
+
     // Status inputs from FSM
     input  wire                         done,
     input  wire                         busy,
@@ -100,6 +104,8 @@ module host_interface #(
     localparam ADDR_KV_BASE     = 8'h24;
     localparam ADDR_NUM_LAYERS  = 8'h28;
     localparam ADDR_DEBUG_BASE  = 8'h2C;
+    localparam ADDR_MAX_STEPS   = 8'h30;
+    localparam ADDR_TEST_MODE   = 8'h34;
 
     // -------------------------------------------------------------------------
     // Internal Registers
@@ -141,6 +147,8 @@ module host_interface #(
             cache_len     <= {DIM_WIDTH{1'b0}};
             num_layers    <= 16'd2;  // safe default for FPGA debug (host overrides)
             debug_base    <= {HBM_ADDR_W{1'b0}};
+            max_steps     <= {DIM_WIDTH{1'b0}};
+            test_mode     <= 4'd0;
         end else begin
             start_pulse <= 1'b0;
 
@@ -194,6 +202,12 @@ module host_interface #(
                         end
                         ADDR_DEBUG_BASE: begin
                             debug_base <= s_axi_wdata[HBM_ADDR_W-1:0];
+                        end
+                        ADDR_MAX_STEPS: begin
+                            max_steps <= s_axi_wdata[DIM_WIDTH-1:0];
+                        end
+                        ADDR_TEST_MODE: begin
+                            test_mode <= s_axi_wdata[3:0];
                         end
                     endcase
 
@@ -281,6 +295,12 @@ module host_interface #(
                             end
                             ADDR_DEBUG_BASE: begin
                                 s_axi_rdata <= {{(32-HBM_ADDR_W){1'b0}}, debug_base};
+                            end
+                            ADDR_MAX_STEPS: begin
+                                s_axi_rdata <= {16'd0, max_steps};
+                            end
+                            ADDR_TEST_MODE: begin
+                                s_axi_rdata <= {28'd0, test_mode};
                             end
                             default: begin
                                 s_axi_rdata <= 32'hDEADBEEF;

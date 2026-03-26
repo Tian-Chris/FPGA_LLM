@@ -72,6 +72,10 @@ module vitis_control #(
     output reg  [DIM_WIDTH-1:0]         num_layers,
     output reg  [HBM_ADDR_W-1:0]       debug_base,
 
+    // Diagnostic test controls
+    output reg  [DIM_WIDTH-1:0]         max_steps,
+    output reg  [3:0]                   test_mode,
+
     // Status inputs from FSM
     input  wire                         done,
     input  wire                         busy,
@@ -109,6 +113,8 @@ module vitis_control #(
     localparam ADDR_KV_HI       = 7'h5C;
     localparam ADDR_NUM_LAYERS  = 7'h60;
     localparam ADDR_DEBUG_BASE  = 7'h68;
+    localparam ADDR_MAX_STEPS   = 7'h70;
+    localparam ADDR_TEST_MODE   = 7'h78;
 
     // -------------------------------------------------------------------------
     // Internal registers
@@ -260,6 +266,8 @@ module vitis_control #(
                             ADDR_DBG_LAYER:   s_axi_rdata <= {16'd0, current_layer};
                             ADDR_NUM_LAYERS:  s_axi_rdata <= {16'd0, num_layers};
                             ADDR_DEBUG_BASE:  s_axi_rdata <= {{(32-HBM_ADDR_W){1'b0}}, debug_base};
+                            ADDR_MAX_STEPS:   s_axi_rdata <= {16'd0, max_steps};
+                            ADDR_TEST_MODE:   s_axi_rdata <= {28'd0, test_mode};
                             default:          s_axi_rdata <= 32'd0;
                         endcase
                         rd_state <= RD_DATA;
@@ -303,6 +311,8 @@ module vitis_control #(
             cache_len     <= {DIM_WIDTH{1'b0}};
             num_layers    <= 16'd2;  // safe default for FPGA debug (host overrides)
             debug_base    <= {HBM_ADDR_W{1'b0}};
+            max_steps     <= {DIM_WIDTH{1'b0}};
+            test_mode     <= 4'd0;
         end else begin
             start <= 1'b0;  // default: single-cycle pulse
 
@@ -331,6 +341,8 @@ module vitis_control #(
                     ADDR_CACHE_LEN:   cache_len     <= wr_data_latch[DIM_WIDTH-1:0];
                     ADDR_NUM_LAYERS:  num_layers    <= wr_data_latch[DIM_WIDTH-1:0];
                     ADDR_DEBUG_BASE:  debug_base    <= wr_data_latch[HBM_ADDR_W-1:0];
+                    ADDR_MAX_STEPS:   max_steps     <= wr_data_latch[DIM_WIDTH-1:0];
+                    ADDR_TEST_MODE:   test_mode     <= wr_data_latch[3:0];
                     default: ;
                 endcase
             end

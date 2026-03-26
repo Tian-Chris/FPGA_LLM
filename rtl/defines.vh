@@ -161,6 +161,15 @@ localparam S_CHECKPOINT  = 5'd17;  // post-layer URAM checkpoint dump to debug t
 localparam S_STEP_DBG_FLUSH = 5'd18;  // per-step URAM dump to output region
 `endif
 
+// Diagnostic test states (used when test_mode != 0)
+localparam S_TEST_DISPATCH  = 5'd19;  // Branch on test_mode value
+localparam S_TEST_ECHO      = 5'd20;  // HBM write pattern via debug_writer
+localparam S_TEST_URAM_WR   = 5'd21;  // URAM write via nm_adapter
+localparam S_TEST_URAM_FL   = 5'd22;  // URAM flush to HBM
+localparam S_TEST_LATENCY   = 5'd23;  // URAM read latency probe
+localparam S_TEST_MULTI_ROW = 5'd24;  // Multi-row URAM cascade test
+localparam S_TEST_REG_CHK   = 5'd25;  // Register value readback
+
 // Legacy aliases (kept for host_interface status register compatibility)
 localparam FSM_IDLE = 6'd0;
 localparam FSM_DONE = 6'd15;

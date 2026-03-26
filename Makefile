@@ -1,4 +1,4 @@
-.PHONY: all lint lint-all sim wave synth show sta clean help cosim cosim-matmul cosim-softmax cosim-layernorm cosim-activation cosim-residual_add cosim-fp-primitives cosim-fp16-mult cosim-fp32-add cosim-fp32-to-fp16 cosim-fp16-add cosim-fp16-compare cosim-clean sim-small test-small test-top test-matmul1k test-1k test-1k-debug test-decode test-multi test-token test-golden test-golden-24 test-golden-1k test-golden-multi test-golden-token test-golden-token-24 test-pytorch
+.PHONY: all lint lint-all sim wave synth show sta clean help cosim cosim-matmul cosim-softmax cosim-layernorm cosim-activation cosim-residual_add cosim-fp-primitives cosim-fp16-mult cosim-fp32-add cosim-fp32-to-fp16 cosim-fp16-add cosim-fp16-compare cosim-clean sim-small test-small test-top test-matmul1k test-1k test-1k-debug test-decode test-multi test-token test-golden test-golden-24 test-golden-1k test-golden-multi test-golden-token test-golden-token-24 test-pytorch test-diag
 
 STA_TIME ?= 10.0
 
@@ -322,6 +322,9 @@ test-golden-token:
 
 test-golden-token-24:
 	NUM_LAYERS=24 python3 verify/test_token_cosim.py --golden-only
+
+test-diag:
+	python3 verify/test_diag.py
 
 test-pytorch:
 	python3.11 verify/fp32_baseline.py

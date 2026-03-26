@@ -3,13 +3,16 @@
 # =============================================================================
 #
 # Targets:
-#   make package    — Vivado: package RTL → .xo
-#   make link-emu   — v++: link .xo → .xclbin (hw_emu)
-#   make link-hw    — v++: link .xo → .xclbin (hw)
-#   make host       — g++: compile XRT host application
-#   make run-emu    — Run hardware emulation
-#   make run-hw     — Run on real FPGA
-#   make clean      — Remove build artifacts
+#   make package       — Vivado: package RTL → .xo
+#   make package-debug — Vivado: package RTL → .xo (with STEP_DEBUG)
+#   make link-prod     — v++: link .xo → .xclbin (hw, 100MHz, spread)
+#   make link-debug    — v++: link debug .xo → .xclbin (hw, 100MHz, spread)
+#   make link-hw-ila   — v++: link .xo → .xclbin (hw, 100MHz, spread + ILA)
+#   make host          — g++: compile XRT host application
+#   make link-emu      — v++: link .xo → .xclbin (hw_emu)
+#   make run-emu       — Run hardware emulation
+#   make run-hw        — Run on real FPGA
+#   make clean         — Remove build artifacts
 # =============================================================================
 
 # Platform
@@ -27,10 +30,6 @@ KERNEL   := fpga_kernel
 XO_FILE  := $(KERNEL).xo
 CFG_FILE := connectivity.cfg
 
-# Targets
-TARGET   ?= hw_emu
-XCLBIN   := $(KERNEL)_$(TARGET).xclbin
-
 # Host
 HOST_SRC := host.cpp
 HOST_EXE := host
@@ -41,125 +40,79 @@ HOST_CXX    := g++
 HOST_CFLAGS := -std=c++17 -O2 -I$(XRT_DIR)/include -fmessage-length=0
 HOST_LFLAGS := -L$(XRT_DIR)/lib -lOpenCL -lxrt_coreutil -pthread
 
+# Common v++ link flags
+FREQ        ?= 100
+VPP_LINK    := $(VPP) -t hw --platform $(PLATFORM_PATH) --config $(CFG_FILE) \
+		--kernel_frequency $(FREQ) --dk chipscope:fpga_kernel_1
+SPREAD_OPTS := --vivado.prop run.impl_1.STEPS.PLACE_DESIGN.ARGS.DIRECTIVE=AltSpreadLogic_high \
+		--vivado.prop run.impl_1.STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE=AlternateCLBRouting \
+		--vivado.prop run.impl_1.STEPS.OPT_DESIGN.ARGS.DIRECTIVE=ExploreWithRemap
+
+# Debug .xo (STEP_DEBUG baked in during package)
+DEBUG_XO := $(KERNEL)_debug.xo
+
+# RTL deps shared by all package targets
+RTL_DEPS := build.tcl kernel.xml rtl/fpga_kernel.v rtl/vitis_control.v $(wildcard ../rtl/*.v ../rtl/*.vh)
+
 # =============================================================================
 # Package: RTL → .xo (Vivado batch)
 # =============================================================================
-.PHONY: package
+.PHONY: package package-debug
+
 package: $(XO_FILE)
 
-$(XO_FILE): build.tcl kernel.xml rtl/fpga_kernel.v rtl/vitis_control.v $(wildcard ../rtl/*.v ../rtl/*.vh)
+$(XO_FILE): $(RTL_DEPS)
 	cd .. && $(VIVADO) -mode batch -source fpga/build.tcl -tclargs
 	@echo "=== Package complete: $(XO_FILE) ==="
 
-# =============================================================================
-# Link: .xo → .xclbin (v++)
-# =============================================================================
-.PHONY: link-emu link-hw link-hw-fast link-hw-spread
-
-link-emu: TARGET := hw_emu
-link-emu: $(KERNEL)_hw_emu.xclbin
-
-link-hw: TARGET := hw
-link-hw: $(KERNEL)_hw.xclbin
-
-$(KERNEL)_%.xclbin: $(XO_FILE) $(CFG_FILE)
-	$(VPP) -t $* --platform $(PLATFORM_PATH) \
-		--link $(XO_FILE) \
-		--config $(CFG_FILE) \
-		--kernel_frequency 100 \
-		--dk chipscope:fpga_kernel_1 \
-		-o $@
-	@echo "=== Link complete: $@ ==="
-
-link-hw-fast: $(XO_FILE) $(CFG_FILE)
-	$(VPP) -t hw --platform $(PLATFORM_PATH) \
-		--link $(XO_FILE) \
-		--config $(CFG_FILE) \
-		--kernel_frequency 10 \
-		--dk chipscope:fpga_kernel_1 \
-		-o $(KERNEL)_hw.xclbin
-	@echo "=== Link complete (10MHz, default directives): $(KERNEL)_hw.xclbin ==="
-
-link-hw-spread: $(XO_FILE) $(CFG_FILE)
-	$(VPP) -t hw --platform $(PLATFORM_PATH) \
-		--link $(XO_FILE) \
-		--config $(CFG_FILE) \
-		--kernel_frequency 100 \
-		--dk chipscope:fpga_kernel_1 \
-		--vivado.prop run.impl_1.STEPS.PLACE_DESIGN.ARGS.DIRECTIVE=AltSpreadLogic_high \
-		--vivado.prop run.impl_1.STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE=AlternateCLBRouting \
-		--vivado.prop run.impl_1.STEPS.OPT_DESIGN.ARGS.DIRECTIVE=ExploreWithRemap \
-		-o $(KERNEL)_hw.xclbin
-	@echo "=== Link complete (AltSpreadLogic_high): $(KERNEL)_hw.xclbin ==="
-
-# =============================================================================
-# Production vs Debug builds (compile-time STEP_DEBUG toggle)
-# =============================================================================
-# Debug .xo has STEP_DEBUG define baked in during Vivado package step
-DEBUG_XO := $(KERNEL)_debug.xo
-
-.PHONY: package-debug link-prod link-debug
-
 package-debug: $(DEBUG_XO)
 
-$(DEBUG_XO): build.tcl kernel.xml rtl/fpga_kernel.v rtl/vitis_control.v $(wildcard ../rtl/*.v ../rtl/*.vh)
+$(DEBUG_XO): $(RTL_DEPS)
 	cd .. && export STEP_DEBUG=1 && $(VIVADO) -mode batch -source fpga/build.tcl -tclargs
 	mv $(XO_FILE) $(DEBUG_XO)
 	@echo "=== Package-debug complete: $(DEBUG_XO) ==="
 
+# =============================================================================
+# Link: .xo → .xclbin (v++)
+# =============================================================================
+.PHONY: link-prod link-debug link-hw-ila link-emu
+
 link-prod: $(XO_FILE) $(CFG_FILE)
-	$(VPP) -t hw --platform $(PLATFORM_PATH) \
-		--link $(XO_FILE) \
-		--config $(CFG_FILE) \
-		--kernel_frequency 100 \
-		--dk chipscope:fpga_kernel_1 \
-		--vivado.prop run.impl_1.STEPS.PLACE_DESIGN.ARGS.DIRECTIVE=AltSpreadLogic_high \
-		--vivado.prop run.impl_1.STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE=AlternateCLBRouting \
-		--vivado.prop run.impl_1.STEPS.OPT_DESIGN.ARGS.DIRECTIVE=ExploreWithRemap \
-		-o $(KERNEL)_hw.xclbin
+	$(VPP_LINK) --link $(XO_FILE) $(SPREAD_OPTS) -o $(KERNEL)_hw.xclbin
 	@echo "=== Link-prod complete: $(KERNEL)_hw.xclbin ==="
 
 link-debug: $(DEBUG_XO) $(CFG_FILE)
-	$(VPP) -t hw --platform $(PLATFORM_PATH) \
-		--link $(DEBUG_XO) \
-		--config $(CFG_FILE) \
-		--kernel_frequency 100 \
-		--dk chipscope:fpga_kernel_1 \
-		--vivado.prop run.impl_1.STEPS.PLACE_DESIGN.ARGS.DIRECTIVE=AltSpreadLogic_high \
-		--vivado.prop run.impl_1.STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE=AlternateCLBRouting \
-		--vivado.prop run.impl_1.STEPS.OPT_DESIGN.ARGS.DIRECTIVE=ExploreWithRemap \
-		-o $(KERNEL)_debug_hw.xclbin
+	$(VPP_LINK) --link $(DEBUG_XO) $(SPREAD_OPTS) -o $(KERNEL)_debug_hw.xclbin
 	@echo "=== Link-debug complete (STEP_DEBUG): $(KERNEL)_debug_hw.xclbin ==="
 
 link-hw-ila: $(XO_FILE) $(CFG_FILE)
-	$(VPP) -t hw --platform $(PLATFORM_PATH) \
-		--link $(XO_FILE) \
-		--config $(CFG_FILE) \
-		--kernel_frequency 100 \
-		--dk chipscope:fpga_kernel_1 \
-		--vivado.prop run.impl_1.STEPS.PLACE_DESIGN.ARGS.DIRECTIVE=AltSpreadLogic_high \
-		--vivado.prop run.impl_1.STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE=AlternateCLBRouting \
-		--vivado.prop run.impl_1.STEPS.OPT_DESIGN.ARGS.DIRECTIVE=ExploreWithRemap \
+	$(VPP_LINK) --link $(XO_FILE) $(SPREAD_OPTS) \
 		--vivado.prop run.impl_1.STEPS.OPT_DESIGN.TCL.POST=insert_ila.tcl \
 		-o $(KERNEL)_hw.xclbin
-	@echo "=== Link complete (ILA + AltSpreadLogic_high): $(KERNEL)_hw.xclbin ==="
+	@echo "=== Link complete (ILA): $(KERNEL)_hw.xclbin ==="
+
+link-emu: $(XO_FILE) $(CFG_FILE)
+	$(VPP) -t hw_emu --platform $(PLATFORM_PATH) \
+		--link $(XO_FILE) --config $(CFG_FILE) \
+		--kernel_frequency $(FREQ) -o $(KERNEL)_hw_emu.xclbin
+	@echo "=== Link-emu complete: $(KERNEL)_hw_emu.xclbin ==="
 
 # =============================================================================
 # Host application
 # =============================================================================
 .PHONY: host
-host: $(HOST_EXE)
 
 $(HOST_EXE): $(HOST_SRC)
 	$(HOST_CXX) $(HOST_CFLAGS) -o $@ $< $(HOST_LFLAGS)
 	@echo "=== Host build complete ==="
+
+host: $(HOST_EXE)
 
 # =============================================================================
 # Run
 # =============================================================================
 .PHONY: run-emu run-hw
 
-# Generate emconfig for hw_emu
 emconfig.json:
 	source $(VIVADO_SETUP) && emconfigutil --platform $(PLATFORM_PATH)
 
@@ -173,6 +126,7 @@ run-hw: $(HOST_EXE) $(KERNEL)_hw.xclbin
 # Debug register reader (uses xrt::ip, run after kernel timeout + reset)
 # =============================================================================
 .PHONY: dbg_read
+
 dbg_read: dbg_read.cpp
 	$(HOST_CXX) $(HOST_CFLAGS) -o $@ $< $(HOST_LFLAGS)
 	@echo "=== dbg_read build complete ==="
@@ -189,7 +143,7 @@ HOST_EMU_EXE := host_emu
 
 package-small: $(SMALL_XO)
 
-$(SMALL_XO): build.tcl kernel.xml rtl/fpga_kernel.v rtl/vitis_control.v $(wildcard ../rtl/*.v ../rtl/*.vh)
+$(SMALL_XO): $(RTL_DEPS)
 	cd .. && export EMU_SMALL=1 && $(VIVADO) -mode batch -source fpga/build.tcl -tclargs
 	@echo "=== Package-small complete: $(SMALL_XO) ==="
 
@@ -197,10 +151,8 @@ link-emu-small: $(SMALL_XCLBIN)
 
 $(SMALL_XCLBIN): $(SMALL_XO) $(CFG_FILE)
 	$(VPP) -t hw_emu --platform $(PLATFORM_PATH) \
-		--link $(SMALL_XO) \
-		--config $(CFG_FILE) \
-		--kernel_frequency 100 \
-		-o $@
+		--link $(SMALL_XO) --config $(CFG_FILE) \
+		--kernel_frequency 100 -o $@
 	@echo "=== Link-emu-small complete: $@ ==="
 
 host_emu: $(HOST_EMU_EXE)
@@ -216,6 +168,7 @@ run-emu-small: $(HOST_EMU_EXE) $(SMALL_XCLBIN) emconfig.json
 # Clean
 # =============================================================================
 .PHONY: clean
+
 clean:
 	rm -rf $(HOST_EXE) *.xo *.xclbin *.log *.jou
 	rm -rf $(KERNEL)_pkg $(KERNEL)_pkg_ip

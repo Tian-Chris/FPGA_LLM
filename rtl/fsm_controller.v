@@ -121,6 +121,21 @@ module fsm_controller #(
     output reg  [5:0]               current_state,
     output reg  [DIM_W-1:0]         current_layer,
 
+    // Diagnostic test controls
+    input  wire [DIM_W-1:0]         max_steps,
+    input  wire [3:0]               test_mode,
+
+    // Test injection: nm_adapter scalar write (active when test_mode != 0)
+    output reg                      test_wr_en,
+    output reg  [NM_ADDR_W-1:0]    test_wr_addr,
+    output reg  [DATA_WIDTH-1:0]    test_wr_data,
+
+    // Test injection: act_dma scalar read (active when test_mode != 0)
+    output reg                      test_dma_rd_en,
+    output reg  [15:0]              test_dma_rd_addr,
+    input  wire [DATA_WIDTH-1:0]    test_dma_rd_data,
+    input  wire                     test_dma_rd_valid,
+
     // Debug trace to HBM
     input  wire [HBM_ADDR_W-1:0]   debug_base,
     output reg                      dbg_wr_valid,
@@ -275,6 +290,15 @@ module fsm_controller #(
     reg [HBM_ADDR_W-1:0] step_dbg_stride;   // bt * MODEL_STRIDE (precomputed)
     `endif
 
+    // Diagnostic test registers
+    reg [DIM_W-1:0]      max_steps_r;
+    reg [3:0]            test_mode_r;
+    reg [DIM_W-1:0]      step_cnt;         // total steps executed (for max_steps)
+    reg [DIM_W-1:0]      test_cnt;         // generic counter for test loops
+    reg [15:0]           test_latency_cnt; // cycle counter for latency probe
+    reg [2:0]            test_phase;       // sub-state within test states
+    reg [3:0]            test_row_idx;     // which row we're testing (multi-row)
+
     // Computed values
     wire [DIM_W-1:0] bt = batch_r * seq_r;
     wire [HBM_ADDR_W-1:0] layer_wgt_base = weight_base + layer_cnt * LAYER_SIZE;
@@ -380,6 +404,19 @@ module fsm_controller #(
             step_dbg_offset     <= {HBM_ADDR_W{1'b0}};
             step_dbg_stride     <= {HBM_ADDR_W{1'b0}};
             `endif
+            // Diagnostic test resets
+            max_steps_r      <= {DIM_W{1'b0}};
+            test_mode_r      <= 4'd0;
+            step_cnt         <= {DIM_W{1'b0}};
+            test_cnt         <= {DIM_W{1'b0}};
+            test_latency_cnt <= 16'd0;
+            test_phase       <= 3'd0;
+            test_row_idx     <= 4'd0;
+            test_wr_en       <= 1'b0;
+            test_wr_addr     <= {NM_ADDR_W{1'b0}};
+            test_wr_data     <= {DATA_WIDTH{1'b0}};
+            test_dma_rd_en   <= 1'b0;
+            test_dma_rd_addr <= 16'd0;
             flush_hbm_base   <= {HBM_ADDR_W{1'b0}};
             flush_hbm_stride <= {HBM_ADDR_W{1'b0}};
             flush_num_rows   <= 10'd0;
@@ -404,6 +441,8 @@ module fsm_controller #(
             nm_adapter_flush <= 1'b0;
             act_dma_flush    <= 1'b0;
             chk_uram_rd_en   <= 1'b0;
+            test_wr_en       <= 1'b0;
+            test_dma_rd_en   <= 1'b0;
 
             // Debug
             current_state <= {1'b0, state};
@@ -434,7 +473,15 @@ module fsm_controller #(
                         step_dbg_offset     <= {HBM_ADDR_W{1'b0}};
                         step_dbg_stride     <= batch_size * seq_len * MODEL_STRIDE;
                         `endif
-                        state     <= S_DECODE;
+                        // Diagnostic test registers
+                        max_steps_r  <= max_steps;
+                        test_mode_r  <= test_mode;
+                        step_cnt     <= {DIM_W{1'b0}};
+                        test_cnt     <= {DIM_W{1'b0}};
+                        test_phase   <= 3'd0;
+                        test_row_idx <= 4'd0;
+                        // Branch: test mode or normal operation
+                        state <= (test_mode != 4'd0) ? S_TEST_DISPATCH : S_DECODE;
                         // synthesis translate_off
                         $display("[FSM %0t] START: batch=%0d seq=%0d decode=%0d cache_len=%0d",
                                  $time, batch_size, seq_len, decode_mode, cache_len);
@@ -938,7 +985,11 @@ module fsm_controller #(
                     if (dbg_base_r == {HBM_ADDR_W{1'b0}} || (dbg_pending && dbg_wr_done)) begin
                         dbg_pending   <= 1'b0;
                         dbg_write_idx <= dbg_write_idx + 1;
-                        if (step_bt == BT_END) begin
+                        step_cnt      <= step_cnt + 1;
+                        // max_steps limit (0 = unlimited)
+                        if (max_steps_r != {DIM_W{1'b0}} && (step_cnt + 1) >= max_steps_r) begin
+                            state <= S_DONE;
+                        end else if (step_bt == BT_END) begin
                             // Checkpoint dump: read first 4 URAM words after layer
                             if (dbg_base_r != {HBM_ADDR_W{1'b0}}) begin
                                 chk_col_idx   <= 3'd0;
@@ -1061,6 +1112,296 @@ module fsm_controller #(
                         flush_sent <= 1'b0;
                         state      <= S_DONE;
                     end
+                end
+
+                // =========================================================
+                // DIAGNOSTIC TEST STATES (active when test_mode != 0)
+                // =========================================================
+
+                // ---------------------------------------------------------
+                // S_TEST_DISPATCH: route to test-specific state
+                // ---------------------------------------------------------
+                S_TEST_DISPATCH: begin
+                    case (test_mode_r)
+                        4'd1:    state <= S_TEST_ECHO;
+                        4'd5:    state <= S_TEST_URAM_WR;
+                        4'd6:  begin
+                            state <= S_TEST_URAM_WR;  // latency probe starts with URAM write
+                        end
+                        4'd7:    state <= S_TEST_URAM_WR;  // multi-row starts with write
+                        4'd12:   state <= S_TEST_REG_CHK;
+                        default: state <= S_DONE;
+                    endcase
+                    test_phase <= 3'd0;
+                    test_cnt   <= {DIM_W{1'b0}};
+                end
+
+                // ---------------------------------------------------------
+                // S_TEST_REG_CHK (test_mode=12): write register values to
+                // output HBM via debug_writer so host can verify
+                // ---------------------------------------------------------
+                S_TEST_REG_CHK: begin
+                    if (!dbg_pending && !dbg_wr_busy) begin
+                        dbg_wr_valid <= 1'b1;
+                        dbg_wr_addr  <= output_base + test_cnt;
+                        case (test_cnt[1:0])
+                            2'd0: begin
+                                dbg_wr_data[15:0]    <= batch_r;
+                                dbg_wr_data[31:16]   <= seq_r;
+                                dbg_wr_data[47:32]   <= num_layers_r;
+                                dbg_wr_data[51:48]   <= test_mode_r;
+                                dbg_wr_data[63:52]   <= 12'd0;
+                                dbg_wr_data[79:64]   <= max_steps_r;
+                                dbg_wr_data[95:80]   <= cache_len_r;
+                                dbg_wr_data[96]      <= decode_r;
+                                dbg_wr_data[127:97]  <= 31'd0;
+                                dbg_wr_data[255:128] <= 128'd0;
+                            end
+                            2'd1: begin
+                                dbg_wr_data[27:0]    <= weight_base;
+                                dbg_wr_data[31:28]   <= 4'd0;
+                                dbg_wr_data[59:32]   <= act_base;
+                                dbg_wr_data[63:60]   <= 4'd0;
+                                dbg_wr_data[255:64]  <= 192'd0;
+                            end
+                            2'd2: begin
+                                dbg_wr_data[27:0]    <= output_base;
+                                dbg_wr_data[31:28]   <= 4'd0;
+                                dbg_wr_data[59:32]   <= kv_base;
+                                dbg_wr_data[63:60]   <= 4'd0;
+                                dbg_wr_data[255:64]  <= 192'd0;
+                            end
+                            2'd3: begin
+                                dbg_wr_data[27:0]    <= dbg_base_r;
+                                dbg_wr_data[31:28]   <= 4'd0;
+                                dbg_wr_data[255:32]  <= 224'd0;
+                            end
+                        endcase
+                        dbg_pending <= 1'b1;
+                    end
+                    if (dbg_pending && dbg_wr_done) begin
+                        dbg_pending <= 1'b0;
+                        if (test_cnt == 16'd3)
+                            state <= S_DONE;
+                        else
+                            test_cnt <= test_cnt + 1;
+                    end
+                end
+
+                // ---------------------------------------------------------
+                // S_TEST_ECHO (test_mode=1): write known pattern to output
+                // HBM via debug_writer
+                // ---------------------------------------------------------
+                S_TEST_ECHO: begin
+                    if (!dbg_pending && !dbg_wr_busy) begin
+                        dbg_wr_valid <= 1'b1;
+                        dbg_wr_addr  <= output_base + test_cnt;
+                        // Pattern: {idx, CAFE, idx, CAFE, ...} repeated 8 times
+                        dbg_wr_data <= {test_cnt[15:0], 16'hCAFE,
+                                        test_cnt[15:0], 16'hCAFE,
+                                        test_cnt[15:0], 16'hCAFE,
+                                        test_cnt[15:0], 16'hCAFE,
+                                        test_cnt[15:0], 16'hCAFE,
+                                        test_cnt[15:0], 16'hCAFE,
+                                        test_cnt[15:0], 16'hCAFE,
+                                        test_cnt[15:0], 16'hCAFE};
+                        dbg_pending <= 1'b1;
+                    end
+                    if (dbg_pending && dbg_wr_done) begin
+                        dbg_pending <= 1'b0;
+                        if (test_cnt == 16'd7)
+                            state <= S_DONE;
+                        else
+                            test_cnt <= test_cnt + 1;
+                    end
+                end
+
+                // ---------------------------------------------------------
+                // S_TEST_URAM_WR (test_mode=5,6,7): write known pattern to
+                // URAM via nm_adapter, then flush or probe latency
+                // ---------------------------------------------------------
+                S_TEST_URAM_WR: begin
+                    case (test_phase)
+                        3'd0: begin
+                            // Configure nm_adapter
+                            nm_cfg_col_bits <= CFG_COL_MOD;  // MODEL_DIM width
+                            nm_addr_offset  <= {NM_ADDR_W{1'b0}};
+                            test_cnt <= {DIM_W{1'b0}};
+                            test_phase <= 3'd1;
+                            // For multi-row test, set starting row offset
+                            if (test_mode_r == 4'd7) begin
+                                case (test_row_idx)
+                                    4'd0: nm_addr_offset <= {NM_ADDR_W{1'b0}};
+                                    4'd1: nm_addr_offset <= 20'd256 * MODEL_DIM;
+                                    4'd2: nm_addr_offset <= 20'd512 * MODEL_DIM;
+                                    4'd3: nm_addr_offset <= 20'd768 * MODEL_DIM;
+                                    default: nm_addr_offset <= {NM_ADDR_W{1'b0}};
+                                endcase
+                            end
+                        end
+                        3'd1: begin
+                            // Write 64 scalar values (4 bus words) to URAM
+                            // For test 6 (latency), only write 16 values (1 bus word)
+                            test_wr_en   <= 1'b1;
+                            test_wr_addr <= test_cnt[NM_ADDR_W-1:0];
+                            // Pattern: base + index. Base varies by row for multi-row
+                            if (test_mode_r == 4'd7) begin
+                                case (test_row_idx)
+                                    4'd0: test_wr_data <= 16'hA000 + test_cnt[15:0];
+                                    4'd1: test_wr_data <= 16'hB000 + test_cnt[15:0];
+                                    4'd2: test_wr_data <= 16'hC000 + test_cnt[15:0];
+                                    4'd3: test_wr_data <= 16'hD000 + test_cnt[15:0];
+                                    default: test_wr_data <= 16'h3C00 + test_cnt[15:0];
+                                endcase
+                            end else begin
+                                test_wr_data <= 16'h3C00 + test_cnt[15:0];
+                            end
+                            test_cnt <= test_cnt + 1;
+                            if ((test_mode_r == 4'd6 && test_cnt == 16'd15) ||
+                                (test_mode_r != 4'd6 && test_cnt == 16'd63)) begin
+                                test_phase <= 3'd2;
+                            end
+                        end
+                        3'd2: begin
+                            // Flush nm_adapter write buffer to URAM
+                            nm_adapter_flush <= 1'b1;
+                            test_phase <= 3'd3;
+                        end
+                        3'd3: begin
+                            // Wait for adapter flush done
+                            if (nm_adapter_flush_done) begin
+                                test_phase <= 3'd0;
+                                test_cnt   <= {DIM_W{1'b0}};
+                                if (test_mode_r == 4'd6)
+                                    state <= S_TEST_LATENCY;
+                                else if (test_mode_r == 4'd7 && test_row_idx < 4'd3) begin
+                                    // Write all 4 rows before reading back
+                                    test_row_idx <= test_row_idx + 1;
+                                    state <= S_TEST_URAM_WR;
+                                end else begin
+                                    // test_mode=5 (single row) or 7 (all rows written)
+                                    if (test_mode_r == 4'd7)
+                                        test_row_idx <= 4'd0;  // reset for readback phase
+                                    state <= S_TEST_URAM_FL;
+                                end
+                            end
+                        end
+                        default: test_phase <= 3'd0;
+                    endcase
+                end
+
+                // ---------------------------------------------------------
+                // S_TEST_URAM_FL (test_mode=5): flush URAM row 0 to HBM
+                //                (test_mode=7): checkpoint-read rows
+                //                0/256/512/768, write to HBM via debug_writer
+                // ---------------------------------------------------------
+                S_TEST_URAM_FL: begin
+                    if (test_mode_r == 4'd7) begin
+                        // Multi-row: use checkpoint reads (uram_flush can't
+                        // start from arbitrary rows)
+                        case (test_phase)
+                            3'd0: begin
+                                // Issue checkpoint read for target row
+                                chk_uram_rd_en <= 1'b1;
+                                case (test_row_idx)
+                                    4'd0: chk_uram_rd_row <= 10'd0;
+                                    4'd1: chk_uram_rd_row <= 10'd256;
+                                    4'd2: chk_uram_rd_row <= 10'd512;
+                                    4'd3: chk_uram_rd_row <= 10'd768;
+                                    default: chk_uram_rd_row <= 10'd0;
+                                endcase
+                                chk_uram_rd_col <= 8'd0;  // first bus word
+                                test_phase <= 3'd1;
+                            end
+                            3'd1: begin
+                                // Wait for read valid
+                                if (chk_uram_rd_valid)
+                                    test_phase <= 3'd2;
+                            end
+                            3'd2: begin
+                                // Write readback data to HBM via debug_writer
+                                if (!dbg_pending && !dbg_wr_busy) begin
+                                    dbg_wr_valid <= 1'b1;
+                                    dbg_wr_addr  <= output_base + {24'd0, test_row_idx};
+                                    dbg_wr_data  <= chk_uram_rd_data;
+                                    dbg_pending  <= 1'b1;
+                                end
+                                if (dbg_pending && dbg_wr_done) begin
+                                    dbg_pending <= 1'b0;
+                                    if (test_row_idx < 4'd3) begin
+                                        test_row_idx <= test_row_idx + 1;
+                                        test_phase   <= 3'd0;
+                                    end else begin
+                                        state <= S_DONE;
+                                    end
+                                end
+                            end
+                            default: test_phase <= 3'd0;
+                        endcase
+                    end else begin
+                        // test_mode=5: Simple flush row 0 to HBM
+                        if (!flush_sent && !uram_flush_done) begin
+                            uram_flush_start         <= 1'b1;
+                            flush_sent               <= 1'b1;
+                            uram_flush_num_rows      <= 10'd0;  // 1 row
+                            uram_flush_num_col_words <= 8'd3;   // 4 words (count-1)
+                            uram_flush_start_col     <= 8'd0;
+                            uram_flush_hbm_base      <= output_base;
+                            uram_flush_hbm_stride    <= MODEL_STRIDE;
+                        end
+                        if (uram_flush_done) begin
+                            flush_sent <= 1'b0;
+                            state <= S_DONE;
+                        end
+                    end
+                end
+
+                // ---------------------------------------------------------
+                // S_TEST_LATENCY (test_mode=6): measure URAM read latency
+                // via checkpoint read interface
+                // ---------------------------------------------------------
+                S_TEST_LATENCY: begin
+                    case (test_phase)
+                        3'd0: begin
+                            // Issue URAM read via checkpoint interface
+                            chk_uram_rd_en  <= 1'b1;
+                            chk_uram_rd_row <= 10'd0;
+                            chk_uram_rd_col <= 8'd0;
+                            test_latency_cnt <= 16'd1;  // count starts at 1 (this cycle)
+                            test_phase <= 3'd1;
+                        end
+                        3'd1: begin
+                            // Count cycles until valid
+                            if (chk_uram_rd_valid) begin
+                                // Capture result
+                                test_phase <= 3'd2;
+                            end else begin
+                                test_latency_cnt <= test_latency_cnt + 1;
+                            end
+                        end
+                        3'd2: begin
+                            // Write result via debug_writer
+                            if (!dbg_pending && !dbg_wr_busy) begin
+                                dbg_wr_valid <= 1'b1;
+                                dbg_wr_addr  <= output_base;
+                                // Result record:
+                                //   [15:0]   measured latency (cycles)
+                                //   [31:16]  expected latency (URAM_RD_LATENCY param)
+                                //   [47:32]  0xBEEF (marker)
+                                //   [255:48] URAM read data (first 13 FP16 values)
+                                dbg_wr_data[15:0]   <= test_latency_cnt;
+                                dbg_wr_data[31:16]  <= 16'd1;  // expected (RD_LATENCY=1)
+                                dbg_wr_data[47:32]  <= 16'hBEEF;
+                                dbg_wr_data[255:48] <= chk_uram_rd_data[207:0];
+                                dbg_pending <= 1'b1;
+                            end
+                            if (dbg_pending && dbg_wr_done) begin
+                                dbg_pending <= 1'b0;
+                                state <= S_DONE;
+                            end
+                        end
+                        default: test_phase <= 3'd0;
+                    endcase
                 end
 
                 // ---------------------------------------------------------

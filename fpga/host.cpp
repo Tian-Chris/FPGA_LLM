@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <numeric>
 #include <string>
@@ -594,8 +595,10 @@ int main(int argc, char* argv[]) {
 
     auto t0 = std::chrono::high_resolution_clock::now();
     uint32_t num_layers_arg = static_cast<uint32_t>(NUM_LAYERS);
-    // Debug trace: put it at the end of the output buffer (word-addressed)
-    uint32_t debug_base = static_cast<uint32_t>(bo_output.address() >> 5);
+    // Debug trace: put it at the END of the output buffer so it doesn't
+    // conflict with STEP_DEBUG per-step data written from the start.
+    // Last 64KB = 2048 32-byte words.
+    uint32_t debug_base = static_cast<uint32_t>((bo_output.address() + OUTPUT_BUF_SIZE - 65536) >> 5);
     std::cout << "  debug_base=0x" << std::hex << debug_base << std::dec << "\n";
     auto run = kernel(batch_size, seq_len,
                       bo_weight, bo_weight,
@@ -638,18 +641,21 @@ int main(int argc, char* argv[]) {
     bo_output.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     {
         std::cout << "\n=== Debug Trace ===\n";
+        // Debug trace is at the END of the output buffer (last 64KB)
+        // 64KB / 2 bytes = 32768 int16 elements; offset in int16 units:
+        constexpr int DBG_TRACE_OFFSET = (OUTPUT_BUF_SIZE - 65536) / 2;
         // Each debug record is 256 bits = 16 x int16 = 32 bytes
         // Read up to 512 records (covers 24 layers × 16 steps + DONE)
         for (int rec = 0; rec < 512; ++rec) {
             // Cast via uint16_t first to avoid int16_t sign extension
-            uint32_t w0 = static_cast<uint16_t>(output_map[rec * 16 + 0]);
-            uint32_t w1 = static_cast<uint16_t>(output_map[rec * 16 + 1]);
+            uint32_t w0 = static_cast<uint16_t>(output_map[DBG_TRACE_OFFSET + rec * 16 + 0]);
+            uint32_t w1 = static_cast<uint16_t>(output_map[DBG_TRACE_OFFSET + rec * 16 + 1]);
             uint32_t cycle = w0 | (w1 << 16);
-            uint16_t layer = static_cast<uint16_t>(output_map[rec * 16 + 2]);
-            uint8_t  state = static_cast<uint8_t>(output_map[rec * 16 + 3] & 0xFF);
-            uint8_t  step  = static_cast<uint8_t>((static_cast<uint16_t>(output_map[rec * 16 + 3]) >> 8) & 0xFF);
-            uint8_t  bt    = static_cast<uint8_t>(output_map[rec * 16 + 4] & 0xFF);
-            uint8_t  cfg   = static_cast<uint8_t>((static_cast<uint16_t>(output_map[rec * 16 + 4]) >> 8) & 0xFF);
+            uint16_t layer = static_cast<uint16_t>(output_map[DBG_TRACE_OFFSET + rec * 16 + 2]);
+            uint8_t  state = static_cast<uint8_t>(output_map[DBG_TRACE_OFFSET + rec * 16 + 3] & 0xFF);
+            uint8_t  step  = static_cast<uint8_t>((static_cast<uint16_t>(output_map[DBG_TRACE_OFFSET + rec * 16 + 3]) >> 8) & 0xFF);
+            uint8_t  bt    = static_cast<uint8_t>(output_map[DBG_TRACE_OFFSET + rec * 16 + 4] & 0xFF);
+            uint8_t  cfg   = static_cast<uint8_t>((static_cast<uint16_t>(output_map[DBG_TRACE_OFFSET + rec * 16 + 4]) >> 8) & 0xFF);
             if (cycle == 0 && layer == 0 && state == 0 && step == 0)
                 break;  // empty record — end of trace
 
@@ -657,12 +663,12 @@ int main(int argc, char* argv[]) {
             uint8_t hdr = static_cast<uint8_t>((cycle >> 24) & 0xFF);
             if (hdr == 0xCC) {
                 uint8_t col = static_cast<uint8_t>((cycle >> 16) & 0xFF);
-                uint16_t chk_layer = static_cast<uint16_t>(output_map[rec * 16 + 0]);
+                uint16_t chk_layer = static_cast<uint16_t>(output_map[DBG_TRACE_OFFSET + rec * 16 + 0]);
                 std::cout << "  [" << rec << "] CHECKPOINT L" << chk_layer
                           << " col=" << (int)col << " data:";
                 // Print URAM FP16 values from bits [255:32] = words 2..15
                 for (int w = 2; w < 16; ++w) {
-                    uint16_t val = static_cast<uint16_t>(output_map[rec * 16 + w]);
+                    uint16_t val = static_cast<uint16_t>(output_map[DBG_TRACE_OFFSET + rec * 16 + w]);
                     std::cout << " " << fp16_to_float(val);
                 }
                 std::cout << "\n";
@@ -706,20 +712,39 @@ int main(int argc, char* argv[]) {
         }
 
         if (has_step_data && total_elems <= buf_elems) {
+            int row_elems = MODEL_STRIDE * BUS_ELEMS;  // 1024 FP16 per row
             std::cout << "\n=== Per-Step URAM Debug Dumps ===\n";
             std::cout << "  bt=" << bt << " MODEL_STRIDE=" << MODEL_STRIDE
-                      << " step_stride=" << step_stride_elems << " elems\n";
+                      << " step_stride=" << step_stride_elems
+                      << " row_elems=" << row_elems << "\n";
             for (int layer = 0; layer < NUM_LAYERS; ++layer) {
                 std::cout << "  --- Layer " << layer << " ---\n";
                 for (int s = 0; s < steps_per_layer; ++s) {
                     int global_step = layer * steps_per_layer + s;
                     int base_elem = global_step * step_stride_elems;
-                    std::cout << "    Step " << s << " (" << STEP_NAMES[s] << ") row0[0:8]:";
-                    for (int i = 0; i < 8 && (base_elem + i) < buf_elems; ++i) {
-                        float val = fp16_to_float(static_cast<uint16_t>(output_map[base_elem + i]));
-                        std::cout << " " << val;
+                    // Per-step stats across ALL rows
+                    int nonzero = 0;
+                    float abs_sum = 0.0f, abs_max = 0.0f;
+                    for (int i = 0; i < step_stride_elems && (base_elem + i) < buf_elems; ++i) {
+                        float v = fp16_to_float(static_cast<uint16_t>(output_map[base_elem + i]));
+                        if (v != 0.0f) nonzero++;
+                        float a = (v < 0) ? -v : v;
+                        abs_sum += a;
+                        if (a > abs_max) abs_max = a;
                     }
-                    std::cout << "\n";
+                    std::cout << "    Step " << s << " (" << STEP_NAMES[s]
+                              << ") nonzero=" << nonzero << "/" << step_stride_elems
+                              << " abs_sum=" << abs_sum << " abs_max=" << abs_max << "\n";
+                    // Print first 32 elements of each row
+                    for (int r = 0; r < bt; ++r) {
+                        int row_base = base_elem + r * row_elems;
+                        std::cout << "      row" << r << "[0:32]:";
+                        for (int i = 0; i < 32 && (row_base + i) < buf_elems; ++i) {
+                            float val = fp16_to_float(static_cast<uint16_t>(output_map[row_base + i]));
+                            std::cout << " " << val;
+                        }
+                        std::cout << "\n";
+                    }
                 }
             }
             std::cout << "================================\n\n";
@@ -845,6 +870,44 @@ int main(int argc, char* argv[]) {
         }
         std::cout << "  zeros=" << zeros << "/" << MODEL_DIM
                   << " inf_nan=" << inf_nan << "/" << MODEL_DIM << "\n";
+    }
+
+    // -----------------------------------------------------------------
+    // Dump full activation buffer to hex file for offline golden comparison
+    // -----------------------------------------------------------------
+    {
+        const char* dump_path = "act_dump.hex";
+        std::ofstream fout(dump_path);
+        if (!fout) {
+            std::cerr << "ERROR: cannot open " << dump_path << "\n";
+        } else {
+            // Header: layout info for the Python comparison script
+            fout << "# ACT_DUMP seq_len=" << seq_len
+                 << " model_dim=" << MODEL_DIM
+                 << " bus_elems=" << BUS_ELEMS
+                 << " model_stride=" << MODEL_STRIDE
+                 << " act_scratch_words=" << ACT_SCRATCH_WORDS
+                 << " kv_layer_size=" << KV_LAYER_SIZE
+                 << " num_layers=" << NUM_LAYERS << "\n";
+            fout << "# OFFSETS embed=" << ACT_EMBED_OFFSET
+                 << " q=" << ACT_Q_OFFSET
+                 << " attn=" << ACT_ATTN_OFFSET
+                 << " temp=" << ACT_TEMP_OFFSET << "\n";
+            // Dump entire activation buffer as hex uint16 values
+            // Total int16 elements = ACT_BUF_SIZE / 2
+            size_t total_elems = ACT_BUF_SIZE / 2;
+            fout << "# total_elems=" << total_elems << "\n";
+            fout << std::hex << std::setfill('0');
+            for (size_t i = 0; i < total_elems; ++i) {
+                fout << std::setw(4) << static_cast<uint16_t>(act_map[i]);
+                if ((i & 15) == 15) fout << "\n";
+                else fout << " ";
+            }
+            fout << "\n";
+            fout.close();
+            std::cout << "\n  Activation buffer dumped to " << dump_path
+                      << " (" << total_elems << " uint16 values)\n";
+        }
     }
 
     // Print prompt and first predicted token (prefill only, no decode)

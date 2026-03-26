@@ -179,6 +179,15 @@ module diffusion_transformer_top #(
     wire [DIM_W-1:0]            host_cache_len;
     wire [DIM_W-1:0]            host_num_layers;
     wire [HBM_ADDR_W-1:0]      host_debug_base;
+    wire [DIM_W-1:0]            host_max_steps;
+    wire [3:0]                  host_test_mode;
+
+    // FSM test injection signals (active when test_mode != 0)
+    wire                        fsm_test_wr_en;
+    wire [NM_ADDR_W-1:0]       fsm_test_wr_addr;
+    wire [DATA_WIDTH-1:0]       fsm_test_wr_data;
+    wire                        fsm_test_dma_rd_en;
+    wire [15:0]                 fsm_test_dma_rd_addr;
 
     // =========================================================================
     // FSM ↔ Debug Writer
@@ -449,6 +458,8 @@ module diffusion_transformer_top #(
         .current_layer(current_layer),
         .num_layers(host_num_layers),
         .debug_base(host_debug_base),
+        .max_steps(host_max_steps),
+        .test_mode(host_test_mode),
         .interrupt(interrupt)
     );
 `else
@@ -478,6 +489,8 @@ module diffusion_transformer_top #(
         .cache_len(host_cache_len),
         .num_layers(host_num_layers),
         .debug_base(host_debug_base),
+        .max_steps(host_max_steps),
+        .test_mode(host_test_mode),
         .done(host_done),
         .busy(host_busy),
         .current_state(current_state[4:0]),
@@ -566,6 +579,8 @@ module diffusion_transformer_top #(
         .current_state(current_state),
         .current_layer(current_layer),
         .debug_base(host_debug_base),
+        .max_steps(host_max_steps),
+        .test_mode(host_test_mode),
         .dbg_wr_valid(fsm_dbg_wr_valid),
         .dbg_wr_addr(fsm_dbg_wr_addr),
         .dbg_wr_data(fsm_dbg_wr_data),
@@ -575,7 +590,14 @@ module diffusion_transformer_top #(
         .chk_uram_rd_row(fsm_chk_uram_rd_row),
         .chk_uram_rd_col(fsm_chk_uram_rd_col),
         .chk_uram_rd_data(fsm_chk_uram_rd_data),
-        .chk_uram_rd_valid(fsm_chk_uram_rd_valid)
+        .chk_uram_rd_valid(fsm_chk_uram_rd_valid),
+        .test_wr_en(fsm_test_wr_en),
+        .test_wr_addr(fsm_test_wr_addr),
+        .test_wr_data(fsm_test_wr_data),
+        .test_dma_rd_en(fsm_test_dma_rd_en),
+        .test_dma_rd_addr(fsm_test_dma_rd_addr),
+        .test_dma_rd_data(dma_rd_data),
+        .test_dma_rd_valid(dma_rd_valid)
     );
 
     // =========================================================================
@@ -1284,20 +1306,26 @@ module diffusion_transformer_top #(
     assign au_rd_data  = adp_rd_data;
     assign au_rd_valid = adp_rd_valid;
 
-    // --- Adapter write mux ---
-    assign adp_wr_en = sm_wr_en | ln_wr_en | au_wr_en | res_wr_en;
-    assign adp_wr_addr = sm_wr_en  ? (sm_wr_addr + fsm_nm_addr_offset) :
+    // --- Adapter write mux (test_mode overrides normal units) ---
+    wire test_active = (host_test_mode != 4'd0);
+    assign adp_wr_en = test_active ? fsm_test_wr_en
+                                   : (sm_wr_en | ln_wr_en | au_wr_en | res_wr_en);
+    assign adp_wr_addr = test_active ? (fsm_test_wr_addr + fsm_nm_addr_offset) :
+                         sm_wr_en  ? (sm_wr_addr + fsm_nm_addr_offset) :
                          ln_wr_en  ? (ln_wr_addr + fsm_nm_addr_offset) :
                          au_wr_en  ? (au_wr_addr + fsm_nm_addr_offset) :
                                      res_wr_addr;
-    assign adp_wr_data = sm_wr_en  ? sm_wr_data :
+    assign adp_wr_data = test_active ? fsm_test_wr_data :
+                         sm_wr_en  ? sm_wr_data :
                          ln_wr_en  ? ln_wr_data :
                          au_wr_en  ? au_wr_data :
                                      res_wr_data;
 
-    // --- act_dma read mux (HBM-only sources) ---
-    assign dma_rd_en   = ln_param_rd_en | res_sub_rd_en;
-    assign dma_rd_addr = ln_param_rd_en ? ln_param_addr : res_sub_addr;
+    // --- act_dma read mux (HBM-only sources; test_mode overrides) ---
+    assign dma_rd_en   = test_active ? fsm_test_dma_rd_en
+                                     : (ln_param_rd_en | res_sub_rd_en);
+    assign dma_rd_addr = test_active ? fsm_test_dma_rd_addr
+                                     : (ln_param_rd_en ? ln_param_addr : res_sub_addr);
 
     // LN params from act_dma (HBM weight space)
     // Interleaved FP16: gamma[i] at addr 2*i, beta[i] at addr 2*i+1

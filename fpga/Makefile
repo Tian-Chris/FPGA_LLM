@@ -41,12 +41,16 @@ HOST_CFLAGS := -std=c++17 -O2 -I$(XRT_DIR)/include -fmessage-length=0
 HOST_LFLAGS := -L$(XRT_DIR)/lib -lOpenCL -lxrt_coreutil -pthread
 
 # Common v++ link flags
-FREQ        ?= 100
+FREQ        ?= 250
 VPP_LINK    := $(VPP) -t hw --platform $(PLATFORM_PATH) --config $(CFG_FILE) \
-		--kernel_frequency $(FREQ) --dk chipscope:fpga_kernel_1
+		--kernel_frequency $(FREQ)
+# Full directives for production (high-frequency) builds
 SPREAD_OPTS := --vivado.prop run.impl_1.STEPS.PLACE_DESIGN.ARGS.DIRECTIVE=AltSpreadLogic_high \
 		--vivado.prop run.impl_1.STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE=AlternateCLBRouting \
 		--vivado.prop run.impl_1.STEPS.OPT_DESIGN.ARGS.DIRECTIVE=ExploreWithRemap
+
+# Minimal directives for fast iteration builds
+FAST_OPTS   := --vivado.prop run.impl_1.STEPS.PLACE_DESIGN.ARGS.DIRECTIVE=AltSpreadLogic_high
 
 # Debug .xo (STEP_DEBUG baked in during package)
 DEBUG_XO := $(KERNEL)_debug.xo
@@ -75,11 +79,20 @@ $(DEBUG_XO): $(RTL_DEPS)
 # =============================================================================
 # Link: .xo → .xclbin (v++)
 # =============================================================================
-.PHONY: link-prod link-debug link-hw-ila link-emu
+.PHONY: link-prod link-fast link-chipscope link-debug link-hw-ila link-emu
 
 link-prod: $(XO_FILE) $(CFG_FILE)
 	$(VPP_LINK) --link $(XO_FILE) $(SPREAD_OPTS) -o $(KERNEL)_hw.xclbin
 	@echo "=== Link-prod complete: $(KERNEL)_hw.xclbin ==="
+
+link-fast: $(XO_FILE) $(CFG_FILE)
+	$(VPP) -t hw --platform $(PLATFORM_PATH) --config $(CFG_FILE) \
+		--kernel_frequency 50 --link $(XO_FILE) $(FAST_OPTS) -o $(KERNEL)_fast_hw.xclbin
+	@echo "=== Link-fast complete: $(KERNEL)_fast_hw.xclbin ==="
+
+link-chipscope: $(XO_FILE) $(CFG_FILE)
+	$(VPP_LINK) --dk chipscope:fpga_kernel_1 --link $(XO_FILE) $(SPREAD_OPTS) -o $(KERNEL)_cs_hw.xclbin
+	@echo "=== Link-chipscope complete: $(KERNEL)_cs_hw.xclbin ==="
 
 link-debug: $(DEBUG_XO) $(CFG_FILE)
 	$(VPP_LINK) --link $(DEBUG_XO) $(SPREAD_OPTS) -o $(KERNEL)_debug_hw.xclbin
@@ -132,6 +145,20 @@ dbg_read: dbg_read.cpp
 	@echo "=== dbg_read build complete ==="
 
 # =============================================================================
+# Test host
+# =============================================================================
+XCLBIN_PROD := $(KERNEL)_hw.xclbin
+
+.PHONY: host-test run-test
+
+host-test: host_test.cpp
+	$(HOST_CXX) $(HOST_CFLAGS) -o host_test $< $(HOST_LFLAGS)
+	@echo "=== host_test build complete ==="
+
+run-test: host_test $(XCLBIN_PROD)
+	source $(XRT_DIR)/setup.sh && ./host_test $(XCLBIN_PROD) --all --verbose
+
+# =============================================================================
 # Small hw_emu (SIM_SMALL dimensions for fast debug)
 # =============================================================================
 SMALL_XO     := $(KERNEL)_small.xo
@@ -152,7 +179,7 @@ link-emu-small: $(SMALL_XCLBIN)
 $(SMALL_XCLBIN): $(SMALL_XO) $(CFG_FILE)
 	$(VPP) -t hw_emu --platform $(PLATFORM_PATH) \
 		--link $(SMALL_XO) --config $(CFG_FILE) \
-		--kernel_frequency 100 -o $@
+		--kernel_frequency $(FREQ) -o $@
 	@echo "=== Link-emu-small complete: $@ ==="
 
 host_emu: $(HOST_EMU_EXE)

@@ -167,6 +167,12 @@ module fp_mac_unit #(
         end
     end
 
+    // Renormalization: if |new_acc_val| >= 2^28 (bits [30:28] differ from sign bit [31]),
+    // arithmetic right-shift by 4 and compensate in the exponent.
+    wire needs_renorm = (new_acc_val[31:28] != 4'b0000) && (new_acc_val[31:28] != 4'b1111);
+    wire signed [31:0] renorm_val = new_acc_val >>> 4;
+    wire        [7:0]  renorm_exp = new_acc_exp + 8'd4;
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             acc_val  <= 32'sd0;
@@ -177,8 +183,8 @@ module fp_mac_unit #(
             acc_exp  <= 8'd0;
             acc_zero <= 1'b1;
         end else if (enable_s2) begin
-            acc_val  <= new_acc_val;
-            acc_exp  <= new_acc_exp;
+            acc_val  <= needs_renorm ? renorm_val : new_acc_val;
+            acc_exp  <= needs_renorm ? renorm_exp : new_acc_exp;
             acc_zero <= (acc_zero && prod_zero_r);
         end
     end

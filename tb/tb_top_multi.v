@@ -16,7 +16,7 @@ module tb_top_multi;
 
     localparam AXI_AW = 32;
     localparam AXI_DW = 32;
-    localparam TB_HBM_DEPTH = 2097152;
+    localparam TB_HBM_DEPTH = 4194304;
 
     localparam SEQ_LEN = 32;
     localparam BATCH   = 1;
@@ -30,8 +30,8 @@ module tb_top_multi;
     localparam TOTAL_KV_ROWS  = 34;
 
     localparam WEIGHT_BASE = 0;
-    localparam ACT_BASE    = 1574528;
-    localparam KV_BASE     = 1623680;
+    localparam ACT_BASE    = 3149056;
+    localparam KV_BASE     = 3198208;
     localparam OUTPUT_BASE = 32'h8000;
     localparam DEBUG_BASE  = TB_HBM_DEPTH - 512;  // Last 512 words for debug trace
 
@@ -174,7 +174,7 @@ module tb_top_multi;
         axi_write(32'h24, KV_BASE);
         axi_write(32'h1C, 32'd0);       // decode_mode = 0
         axi_write(32'h20, 32'd0);       // cache_len = 0
-        axi_write(32'h28, 2); // num_layers
+        axi_write(32'h28, 4); // num_layers
         axi_write(32'h2C, DEBUG_BASE);  // debug trace base
 
         axi_write(32'h00, 32'h1);       // START
@@ -279,7 +279,7 @@ module tb_top_multi;
                 end
             end
 
-            for (fi = 0; fi < 2; fi = fi + 1) begin
+            for (fi = 0; fi < 4; fi = fi + 1) begin
                 for (dump_row = 0; dump_row < TOTAL_KV_ROWS; dump_row = dump_row + 1) begin
                     for (dump_col = 0; dump_col < MODEL_STRIDE_L; dump_col = dump_col + 1) begin
                         dump_addr = KV_BASE + fi * 16384 + dump_row * MODEL_STRIDE_L + dump_col;
@@ -335,7 +335,7 @@ module tb_top_multi;
 
     // Timeout watchdog (scaled with layers, 3 phases)
     initial begin
-        #1600000000000;
+        #3200000000000;
         $display("[%0t] ERROR: Simulation timeout!", $time);
         $fflush();
         $display("  FSM state: %0d", dut.u_fsm.state);

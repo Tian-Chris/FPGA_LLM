@@ -17,3 +17,4 @@ __pycache__/
 verify/llm_rtl*.txt
 verify/llm_golden*.txt
 scripts/.last_target
+.claude/settings.local.json

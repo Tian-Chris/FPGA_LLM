@@ -30,9 +30,7 @@ FPGA server: yangzi (SSH). Build and run on server, develop locally.
 │   ├── uram_prefetch_buf.v NEW: 1024×1024 URAM prefetch buffer
 │   └── act_dma.v           scalar-to-AXI DMA bridge
 ├── scripts/
-│   ├── verilator_small.f   Verilator flags (SIM_SMALL)
-│   ├── verilator_1k.f      Verilator flags (SIM_1K)
-│   └── verilator_decode.f  Verilator flags (decode mode test, SIM_1K)
+│   └── verilator_small.f   Verilator flags (SIM_SMALL)
 ├── tasks/                  contains summary todo and lessons
 ├── tb/
 │   ├── tb_top.v            SIM_SMALL integration test
@@ -114,7 +112,7 @@ hbm_prefetch.v (hbm_prefetch)
     Purpose: Central HBM-to-URAM DMA engine. Reads rectangular matrix chunk from HBM.
         Issues one AXI4 burst per row (num_col_words beats per row).
         Count fields use DIM_W (16-bit) to avoid truncation.
-    Parameters: HBM_ADDR_W (28), BUS_W (256), ROW_W (10), COL_W (6),
+    Parameters: HBM_ADDR_W (28), BUS_W (256), ROW_W (10), COL_W (8),
         DIM_W (16), ID_W (4), LEN_W (8)
     Key Ports:
         Command: cmd_valid, cmd_ready, cmd_done,
@@ -150,7 +148,7 @@ matmul_engine.v
         K-loop: reads from URAM, streams into engine, waits for compute, advances offsets.
         Output goes to URAM accumulation buffer. Bias added on last k-chunk output.
     Parameters: DATA_W (16), OUT_W (16), ACC_W (32), TILE (32), BUS_W (256), DIM_W (16),
-        HBM_ADDR_W (28), URAM_ROW_W (10), URAM_COL_W (6), PF_ROW_W (10), PF_COL_W (6)
+        HBM_ADDR_W (28), URAM_ROW_W (10), URAM_COL_W (8), PF_ROW_W (10), PF_COL_W (8)
     Key Ports:
         Command: cmd_valid, cmd_op[2:0], cmd_m/k/n[DIM_W-1:0],
             cmd_a_row_off[PF_ROW_W-1:0], cmd_a_col_off[PF_COL_W-1:0],
@@ -174,8 +172,8 @@ tiling_engine.v (tiling_engine) — REWRITTEN for URAM prefetch + bias
         Engines receive chunk-relative URAM offsets (no HBM addresses).
         Bias support: loads bias vector from HBM into bias_buf[256] via AXI burst
         before first k-chunk. Provides bias_rd_addr/bias_rd_data to matmul engines.
-    Parameters: N_ENG (1), TILE (32), DIM_W (16), URAM_ROW_W (10), URAM_COL_W (6),
-        PF_ROW_W (10), PF_COL_W (6), PREFETCH_DIM (1024)
+    Parameters: N_ENG (1), TILE (32), DIM_W (16), URAM_ROW_W (10), URAM_COL_W (8),
+        PF_ROW_W (10), PF_COL_W (8), PREFETCH_DIM (1024)
     Key Ports:
         Command (from FSM): cmd_valid, cmd_op, cmd_m/k/n, cmd_a/b_base/stride,
             cmd_out_col_offset, cmd_has_bias, cmd_ready, cmd_done
@@ -214,11 +212,61 @@ top_level.v (diffusion_transformer_top) — REWRITTEN for prefetch
         URAM_RD_LATENCY (1), ID_W_PARAM (4)
 
 // ============================================================================
+// FP ARITHMETIC UTILITY MODULES
+// ============================================================================
+
+fp_mac_unit.v (fp_mac_unit) — FP16×FP16→FP32 MAC unit (1024 instances in matmul_engine)
+    Purpose: 3-stage integer-accumulate MAC. Stage 1: register inputs. Stage 2: FP16 multiply
+        to sign/exp/22-bit mantissa. Stage 3: integer accumulate (exponent-aligned add),
+        combinational FP32 output. Subnormals flushed to zero.
+    Parameters: DATA_W (16), ACC_W (32)
+    Ports:
+        Input:  clk, rst_n, clear, enable, a_in[DATA_W-1:0], b_in[DATA_W-1:0]
+        Output: acc_out[ACC_W-1:0]  (IEEE FP32 bit pattern, combinational from acc state)
+
+fp16_add.v (fp16_add) — FP16 + FP16 → FP16 adder (2-stage pipeline)
+    Purpose: Stage 1: unpack, magnitude compare, swap, align, add/subtract.
+        Stage 2: normalize (CLZ), round-to-nearest-even, pack. Handles NaN/Inf/±0.
+        Subnormals flushed to zero.
+    Ports:
+        Input:  clk, rst_n, in_valid, a_in[15:0], b_in[15:0]
+        Output: out_valid, result[15:0]
+
+fp16_mult.v (fp16_mult) — FP16 × FP16 → FP32 multiplier (2-stage pipeline)
+    Purpose: Stage 1: unpack inputs, sign XOR, exponent add, register mantissas.
+        Stage 2: 11×11 mantissa multiply, normalize, pack FP32 result.
+        Handles NaN/Inf/zero. Subnormals flushed to zero.
+    Ports:
+        Input:  clk, rst_n, in_valid, a_in[15:0], b_in[15:0]
+        Output: out_valid, result[31:0]
+
+fp16_compare.v (fp16_compare) — FP16 max/min comparator (combinational)
+    Purpose: Sign-magnitude comparison of two FP16 values. NaN propagated to both outputs.
+        ±0 treated as equal.
+    Ports:
+        Input:  a_in[15:0], b_in[15:0]
+        Output: max_out[15:0], min_out[15:0], a_gt_b
+
+fp32_add.v (fp32_add) — FP32 + FP32 → FP32 adder (3-stage pipeline)
+    Purpose: Stage 1: unpack, magnitude swap, register. Stage 2: align smaller mantissa,
+        add/subtract (28-bit). Stage 3: normalize (CLZ), round-to-nearest-even, pack.
+        Handles NaN/Inf/±0. Subnormals flushed to zero.
+    Ports:
+        Input:  clk, rst_n, in_valid, a_in[31:0], b_in[31:0]
+        Output: out_valid, result[31:0]
+
+fp32_to_fp16.v (fp32_to_fp16) — FP32→FP16 converter (combinational)
+    Purpose: Rebias exponent (−112), truncate mantissa 23→10 bits, round-to-nearest-even.
+        Overflow → ±Inf, underflow → ±0. NaN payload preserved. Subnormals flushed to zero.
+    Ports:
+        Input:  in[31:0]
+        Output: out[15:0]
+
+// ============================================================================
 // UNCHANGED MODULES
 // ============================================================================
 
 mac_unit.v — Legacy INT16 MAC (retained in RTL_ALL, replaced by fp_mac_unit in matmul_engine)
-fp_mac_unit.v — FP16×FP16→FP32 MAC (5-stage pipeline: fp16_mult + fp32_add)
 activation.v — GELU via 512-entry LUT. Combinational LUT lookup from mem_rd_data (no pipeline regs). gelu_lut.hex loaded at init.
 layernorm.v — FP16/FP32 LN (mean, variance, Quake rsqrt, normalize). PARAM_W=16 (FP16 gamma/beta). Interleaved param reads: gamma[i] at addr 2*i, beta[i] at addr 2*i+1.
 softmax.v — FP16 softmax: scale_factor[15:0] (FP16 multiplier), 256-entry exp LUT, Newton-Raphson reciprocal. Causal masking.

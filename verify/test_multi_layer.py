@@ -147,7 +147,8 @@ def generate_weights(num_layers, seed=42):
     rng = np.random.RandomState(seed)
 
     def rand_mat(rows, cols):
-        vals = rng.uniform(-0.05, 0.05, (rows, cols)).astype(np.float16)
+        scale = float(np.sqrt(2.0 / (rows + cols)))
+        vals = rng.uniform(-scale, scale, (rows, cols)).astype(np.float16)
         return vals.view(np.uint16).astype(int).tolist()
 
     def rand_vec(dim):

@@ -294,7 +294,7 @@ module fsm_controller #(
     reg [DIM_W-1:0]      max_steps_r;
     reg [3:0]            test_mode_r;
     reg [DIM_W-1:0]      step_cnt;         // total steps executed (for max_steps)
-    reg [DIM_W-1:0]      test_cnt;         // generic counter for test loops
+    reg [NM_ADDR_W-1:0]  test_cnt;         // generic counter for test loops
     reg [15:0]           test_latency_cnt; // cycle counter for latency probe
     reg [2:0]            test_phase;       // sub-state within test states
     reg [3:0]            test_row_idx;     // which row we're testing (multi-row)

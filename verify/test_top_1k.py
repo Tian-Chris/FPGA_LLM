@@ -131,24 +131,186 @@ RTL_ALL = [
 
 
 # ---------------------------------------------------------------------------
-# Numpy-Accelerated Tiled Matmul (FP16 with FP32 accumulation)
+# Numpy-Accelerated Tiled Matmul (Block-Float MAC matching fp_mac_unit.v)
 # ---------------------------------------------------------------------------
 
-def tiled_matmul_fp16_numpy(mat_a, mat_b, tile_size, prefetch_dim=1024, bias=None):
-    """Numpy-accelerated tiled matmul with FP16 bit pattern inputs.
+def _to_int32(x):
+    """Clamp a numpy int64 array to 32-bit signed two's complement range."""
+    x = x & np.int64(0xFFFFFFFF)
+    return np.where(x >= np.int64(0x80000000), x - np.int64(0x100000000), x)
 
-    Per tile: FP16 inputs → float64 accumulation per k-chunk (models integer
-    accumulation — no intermediate rounding), convert to FP16, then accumulate
-    across k-chunks with FP16 addition.
+
+def _blockfloat_matmul_tile(A_bits_tile, B_bits_tile):
+    """Block-float MAC matching RTL fp_mac_unit.v, vectorized over all (i,j) pairs.
+
+    Args:
+        A_bits_tile: uint16 numpy array of shape (tile_rows, K_chunk)
+        B_bits_tile: uint16 numpy array of shape (K_chunk, tile_cols)
+
+    Returns:
+        FP16 bit patterns as uint16 numpy array of shape (tile_rows, tile_cols).
+    """
+    tile_rows, K = A_bits_tile.shape
+    _, tile_cols = B_bits_tile.shape
+
+    # Accumulator state arrays: int64 for acc_val (masked to 32-bit), int32 for exp
+    acc_val  = np.zeros((tile_rows, tile_cols), dtype=np.int64)
+    acc_exp  = np.zeros((tile_rows, tile_cols), dtype=np.int32)
+    acc_zero = np.ones((tile_rows, tile_cols),  dtype=bool)
+
+    # Unpack A and B FP16 fields once
+    # A: (tile_rows, K) fields
+    a_bits = A_bits_tile.astype(np.int32)
+    a_sign_all = (a_bits >> 15) & 1                    # (tile_rows, K)
+    a_exp_all  = (a_bits >> 10) & 0x1F                 # (tile_rows, K)
+    a_mant_all = a_bits & 0x3FF                        # (tile_rows, K)
+
+    # B: (K, tile_cols) fields
+    b_bits = B_bits_tile.astype(np.int32)
+    b_sign_all = (b_bits >> 15) & 1                    # (K, tile_cols)
+    b_exp_all  = (b_bits >> 10) & 0x1F                 # (K, tile_cols)
+    b_mant_all = b_bits & 0x3FF                        # (K, tile_cols)
+
+    for k in range(K):
+        # Per-element fields for this k (broadcast over output tile)
+        # a fields: (tile_rows,) → expand to (tile_rows, 1)
+        a_sign = a_sign_all[:, k:k+1].astype(np.int64)   # (tile_rows, 1)
+        a_exp  = a_exp_all [:, k:k+1].astype(np.int64)
+        a_mant = a_mant_all[:, k:k+1].astype(np.int64)
+
+        # b fields: (tile_cols,) via (1, K)[k] → expand to (1, tile_cols)
+        b_sign = b_sign_all[k:k+1, :].astype(np.int64)   # (1, tile_cols)
+        b_exp  = b_exp_all [k:k+1, :].astype(np.int64)
+        b_mant = b_mant_all[k:k+1, :].astype(np.int64)
+
+        # Subnormal check: flush to zero if either exp is 0
+        either_zero = (a_exp == 0) | (b_exp == 0)          # (tile_rows, tile_cols)
+
+        # Step 2: Multiply
+        prod_sign = a_sign ^ b_sign                         # (tile_rows, tile_cols)
+        mant_prod = (np.int64(1024) | a_mant) * (np.int64(1024) | b_mant)  # 22-bit, int64
+        prod_hi   = (mant_prod >> 21) & 1
+        # Normalize: ensure leading 1 at bit 21
+        mant_norm = np.where(prod_hi.astype(bool),
+                             mant_prod,
+                             (mant_prod << 1) & np.int64(0x3FFFFF))
+        prod_exp  = (a_exp + b_exp + 97 + prod_hi).astype(np.int32)  # 8-bit FP32-biased
+
+        # Step 3: Sign-extend product to 32-bit signed
+        # prod_signed is 23-bit signed: if prod_sign, negate mant_norm
+        prod_signed = np.where(prod_sign.astype(bool),
+                               -mant_norm,
+                               mant_norm)                   # range: [-2^22, 2^22], int64
+        # Sign-extend to 32 bits: prod_signed is 23-bit, extend sign from bit 22
+        # RTL: {{10{prod_signed[22]}}, prod_signed[21:0]}
+        prod_ext = _to_int32(prod_signed)                   # int64 masked to int32 semantics
+
+        # Step 4: Accumulate
+        acc_ge_prod  = acc_exp >= prod_exp                  # (tile_rows, tile_cols) bool
+        shift_ge     = (acc_exp - prod_exp).astype(np.int32)
+        shift_lt     = (prod_exp - acc_exp).astype(np.int32)
+
+        # Case: acc_zero → load product
+        load_mask = acc_zero & ~either_zero                 # load this product
+        acc_val  = np.where(load_mask,  _to_int32(prod_ext), acc_val)
+        acc_exp  = np.where(load_mask,  prod_exp,            acc_exp)
+        acc_zero = np.where(load_mask,  False,               acc_zero)
+
+        # Case: !acc_zero, !either_zero, acc_ge_prod → shift product right
+        mask_ge = ~acc_zero & ~either_zero & acc_ge_prod
+        shift_ge_clamp   = np.clip(shift_ge, 0, 27)
+        shift_ge_discard = shift_ge > 27
+        # Arithmetic right shift of prod_ext
+        prod_shifted_ge = np.where(shift_ge_discard, np.int64(0),
+                                   prod_ext >> shift_ge_clamp.astype(np.int64))
+        new_val_ge = _to_int32(acc_val + prod_shifted_ge)
+        acc_val = np.where(mask_ge, new_val_ge, acc_val)
+        # acc_exp unchanged in this case
+
+        # Case: !acc_zero, !either_zero, !acc_ge_prod → shift accumulator right
+        mask_lt = ~acc_zero & ~either_zero & ~acc_ge_prod
+        shift_lt_clamp   = np.clip(shift_lt, 0, 27)
+        shift_lt_discard = shift_lt > 27
+        # Arithmetic right shift of acc_val
+        acc_shifted_lt = np.where(shift_lt_discard, np.int64(0),
+                                  acc_val >> shift_lt_clamp.astype(np.int64))
+        new_val_lt = np.where(shift_lt_discard,
+                              _to_int32(prod_ext),
+                              _to_int32(acc_shifted_lt + prod_ext))
+        acc_val = np.where(mask_lt, new_val_lt, acc_val)
+        acc_exp = np.where(mask_lt, prod_exp,   acc_exp)
+
+        # Step 5: Renormalize after accumulation
+        # Check bits [31:28]: if not 0000 or 1111, shift right 4 and add 4 to exp
+        top4 = (acc_val >> 28) & np.int64(0xF)
+        needs_renorm = (top4 != 0) & (top4 != 0xF)
+        acc_val = np.where(needs_renorm, acc_val >> 4, acc_val)
+        acc_exp = np.where(needs_renorm, acc_exp + 4,  acc_exp)
+
+    # Step 6: Convert (acc_val, acc_exp) → FP32 → FP16
+    # acc_val is int64 holding a 32-bit signed integer
+    out_sign = (acc_val < 0).astype(np.int64)
+    abs_val  = np.where(acc_val < 0, -acc_val, acc_val) & np.int64(0xFFFFFFFF)
+
+    # Find leading 1 position (lead_pos): position of MSB in abs_val (0-indexed from bit 0)
+    # Vectorized: use bit_length equivalent via log2
+    # For each element: lead_pos = floor(log2(abs_val)) if abs_val > 0 else 0
+    # We need integer log2, use np.where for safety
+    safe_abs = np.where(abs_val > 0, abs_val, np.int64(1))
+    lead_pos = np.floor(np.log2(safe_abs.astype(np.float64))).astype(np.int32)
+    lead_pos = np.where(abs_val == 0, np.int32(0), lead_pos)
+
+    # Shift abs_val so leading 1 is at bit 23
+    shift_to_23 = (lead_pos - 23).astype(np.int32)
+    # Positive shift_to_23 → right shift, negative → left shift
+    shifted_for_mant = np.where(
+        shift_to_23 >= 0,
+        (abs_val >> shift_to_23.astype(np.int64)),
+        (abs_val << (-shift_to_23).astype(np.int64))
+    )
+    out_mant = shifted_for_mant & np.int64(0x7FFFFF)    # lower 23 bits
+
+    # Output exponent: acc_exp corresponds to leading 1 at bit 21 in the accumulator
+    # exp_adjust = lead_pos - 21
+    exp_adjust = (lead_pos - 21).astype(np.int32)
+    out_exp_s  = acc_exp + exp_adjust                    # signed
+
+    # Pack FP32 bit pattern
+    fp32_bits = np.zeros((tile_rows, tile_cols), dtype=np.int64)
+    is_zero    = acc_zero | (acc_val == 0)
+    is_inf     = ~is_zero & (out_exp_s >= 255)
+    is_under   = ~is_zero & ~is_inf & (out_exp_s <= 0)
+    is_normal  = ~is_zero & ~is_inf & ~is_under
+
+    fp32_bits = np.where(is_inf,
+                         (out_sign << 31) | np.int64(0x7F800000),
+                         fp32_bits)
+    fp32_bits = np.where(is_normal,
+                         (out_sign << 31) |
+                         (out_exp_s.astype(np.int64) << 23) |
+                         out_mant,
+                         fp32_bits)
+    # zero and underflow stay 0
+
+    # Convert FP32 bit patterns → float32 → float16
+    fp32_array = fp32_bits.astype(np.int32).view(np.float32)
+    fp16_array = fp32_array.astype(np.float16)
+    return fp16_array.view(np.uint16)
+
+
+def tiled_matmul_fp16_numpy(mat_a, mat_b, tile_size, prefetch_dim=1024, bias=None):
+    """Numpy-accelerated tiled matmul with block-float MAC matching fp_mac_unit.v.
+
+    Per tile: FP16 inputs → block-float integer accumulation per k-chunk
+    (exactly models RTL's fp_mac_unit.v 32-bit integer MAC with exponent
+    alignment and renormalization), then convert to FP16 via FP32.
+    Cross-chunk accumulation uses FP16 addition (matching uram_accum_buf).
 
     This matches the RTL's fp_mac_unit + uram_accum_buf behavior:
-    - Each k-chunk: integer accumulation (modeled as float64), FP16 at output
+    - Each k-chunk: block-float integer MAC → FP32 → FP16 at output
     - Last k-chunk: add bias (if provided) before FP16 conversion
     - First k-chunk: write to result
     - Subsequent k-chunks: FP16 add to result (fp16_add_comb in uram_accum_buf)
-
-    float64's 52-bit mantissa exceeds the ~27 bits needed for 32 products of
-    22-bit FP16 mantissas, so no rounding occurs during accumulation.
 
     Args:
         bias: optional list of FP16 bit patterns (uint16), length N.
@@ -160,10 +322,8 @@ def tiled_matmul_fp16_numpy(mat_a, mat_b, tile_size, prefetch_dim=1024, bias=Non
     """
     A_bits = np.array(mat_a, dtype=np.uint16)
     B_bits = np.array(mat_b, dtype=np.uint16)
-    A = A_bits.view(np.float16).astype(np.float64)
-    B = B_bits.view(np.float16).astype(np.float64)
-    M, K = A.shape
-    _, N = B.shape
+    M, K = A_bits.shape
+    _, N = B_bits.shape
 
     bias_fp16 = None
     if bias is not None:
@@ -180,10 +340,12 @@ def tiled_matmul_fp16_numpy(mat_a, mat_b, tile_size, prefetch_dim=1024, bias=Non
             for kc in range(num_k_chunks):
                 ks = kc * prefetch_dim
                 ke = min(ks + prefetch_dim, K)
-                # float64 accumulation within this k-chunk (models integer accum)
-                partial = A[ti:te, ks:ke] @ B[ks:ke, tj:je]
-                # RTL path: integer → FP32 → FP16 (double rounding)
-                partial_fp16 = partial.astype(np.float32).astype(np.float16)
+                # Block-float MAC matching RTL fp_mac_unit.v
+                partial_u16 = _blockfloat_matmul_tile(
+                    A_bits[ti:te, ks:ke],
+                    B_bits[ks:ke, tj:je]
+                )
+                partial_fp16 = partial_u16.view(np.float16)
                 # On last k-chunk, add bias before accumulation (matches RTL)
                 if bias_fp16 is not None and kc == num_k_chunks - 1:
                     partial_fp16 = (partial_fp16.astype(np.float32) +

@@ -44,7 +44,7 @@ module layernorm #(
 );
 
     // FP32 constants
-    localparam [31:0] FP32_EPS        = 32'h3727C5AC;  // 1e-5
+    localparam [31:0] FP32_EPS        = 32'h3A83126F;  // 1e-3
     localparam [31:0] FP32_HALF       = 32'h3F000000;  // 0.5
     localparam [31:0] FP32_THREE_HALF = 32'h3FC00000;  // 1.5
     localparam [31:0] FP32_ZERO       = 32'h00000000;

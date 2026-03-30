@@ -59,8 +59,8 @@ module diffusion_transformer_top #(
     // Interrupt
     output wire                         interrupt,
 
-    // --- 4 AXI4 Read-Only Master Ports: Weight + Act Tile Loaders (2 engines) ---
-    // Weight tile loaders (2x, read-only AR+R)
+    // --- AXI4 Read-Only Master Ports: Weight + Act HBM Prefetch DMA Engines ---
+    // Weight HBM prefetch engines (2x, read-only AR+R)
     output wire [ID_W_PARAM-1:0]        m_axi_wgt0_arid,
     output wire [HBM_ADDR_W-1:0]       m_axi_wgt0_araddr,
     output wire [7:0]                   m_axi_wgt0_arlen,
@@ -85,7 +85,7 @@ module diffusion_transformer_top #(
     input  wire                         m_axi_wgt1_rvalid,
     output wire                         m_axi_wgt1_rready,
 
-    // Activation tile loaders (2x, read-only AR+R)
+    // Activation HBM prefetch engines (2x, read-only AR+R)
     output wire [ID_W_PARAM-1:0]        m_axi_act0_arid,
     output wire [HBM_ADDR_W-1:0]       m_axi_act0_araddr,
     output wire [7:0]                   m_axi_act0_arlen,
@@ -157,11 +157,11 @@ module diffusion_transformer_top #(
     // Local Parameters
     // =========================================================================
     localparam DIM_W      = 16;
-    localparam N_ENG      = NUM_ENGINES;        // 4
+    localparam N_ENG      = NUM_ENGINES;        // 1
     localparam ID_W       = ID_W_PARAM;
     localparam LEN_W      = 8;
     localparam URAM_ROW_W = $clog2(URAM_ROWS);  // 10
-    localparam URAM_COL_W = $clog2(URAM_COL_WORDS); // 8 (was 6, URAM_COLS=4096)
+    localparam URAM_COL_W = $clog2(URAM_COL_WORDS); // width varies with URAM_COL_WORDS param
 
     // =========================================================================
     // Host Interface Signals

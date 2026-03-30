@@ -221,10 +221,11 @@ module residual_add #(
                     end else begin
                         rmant = rounded[9:0]; rexp = norm_e;
                     end
-                    if (rexp >= 6'd31)
-                        fp16_add_comb = {res_s, 5'b11111, 10'd0};
-                    else if (rexp[5] || rexp == 6'd0)
+                    // flush to zero before the >= 31 overflow check fires.
+                    if (rexp[5] || rexp == 6'd0)
                         fp16_add_comb = {res_s, 15'd0};
+                    else if (rexp >= 6'd31)
+                        fp16_add_comb = {res_s, 5'b11111, 10'd0};
                     else
                         fp16_add_comb = {res_s, rexp[4:0], rmant};
                 end

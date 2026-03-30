@@ -104,8 +104,8 @@ def layernorm_golden(input_bits, gamma_bits, beta_bits, dim):
         var_sum = np.float32(var_sum + sq)
     variance = np.float32(var_sum * recip)
 
-    # Add epsilon (1e-5 = 0x3727C5AC)
-    eps = _bits_to_fp32(0x3727C5AC)
+    # Add epsilon (1e-3 = 0x3A83126F)
+    eps = _bits_to_fp32(0x3A83126F)
     var_eps = np.float32(variance + np.float32(eps))
     var_eps_bits = _fp32_bits(var_eps)
 
